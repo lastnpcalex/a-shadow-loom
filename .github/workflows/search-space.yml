@@ -1,0 +1,50 @@
+name: Search Space proofs and acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compile search proofs
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/search_space
+          auto-config: false
+          build: true
+          build-args: "--wfail"
+          test: false
+          lint: false
+          use-mathlib-cache: false
+      - name: Regenerate and compare oracle
+        working-directory: formal/search_space
+        run: |
+          lake exe search_fixtures "$env:RUNNER_TEMP/search-cases.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import os,pathlib; assert pathlib.Path('cases.json').read_text(encoding='utf-8') == (pathlib.Path(os.environ['RUNNER_TEMP'])/'search-cases.json').read_text(encoding='utf-8'), 'Search fixture drift'"
+      - name: Install isolated acceptance dependencies
+        run: |
+          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright mcp pillow pyyaml requests cryptography fastembed==0.6.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m playwright install chromium
+      - name: Search, scope, MCP transport and browser acceptance
+        # Synthetic data and controlled completions; no production credentials,
+        # paid model calls, host lifecycle actions or live Loom database access.
+        run: |
+          node --check static/app.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest tests/test_search_space.py tests/test_search_history.py tests/test_search_policy.py tests/test_search_history_mcp.py tests/test_search_space_browser.py -q

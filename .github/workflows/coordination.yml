@@ -1,0 +1,77 @@
+name: Coordination proofs and lifecycle acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coordination:
+    # Windows is the deployed subprocess/filesystem target. No paid models,
+    # production credentials, production databases or host restart actions.
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compile coordination model and proofs
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/coordination
+          auto-config: false
+          build: true
+          build-args: "--wfail"
+          test: false
+          lint: false
+          use-mathlib-cache: false
+      - name: Regenerate and compare proof oracle
+        working-directory: formal/coordination
+        run: |
+          lake exe coordination_fixtures "$env:RUNNER_TEMP/coordination-cases.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import os,pathlib; a=pathlib.Path('generated/cases.json'); b=pathlib.Path(os.environ['RUNNER_TEMP'])/'coordination-cases.json'; assert a.read_text(encoding='utf-8') == b.read_text(encoding='utf-8'), 'Lean fixture drift'"
+          python -c "import os,pathlib; a=pathlib.Path('generated/cases.json.launch.json'); b=pathlib.Path(os.environ['RUNNER_TEMP'])/'coordination-cases.json.launch.json'; assert a.read_text(encoding='utf-8') == b.read_text(encoding='utf-8'), 'Launch feedback fixture drift'"
+          lake exe recovery_fixtures "$env:RUNNER_TEMP/recovery-cases.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import os,pathlib; a=pathlib.Path('generated/recovery.json'); b=pathlib.Path(os.environ['RUNNER_TEMP'])/'recovery-cases.json'; assert a.read_text(encoding='utf-8') == b.read_text(encoding='utf-8'), 'Recovery fixture drift'"
+      - name: Compile child access and disclosure proofs
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/agent_access
+          auto-config: false
+          build: true
+          build-args: "--wfail"
+          test: false
+          lint: false
+          use-mathlib-cache: false
+      - name: Verify child access oracle
+        working-directory: formal/agent_access
+        run: |
+          lake exe agent_access_fixtures "$env:RUNNER_TEMP/agent-access-cases.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import os,pathlib; assert pathlib.Path('cases.json').read_text(encoding='utf-8') == (pathlib.Path(os.environ['RUNNER_TEMP'])/'agent-access-cases.json').read_text(encoding='utf-8'), 'Agent access fixture drift'"
+      - name: Install isolated test dependencies
+        run: |
+          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright mcp pillow pyyaml requests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m playwright install chromium
+      - name: Required runtime and real-browser acceptance
+        # The runner rejects skips/missing observations; no continue-on-error.
+        # Providers are controlled doubles. Real provider/PID tests stay opt-in.
+        run: python tools/lifecycle_preflight.py --output-dir "$env:RUNNER_TEMP/coordination-acceptance"
+      # Portable continuity is a mandatory lifecycle-preflight stage above.
+      # Do not split it back into an advisory hand-picked pytest invocation.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coordination-acceptance
+          path: ${{ runner.temp }}/coordination-acceptance/report.json
+          if-no-files-found: ignore

@@ -32,9 +32,11 @@ const TREE = {
     searchMatches: [],
     searchIndex: -1,
     searchQuery: '',
+    searchRequestSeq: 0,
     treeDataConvId: null,
     treeDataFetchedAt: 0,
     treeFetchPromise: null,
+    treeFetchConvId: null,
 };
 
 function markTreeDataFresh(convId = State.currentConvId) {
@@ -57,20 +59,31 @@ async function refreshTreeData({ force = false, maxAgeMs = 15000 } = {}) {
     const fresh = sameConv && (now - TREE.treeDataFetchedAt) < maxAgeMs;
     if (!force && hasData && fresh) return State.treeData;
 
-    if (TREE.treeFetchPromise && sameConv) return TREE.treeFetchPromise;
+    // A loadConversation() render and several WebSocket notifications can all
+    // request the tree in the same tick. The old guard compared against the
+    // *completed* fetch's conversation id, so every caller started another
+    // request while the first fetch was pending. That request/render storm is
+    // particularly punishing on mobile for large Looms.
+    if (TREE.treeFetchPromise && TREE.treeFetchConvId === convId) {
+        return TREE.treeFetchPromise;
+    }
 
-    TREE.treeFetchPromise = API.get(`/api/conversations/${convId}/tree`)
-        .then(data => {
-            if (State.currentConvId === convId) {
-                State.treeData = data;
-                markTreeDataFresh(convId);
-            }
-            return data;
-        })
-        .finally(() => {
-            if (TREE.treeDataConvId === convId) TREE.treeFetchPromise = null;
-        });
-    return TREE.treeFetchPromise;
+    const fetchPromise = API.get(`/api/conversations/${convId}/tree`);
+    TREE.treeFetchPromise = fetchPromise;
+    TREE.treeFetchConvId = convId;
+    try {
+        const data = await fetchPromise;
+        if (State.currentConvId === convId) {
+            State.treeData = data;
+            markTreeDataFresh(convId);
+        }
+        return data;
+    } finally {
+        if (TREE.treeFetchPromise === fetchPromise) {
+            TREE.treeFetchPromise = null;
+            TREE.treeFetchConvId = null;
+        }
+    }
 }
 
 // ── Canvas Pan/Zoom ──
@@ -483,6 +496,7 @@ function initTreeSearch() {
     });
 
     input.addEventListener('input', () => {
+        TREE.searchRequestSeq += 1;
         clearTimeout(timeout);
         timeout = setTimeout(() => performTreeSearch(), 250);
     });
@@ -509,13 +523,18 @@ function initTreeSearch() {
 async function performTreeSearch() {
     const input = document.getElementById('tree-search-input');
     const query = input.value.trim();
+    const requestSeq = ++TREE.searchRequestSeq;
     if (query.length < 2) {
         clearTreeSearch();
         return;
     }
     if (!State.currentConvId) return;
+    const convId = State.currentConvId;
     try {
-        const results = await API.get(`/api/conversations/${State.currentConvId}/search?q=${encodeURIComponent(query)}`);
+        const results = await API.get(`/api/conversations/${convId}/search?q=${encodeURIComponent(query)}`);
+        if (requestSeq !== TREE.searchRequestSeq
+            || State.currentConvId !== convId
+            || input.value.trim() !== query) return;
         TREE.searchMatches = results.map(r => r.id);
         TREE.searchQuery = query;
         TREE.searchIndex = TREE.searchMatches.length > 0 ? 0 : -1;
@@ -549,6 +568,7 @@ function applyTreeSearchHighlight() {
 }
 
 function clearTreeSearch() {
+    TREE.searchRequestSeq += 1;
     TREE.searchMatches = [];
     TREE.searchIndex = -1;
     TREE.searchQuery = '';
@@ -652,13 +672,16 @@ function getNodeSummary(data) {
 // ── Render ──
 
 async function renderTree() {
+    // Chat launch, snapshot and navigation callers may refresh tree metadata,
+    // but a hidden tree must never allocate/layout its full node DOM.
+    if (State.currentView !== 'tree') return;
     const container = document.getElementById('tree-nodes');
     if (!container) return;
 
     // Render token: a newer render started after this one yields means we
     // abort partway through instead of fighting the new render for the DOM.
     const myToken = (TREE._renderToken = (TREE._renderToken || 0) + 1);
-    const isStale = () => TREE._renderToken !== myToken;
+    const isStale = () => TREE._renderToken !== myToken || State.currentView !== 'tree';
 
     // Restore layout preference before computing layout
     const savedVertical = localStorage.getItem('loom-tree-vertical');
@@ -786,7 +809,7 @@ async function renderTree() {
         canvasEl.className = 'tree-node-card canvas-root';
         canvasEl.innerHTML = `
             <div class="canvas-node-header">Canvas</div>
-            <iframe class="canvas-node-iframe" sandbox="allow-scripts allow-same-origin"
+            <iframe class="canvas-node-iframe" sandbox="allow-scripts allow-same-origin allow-modals allow-downloads"
                 scrolling="no" src="/api/canvas/${State.currentConvId}/index.html?t=${Date.now()}"></iframe>
         `;
         canvasEl.style.position = 'absolute';

@@ -2,20 +2,28 @@
 // Single-page client over admin_server.py's JSON API. No build step.
 
 let META = null;          // /api/meta payload
-let cronArchiveTab = false;
 let refreshTimer = null;
 let specsLoaded = false;
+let acceptanceLoadedAt = 0;
 
 function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
 function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.style.display = 'block';
-    clearTimeout(showToast._timer);
-    showToast._timer = setTimeout(() => t.style.display = 'none', 3000);
+    let panel = document.getElementById('admin-header-info');
+    if (!panel) {
+        panel = document.createElement('details');
+        panel.id = 'admin-header-info';
+        panel.innerHTML = '<summary>Info <span>0</span></summary><div class="admin-info-list" role="log" aria-live="polite"></div>';
+        document.getElementById('topbar').appendChild(panel);
+    }
+    const list = panel.querySelector('.admin-info-list');
+    const row = document.createElement('div');
+    row.textContent = `${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})} · ${msg}`;
+    list.prepend(row);
+    while (list.children.length > 50) list.lastElementChild.remove();
+    panel.querySelector('summary span').textContent = list.children.length;
 }
 
 function ensureConfirmModal() {
@@ -48,8 +56,10 @@ function confirmDialog(message, title = 'Are you sure?') {
     const cancelEls = modal.querySelectorAll('[data-confirm-cancel]');
     titleEl.textContent = title;
     msgEl.textContent = message;
+    const previousFocus = document.activeElement;
     modal.classList.add('open');
-    ok.focus();
+    const cancelButton = modal.querySelector('button[data-confirm-cancel]');
+    cancelButton.focus();
 
     return new Promise(resolve => {
         const cleanup = (value) => {
@@ -57,13 +67,17 @@ function confirmDialog(message, title = 'Are you sure?') {
             ok.removeEventListener('click', onOk);
             cancelEls.forEach(el => el.removeEventListener('click', onCancel));
             document.removeEventListener('keydown', onKey);
+            if (previousFocus?.isConnected) previousFocus.focus();
             resolve(value);
         };
         const onOk = () => cleanup(true);
         const onCancel = () => cleanup(false);
         const onKey = (e) => {
-            if (e.key === 'Escape') cleanup(false);
-            if (e.key === 'Enter') cleanup(true);
+            if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                (document.activeElement === ok ? cancelButton : ok).focus();
+            }
         };
         ok.addEventListener('click', onOk);
         cancelEls.forEach(el => el.addEventListener('click', onCancel));
@@ -72,21 +86,41 @@ function confirmDialog(message, title = 'Are you sure?') {
 }
 
 // ── View switching ──────────────────────────────────────────────────
-const VIEW_TITLES = { overview: 'Overview', servers: 'Servers', terminal: 'Terminal', tools: 'Tools', cron: 'Cron Jobs', guide: 'User Guide' };
+const VIEW_TITLES = { overview: 'Overview', quotas: 'Quotas', diagnostics: 'Diagnostics', activity: 'Activity', extensions: 'Extensions', openrouter: 'OpenRouter configuration', usage: 'Usage & Activity', guide: 'User Guide', settings: 'Settings' };
 
 function setView(name) {
+    if (name === 'settings') window.loadMachineSettings?.();
     document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name));
     document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
     document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
     localStorage.setItem('loom-admin-view', name);
     if (name === 'overview') {
-        if (!specsLoaded) loadSpecs();
         loadLlamaModels({ force: true });
         renderMemoryServices();
         loadDbStorage();
+        if (typeof loadProviderUsage === 'function') loadProviderUsage();
     }
-    if (name === 'terminal') refreshTtyd();
+    if (name === 'activity') refreshSupervision();
+    if (name === 'usage') window.loadUsageActivity?.({ force: true });
+    if (name === 'quotas') {
+        loadOpenRouterUsage();
+        if (typeof loadProviderUsage === 'function') loadProviderUsage({ force: true });
+    }
+    if (name === 'diagnostics') {
+        if (!specsLoaded) loadSpecs();
+        window.loadTerminalStatus?.();
+    }
+    if (name === 'extensions' && typeof loadExtensions === 'function') loadExtensions();
+    if (name === 'openrouter') {
+        if (typeof loadOpenRouterSettings === 'function') loadOpenRouterSettings({ force: true });
+        if (typeof loadOpenRouterModels === 'function') loadOpenRouterModels({ force: true });
+    }
 }
+
+window.addEventListener('hashchange', () => {
+    const name = location.hash.slice(1);
+    if (document.getElementById('view-' + name)) setView(name);
+});
 
 // ── Llama switch-model control ──────────────────────────────────────
 function _llamaModelKey(name) {
@@ -251,114 +285,6 @@ async function llamaReloadSelected() {
     if (btn) btn.disabled = false;
 }
 
-// ── Hermes runtime management (Prometheus + attendants) ──────────────────
-// Hits the admin /api/hermes/* relay endpoints, which forward to the main
-// Loom server's _RUNTIMES. Three runtimes: Prometheus (incognito, always-warm,
-// cloud-fallback) + llama/dream attendants (ensouled, model-bound).
-async function fetchHermesStatus() {
-    try {
-        const r = await fetch('/api/hermes/status', { cache: 'no-store' });
-        if (!r.ok) return null;
-        return await r.json();
-    } catch (e) { return null; }
-}
-
-function renderHermesRuntimePanel(status) {
-    const panel = document.getElementById('hermes-runtime-panel');
-    if (!panel) return;
-    if (!status || !status.hermes_available) {
-        panel.innerHTML = '<span class="memory-muted">Hermes adapter unavailable' +
-            (status && status.import_error ? ' (' + esc(String(status.import_error)) + ')' : '') + '.</span>';
-        return;
-    }
-    const dot = (up) => up ? '🟢' : '⚫';
-    const m = status.models || {};
-    const llamaUp = m.llama && m.llama.up;
-    const dreamUp = m.dream && m.dream.up;
-    const llamaAtt = m.llama && m.llama.attendant;
-    const dreamAtt = m.dream && m.dream.attendant;
-    const prom = status.prometheus || {};
-    const parts = [];
-    parts.push('<div class="rt-row"><b>Models:</b> ' +
-        `llama ${dot(llamaUp)} ${llamaUp ? 'up' : 'down'} · ` +
-        `dream ${dot(dreamUp)} ${dreamUp ? 'up' : 'down'}</div>`);
-    parts.push('<div class="rt-row"><b>Llama attendant:</b> ' +
-        (llamaAtt && llamaAtt.alive ? `warm (PID ${llamaAtt.pid})` : 'cold (re-inits on next turn)') + '</div>');
-    parts.push('<div class="rt-row"><b>Dream attendant:</b> ' +
-        (dreamAtt && dreamAtt.alive ? `warm (PID ${dreamAtt.pid})` : 'cold (re-inits on next turn)') + '</div>');
-    parts.push('<div class="rt-row"><b>Prometheus:</b> ' +
-        (prom.alive ? `warm (PID ${prom.pid})` : 'cold — will init on next incognito turn') +
-        (prom.held ? '' : ' · not held') + '</div>');
-    panel.innerHTML = parts.join('');
-}
-
-async function hermesStatus() {
-    const out = document.getElementById('out-hermes');
-    if (out) { out.classList.remove('error'); out.textContent = 'Probing Hermes runtimes…'; }
-    const s = await fetchHermesStatus();
-    renderHermesRuntimePanel(s);
-    if (out) {
-        if (!s) { out.textContent = 'Main server unreachable.'; out.classList.add('error'); }
-        else if (!s.hermes_available) { out.textContent = 'Hermes adapter unavailable: ' + (s.import_error || '?'); out.classList.add('error'); }
-        else { out.textContent = JSON.stringify(s, null, 2); }
-    }
-}
-
-async function prometheusRestart() {
-    if (!await confirmDialog('Restart Prometheus? Re-routes the backend (rewrites config) and clears the warm runtime; it re-inits on the next incognito turn.', 'Restart Prometheus')) return;
-    const btn = document.getElementById('btn-prometheus-restart');
-    if (btn) btn.disabled = true;
-    try {
-        const r = await fetch('/api/hermes/prometheus/restart', { method: 'POST' });
-        const d = await r.json();
-        const out = document.getElementById('out-hermes');
-        if (out) out.textContent = d.status === 'ok'
-            ? `Prometheus re-routed → backend: ${d.backend}, model: ${d.model}\nWarm runtime cleared; re-inits on next incognito turn.`
-            : ('Error: ' + (d.error || JSON.stringify(d)));
-    } catch (e) {
-        const out = document.getElementById('out-hermes');
-        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
-    }
-    await hermesStatus();
-    if (btn) btn.disabled = false;
-}
-
-async function prometheusStop() {
-    if (!await confirmDialog('Stop Prometheus\' warm runtime? It stays down until the next incognito turn re-inits it.', 'Stop Prometheus')) return;
-    const btn = document.getElementById('btn-prometheus-stop');
-    if (btn) btn.disabled = true;
-    try {
-        const r = await fetch('/api/hermes/prometheus/stop', { method: 'POST' });
-        const d = await r.json();
-        const out = document.getElementById('out-hermes');
-        if (out) out.textContent = d.status === 'ok'
-            ? `Prometheus stopped (cleared: ${d.cleared}).`
-            : ('Error: ' + (d.error || JSON.stringify(d)));
-    } catch (e) {
-        const out = document.getElementById('out-hermes');
-        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
-    }
-    await hermesStatus();
-    if (btn) btn.disabled = false;
-}
-
-async function attendantStop(backend) {
-    if (!await confirmDialog(`Force-clear the ${backend} attendant's warm process? The soul (home/state.db) survives; it re-inits on the next turn.`, `Clear ${backend} attendant`)) return;
-    try {
-        const r = await fetch('/api/hermes/attendant/stop?backend=' + backend, { method: 'POST' });
-        const d = await r.json();
-        const out = document.getElementById('out-hermes');
-        if (out) out.textContent = d.status === 'ok'
-            ? `${backend} attendant cleared (cleared: ${d.cleared}).`
-            : ('Error: ' + (d.error || JSON.stringify(d)));
-    } catch (e) {
-        const out = document.getElementById('out-hermes');
-        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
-    }
-    await hermesStatus();
-}
-
-
 // ── Meta / quick links ──────────────────────────────────────────────
 async function loadMeta() {
     try {
@@ -369,8 +295,6 @@ async function loadMeta() {
     document.getElementById('admin-port').textContent = META.admin_port;
     const llamaTag = document.getElementById('llama-port-tag');
     if (llamaTag) llamaTag.textContent = ':' + META.llama_port;
-    const nrolTag = document.getElementById('nrol-port-tag');
-    if (nrolTag) nrolTag.textContent = ':' + META.nrol_port;
     const dreamTag = document.getElementById('dream-port-tag');
     if (dreamTag) dreamTag.textContent = ':' + META.dream_port;
     const ttydTag = document.getElementById('ttyd-port-tag');
@@ -379,10 +303,9 @@ async function loadMeta() {
     // Links use the page's own hostname so they work over Tailscale.
     const h = location.hostname;
     const links = [
-        ['🌐 Main Loom', `https://${h}:${META.main_port}`],
+        ['🌐 Main EXO', `https://${h}:${META.main_port}`],
         ['🧪 Test', `http://${h}:${META.test_port}`],
         ['🦙 Llama', `http://${h}:${META.llama_port}`],
-        ['📈 NROL-AO', `http://${h}:${META.nrol_port}`],
         ['🎨 ComfyUI', `http://${h}:${META.comfy_port}`],
     ];
     document.getElementById('quick-links').innerHTML = links
@@ -398,15 +321,14 @@ function scheduleRefresh(delay = 10000) {
 
 async function refreshAll() {
     try {
-        await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs(), refreshPorts(), loadDbStorage()]);
+        // Independent, minute-throttled request: never delay the activity poll.
+        loadOpenRouterUsage();
+        await Promise.all([refreshInstances(), refreshSupervision(), refreshPorts(), loadDbStorage(), loadAcceptance()]);
         const overview = document.getElementById('view-overview');
         if (overview?.classList.contains('active') && document.activeElement?.id !== 'llama-model-switch') {
             await loadLlamaModels({ force: true });
             await renderDreamModels();
         }
-        // Keep the Hermes runtime panel fresh without blocking the periodic loop
-        // — a slow/unreachable main server must not stall refreshAll.
-        fetchHermesStatus().then(renderHermesRuntimePanel).catch(() => {});
     } catch (e) { /* keep ticking */ }
     scheduleRefresh();
 }
@@ -433,15 +355,6 @@ const SERVER_HEAD_ACTIONS = {
             { cls: 'btn btn-green', label: 'Start',  tool: 'comfyui-start' },
         ],
         target: 'out-comfy',
-    },
-    nrol: {
-        on: [
-            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'nrol-dashboard-stop', confirm: 'Stop NROL-AO dashboard if Loom admin launched it?' },
-        ],
-        off: [
-            { cls: 'btn btn-green', label: 'Start',  tool: 'nrol-dashboard-start' },
-        ],
-        target: 'out-nrol',
     },
     dream: {
         on: [
@@ -480,26 +393,23 @@ async function refreshPorts() {
         const r = await fetch('/api/ports-status', { cache: 'no-store' });
         if (r.ok) d = await r.json();
     } catch (e) { return; }
-    const order = [['main', 'Loom'], ['test', 'Test'], ['llama', 'Llama'], ['dream', 'Dream Engine'], ['nrol', 'NROL'], ['comfy', 'Comfy'], ['ttyd', 'ttyd']];
+    const order = [['main', 'EXO'], ['test', 'Test'], ['llama', 'Llama'], ['dream', 'Dream Engine'], ['comfy', 'Comfy']];
+    const health = document.getElementById('service-health');
+    if (health) health.innerHTML = order.filter(([key]) => key !== 'dream').map(([key, label]) =>
+        `<div class="health-tile"><span>${label}</span><strong class="${typeof d[key] !== 'boolean' ? '' : d[key] ? 'health-online' : 'health-offline'}">${typeof d[key] !== 'boolean' ? 'Unknown' : d[key] ? 'Reachable' : 'Offline'}</strong></div>`).join('');
     document.getElementById('pulse-grid').innerHTML = order
         .map(([k, label]) => `<span class="pulse-item"><span class="dot ${d[k] ? 'on' : 'off'}"></span>${label}</span>`)
         .join('');
-    for (const k of ['llama', 'comfy', 'nrol', 'ttyd', 'dream']) {
+    for (const k of ['llama', 'comfy', 'dream']) {
         const dot = document.getElementById('dot-' + k);
         if (dot) dot.className = 'dot ' + (d[k] ? 'on' : 'off');
     }
-    for (const k of ['llama', 'comfy', 'nrol', 'dream']) renderServerHeadActions(k, !!d[k]);
-    // Keep the terminal iframe in sync if ttyd died or came up elsewhere
-    if (document.getElementById('view-terminal').classList.contains('active')) {
-        const frame = document.getElementById('ttyd-frame');
-        if (!d.ttyd && frame.classList.contains('live')) refreshTtyd();
-        if (d.ttyd && !frame.classList.contains('live')) refreshTtyd();
-    }
+    for (const k of ['llama', 'comfy', 'dream']) renderServerHeadActions(k, !!d[k]);
 }
 
 function _instanceActionsHtml(s) {
     const on = s.status === 'online';
-    if (on) {
+    if (on || s.status === 'stopping' || s.pid || (s.pids || []).length) {
         return `<button onclick="doAction('${s.name}', 'restart')" class="btn btn-cyan">↻ Restart</button>
                 <button onclick="doAction('${s.name}', 'shutdown')" class="btn btn-warn">⏹ Shutdown</button>`;
     }
@@ -521,6 +431,7 @@ async function refreshInstances() {
     const r = await fetch('/api/status', { cache: 'no-store' });
     if (!r.ok) return;
     const d = await r.json();
+    if (d.admin_pid) window.currentAdminPid = d.admin_pid;
     const instances = d.instances || [];
 
     // Mirror state onto the matching server-cards, so the
@@ -542,123 +453,11 @@ async function refreshInstances() {
     }
 }
 
-async function refreshGenerations() {
-    let gens = [];
-    try {
-        const r = await fetch('/api/generations-proxy', { cache: 'no-store' });
-        if (r.ok) gens = await r.json();
-    } catch (e) { /* ignore */ }
-    const empty = document.getElementById('generations-empty');
-    const table = document.getElementById('generations-table');
-    const body = document.getElementById('generations-body');
-    const count = document.getElementById('gens-count');
-    if (!gens.length) {
-        empty.style.display = 'block';
-        table.style.display = 'none';
-        count.textContent = '';
-        return;
-    }
-    empty.style.display = 'none';
-    table.style.display = 'table';
-    count.textContent = '(' + gens.length + ')';
-    body.innerHTML = gens.map(g => {
-        const status = g.in_memory ? 'running' : (g.pid_alive ? 'orphan' : 'dead');
-        const color = status === 'running' ? 'var(--green)' : (status === 'orphan' ? 'var(--amber)' : 'var(--text-mute)');
-        const age = g.started_at ? Math.round(Date.now() / 1000 - g.started_at) + 's' : '—';
-        return `<tr>
-            <td>${g.conv_id}</td><td>#${g.draft_msg_id}</td><td>${g.pid || '—'}</td>
-            <td><span style="color:${color}">${status}</span></td>
-            <td>${esc(g.mode || '—')}</td><td>${age}</td>
-            <td><button class="btn btn-warn" onclick="killGen(${g.draft_msg_id})">Kill</button></td>
-        </tr>`;
-    }).join('');
-}
-
-function setCronTab(archive) {
-    cronArchiveTab = archive;
-    document.getElementById('cron-active-tab').classList.toggle('active', !archive);
-    document.getElementById('cron-archive-tab').classList.toggle('active', archive);
-    refreshCronJobs();
-}
-
-async function refreshCronJobs() {
-    let jobs = [];
-    try {
-        const r = await fetch('/api/cron-proxy?include_archived=' + (cronArchiveTab ? 'true' : 'false'), { cache: 'no-store' });
-        if (r.ok) jobs = await r.json();
-    } catch (e) { /* ignore */ }
-    jobs = jobs.filter(j => cronArchiveTab ? j.archived : !j.archived);
-    const empty = document.getElementById('cron-empty');
-    const table = document.getElementById('cron-table');
-    const body = document.getElementById('cron-body');
-    const count = document.getElementById('cron-count');
-    count.textContent = jobs.length ? '(' + jobs.length + ')' : '';
-    if (!jobs.length) {
-        empty.style.display = 'block';
-        table.style.display = 'none';
-        body.innerHTML = '';
-        return;
-    }
-    empty.style.display = 'none';
-    table.style.display = 'table';
-    body.innerHTML = jobs.map(j => {
-        const desc = esc(j.description || 'No description');
-        const output = esc([j.last_output, j.last_error].filter(Boolean).join('\n'));
-        const status = j.archived ? 'archived' : (j.enabled ? (j.last_status || 'enabled') : 'disabled');
-        const actions = j.archived ? '' : `
-            <button class="btn btn-cyan" onclick="toggleCron(${j.id}, ${j.enabled ? 'false' : 'true'})">${j.enabled ? 'Disable' : 'Enable'}</button>
-            <button class="btn btn-warn" onclick="archiveCron(${j.id})">Archive</button>`;
-        return `<tr>
-            <td>#${j.id}</td>
-            <td>${j.conv_id}</td>
-            <td><code>${esc(j.script)}</code></td>
-            <td>${Math.round((j.every_seconds || 0) / 60)} min</td>
-            <td>${esc(j.last_run_at_display || 'never')}</td>
-            <td>${esc(j.next_run_at_display || '-')}</td>
-            <td>${esc(status)}${j.last_exit_code !== null && j.last_exit_code !== undefined ? ' (' + j.last_exit_code + ')' : ''}</td>
-            <td><details class="cron-detail"><summary>Description</summary><pre>${desc}</pre>${output ? '<pre>' + output + '</pre>' : ''}</details></td>
-            <td>${actions}</td>
-        </tr>`;
-    }).join('');
-}
-
-async function toggleCron(id, enabled) {
-    try {
-        const r = await fetch('/api/cron-proxy/' + id, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled }),
-        });
-        showToast(r.ok ? 'cron updated' : 'cron update failed');
-    } catch (e) { showToast('cron update failed: ' + e); }
-    setTimeout(refreshCronJobs, 300);
-}
-
-async function archiveCron(id) {
-    if (!await confirmDialog('Archive cron job #' + id + '?', 'Archive Cron Job')) return;
-    try {
-        const r = await fetch('/api/cron-proxy/' + id, { method: 'DELETE' });
-        showToast(r.ok ? 'cron archived' : 'cron archive failed');
-    } catch (e) { showToast('cron archive failed: ' + e); }
-    setTimeout(refreshCronJobs, 300);
-}
-
-async function killGen(draftId) {
-    if (!await confirmDialog('Kill generation #' + draftId + '?', 'Kill Generation')) return;
-    showToast('killing #' + draftId);
-    try {
-        const r = await fetch('/api/generations-proxy/' + draftId + '/kill', { method: 'POST' });
-        if (r.ok) { const d = await r.json(); showToast(d.status || 'killed'); }
-        else showToast('kill failed');
-    } catch (e) { showToast('kill failed: ' + e); }
-    setTimeout(refreshAll, 500);
-}
 
 // ── Instance + admin actions ────────────────────────────────────────
 function _writeInstanceStatus(name, text, isError) {
     // Show progress + completion on both the compact Overview note and the
     // full Servers-page server-out, so the same "starting, started" widget
-    // feedback the llama/comfy/nrol cards already gave you is mirrored here.
     const stamp = new Date().toLocaleTimeString();
     const line = '[' + stamp + '] ' + text;
     const note = document.getElementById('status-' + name);
@@ -684,32 +483,145 @@ async function doAction(name, action) {
         const msg = d.status || d.error || 'done';
         const isError = !!d.error;
         _writeInstanceStatus(name, msg, isError);
+        if (isError && (d.pids || []).length) {
+            const head = document.getElementById('head-actions-' + name);
+            if (head) head.innerHTML = _instanceActionsHtml({ name, pids: d.pids });
+        }
     } catch (e) {
         _writeInstanceStatus(name, 'failed: ' + e, true);
     }
     setTimeout(refreshAll, 1500);
 }
 
-async function adminAction(action) {
-    showToast('admin ' + action + '...');
-    const url = action === 'shutdown' ? '/shutdown' : '/admin/restart';
+let adminRestartPending = false;
+
+function reportAdminLifecycle(message, failed = false) {
+    const status = document.getElementById('admin-lifecycle-status');
+    if (status) {
+        status.textContent = message;
+        status.classList.toggle('error', failed);
+    }
+    showToast(message);
+}
+
+async function loadAcceptance({ force = false } = {}) {
+    if (!force && Date.now() - acceptanceLoadedAt < 30000) return;
+    const badge = document.getElementById('acceptance-state');
+    const status = document.getElementById('acceptance-status');
+    const identities = document.getElementById('acceptance-identities');
+    if (!badge || !status || !identities) return;
     try {
-        const r = await fetch(url, { method: 'POST' });
-        const d = await r.json();
-        showToast(d.status || 'done');
-    } catch (e) { /* connection drops — expected */ }
-    if (action === 'restart') {
-        showToast('admin restarting — waiting for it to come back...');
+        const response = await fetch('/api/acceptance', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const state = String(data.state || 'unverified').toUpperCase();
+        badge.textContent = state;
+        badge.style.color = data.state === 'verified' ? 'var(--green)'
+            : data.state === 'failed' ? 'var(--red)' : 'var(--amber)';
+        status.textContent = data.reason || 'Acceptance status unavailable.';
+        const short = value => value?.commit ? String(value.commit).slice(0, 12) : 'unavailable';
+        identities.textContent = `accepted ${short(data.tested_source)} · checkout ${short(data.checkout_source)} · running ${short(data.runtime_source)}`;
+        acceptanceLoadedAt = Date.now();
+    } catch (error) {
+        badge.textContent = 'UNVERIFIED';
+        badge.style.color = 'var(--amber)';
+        status.textContent = `Acceptance evidence unavailable: ${error}`;
+        identities.textContent = '';
+    }
+}
+
+function validAdminPid(pid) {
+    return Number.isSafeInteger(pid) && pid > 0;
+}
+
+async function readAdminStatus() {
+    let response = await fetch('/api/admin-status', { cache: 'no-store', signal: AbortSignal.timeout(8000) });
+    // Assets can update before the serving admin is reloaded. Only a missing
+    // route permits this read-only fallback; an auth/error response stays visible.
+    if (response.status === 404) {
+        response = await fetch('/api/status', { cache: 'no-store', signal: AbortSignal.timeout(20000) });
+    }
+    if (!response.ok) throw new Error(`Admin status unavailable (HTTP ${response.status}).`);
+    const status = await response.json();
+    if (!validAdminPid(status?.admin_pid)) throw new Error('Admin status did not identify its serving PID.');
+    return status;
+}
+
+async function restartAdmin() {
+    if (adminRestartPending) return;
+    adminRestartPending = true;
+    const buttons = ['btn-admin-restart', 'btn-admin-shutdown'].map(id => document.getElementById(id)).filter(Boolean);
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+        reportAdminLifecycle('Checking admin identity before restart…');
+        // Establish identity before the mutation, even before the first dashboard poll.
+        // A missing identity must never mean that any responding server is a replacement.
+        let before;
+        try {
+            before = await readAdminStatus();
+        } catch (error) {
+            throw new Error(`${error.message} No restart request was sent.`);
+        }
+        let oldPid = before.admin_pid;
+        window.currentAdminPid = oldPid;
+        reportAdminLifecycle(`Requesting restart of admin PID ${oldPid}…`);
+        let response;
+        try {
+            // Exactly one POST. A timeout/disconnect is ambiguous, never permission to retry.
+            response = await fetch('/admin/restart', { method: 'POST', signal: AbortSignal.timeout(10000) });
+        } catch (error) {
+            reportAdminLifecycle('Restart response unavailable; checking for a replacement. Request not retried.');
+        }
+        if (response) {
+            let data = null;
+            try { data = await response.json(); } catch (error) { /* verify the PID, not this response */ }
+            if (!response.ok || data?.error) {
+                throw new Error(`Admin restart failed (HTTP ${response.status}): ${data?.error || data?.detail || 'response unavailable'}`);
+            }
+            // Older admins omit old_pid in the already-requested response. Retain the baseline.
+            if (validAdminPid(data?.old_pid)) oldPid = data.old_pid;
+            reportAdminLifecycle(data
+                ? `Restart requested; waiting for admin PID ${oldPid} to be replaced…`
+                : 'Invalid restart response; checking for a replacement. Request not retried.');
+        }
         const start = Date.now();
-        const poll = async () => {
+        do {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            let status;
             try {
-                const p = await fetch('/api/status', { cache: 'no-store' });
-                if (p.ok) { location.reload(); return; }
-            } catch (e) { /* still down */ }
-            if (Date.now() - start < 20000) setTimeout(poll, 1000);
-            else showToast('admin did not come back — check logs');
-        };
-        setTimeout(poll, 2500);
+                status = await readAdminStatus();
+            } catch (error) { /* Not reachable or missing identity is not replacement evidence. */ }
+            if (status && status.admin_pid !== oldPid) {
+                reportAdminLifecycle(`Admin restarted: PID ${oldPid} → ${status.admin_pid}.`);
+                location.reload();
+                return;
+            }
+            if (status?.admin_restart?.requested && Number.isInteger(status.admin_restart.helper_exit_code)) {
+                throw new Error(`Restart helper exited (${status.admin_restart.helper_exit_code}), but admin PID ${oldPid} is still serving. Check admin_server.log; no request was retried.`);
+            }
+        } while (Date.now() - start < 40000);
+        throw new Error(`Admin restart not confirmed: no replacement for PID ${oldPid} was verified. Check admin_server.log. No request was retried.`);
+    } catch (error) {
+        reportAdminLifecycle(error.message || String(error), true);
+    } finally {
+        adminRestartPending = false;
+        buttons.forEach(button => { button.disabled = false; });
+    }
+}
+
+async function adminAction(action) {
+    if (action === 'restart') return restartAdmin();
+    if (action !== 'shutdown' || adminRestartPending) return;
+    try {
+        const response = await fetch('/shutdown', { method: 'POST', signal: AbortSignal.timeout(10000) });
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            reportAdminLifecycle(data.error || `Admin shutdown failed (HTTP ${response.status}).`, true);
+            return;
+        }
+        reportAdminLifecycle(data.status || 'Admin shutdown requested.');
+    } catch (error) {
+        reportAdminLifecycle('Admin shutdown response unavailable; check its state before retrying.', true);
     }
 }
 
@@ -720,33 +632,14 @@ async function confirmTool(name, msg, opts) {
 
 async function runTool(name, opts = {}) {
     clearTimeout(refreshTimer);
-    const out = document.getElementById(opts.target || 'tool-output');
+    const out = document.getElementById(opts.target || 'out-main');
+    if (!out) { showToast('Output panel unavailable'); scheduleRefresh(); return; }
     const isPre = out.tagName === 'PRE';
     out.classList.remove('error', 'html-mode');
     out.innerHTML = '<span class="spinner"></span> Running ' + esc(name) + '...';
     try {
         const r = await fetch('/tools/' + name, { method: opts.method || 'POST' });
         const d = await r.json();
-        if (d.status === 'login_started' && d.url) {
-            // Auth login flow always renders in the Tools output panel
-            const panel = document.getElementById('tool-output');
-            setView('tools');
-            panel.classList.remove('error', 'html-mode');
-            panel.innerHTML = esc(d.output).replace(/\n/g, '<br>') +
-                '<br><br><a href="' + esc(d.url) + '" target="_blank" style="color:var(--cyan); word-break:break-all;">' + esc(d.url) + '</a>' +
-                '<br><br><div style="margin-top:8px;">After authenticating, paste the code from the callback page:<br>' +
-                '<input id="auth-code-input" type="text" placeholder="paste authorization code" style="width:60%; min-width:280px; margin-top:6px;">' +
-                ' <button class="btn btn-cyan" onclick="submitAuthCode()" style="margin-left:6px;">Submit</button></div>' +
-                '<br><span id="login-poll" style="color:var(--text-mute);">Waiting for login to complete...</span>';
-            if (out !== panel) out.textContent = 'See Tools tab for the login flow.';
-            pollLoginStatus();
-            const inp = document.getElementById('auth-code-input');
-            if (inp) {
-                inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuthCode(); });
-                inp.focus();
-            }
-            return;
-        }
         if (d.status === 'ok_html' && !isPre) {
             out.innerHTML = d.output;
             out.classList.add('html-mode');
@@ -771,50 +664,6 @@ async function runTool(name, opts = {}) {
     scheduleRefresh(30000);
 }
 
-async function submitAuthCode() {
-    const inp = document.getElementById('auth-code-input');
-    if (!inp) return;
-    const code = inp.value.trim();
-    if (!code) { showToast('Paste the authorization code first'); return; }
-    inp.disabled = true;
-    try {
-        const r = await fetch('/tools/auth-submit-code', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code }),
-        });
-        const d = await r.json();
-        showToast(d.output || (d.status === 'ok' ? 'submitted' : 'failed'));
-        if (d.status !== 'ok') inp.disabled = false;
-    } catch (e) {
-        showToast('submit failed: ' + e);
-        inp.disabled = false;
-    }
-}
-
-async function pollLoginStatus() {
-    const poll = document.getElementById('login-poll');
-    if (!poll) return;
-    try {
-        const r = await fetch('/tools/auth-login-status');
-        const d = await r.json();
-        if (d.status === 'waiting') {
-            poll.innerHTML = '<span class="spinner"></span> ' + esc(d.output);
-            setTimeout(pollLoginStatus, 3000);
-        } else if (d.status === 'ok') {
-            poll.style.color = 'var(--green)';
-            poll.textContent = d.output;
-            scheduleRefresh(5000);
-        } else {
-            poll.style.color = 'var(--red)';
-            poll.textContent = d.output;
-            scheduleRefresh(10000);
-        }
-    } catch (e) {
-        poll.textContent = 'Poll failed: ' + e;
-        scheduleRefresh(10000);
-    }
-}
 
 // ── System specs ────────────────────────────────────────────────────
 async function loadSpecs() {
@@ -830,78 +679,6 @@ async function loadSpecs() {
     }
 }
 
-// ── ttyd terminal ───────────────────────────────────────────────────
-function ttydUrl(status) {
-    const scheme = status.ssl ? 'https' : 'http';
-    return `${scheme}://${location.hostname}:${status.port}/`;
-}
-
-async function refreshTtyd() {
-    let s = null;
-    try {
-        const r = await fetch('/api/ttyd-status', { cache: 'no-store' });
-        if (r.ok) s = await r.json();
-    } catch (e) { /* admin down */ }
-    if (!s) return;
-    const dot = document.getElementById('dot-ttyd');
-    if (dot) dot.className = 'dot ' + (s.running ? 'on' : 'off');
-    const frame = document.getElementById('ttyd-frame');
-    const open = document.getElementById('ttyd-open');
-    const hint = document.getElementById('ttyd-hint');
-    const url = ttydUrl(s);
-    open.href = url;
-    open.style.display = s.running ? '' : 'none';
-
-    const hints = [];
-    if (!s.exe) {
-        hints.push('ttyd.exe not found — drop it at <code>bin/ttyd.exe</code> (<a href="https://github.com/tsl0922/ttyd/releases" target="_blank" rel="noopener">releases</a>) or set <code>TTYD_EXE</code>.');
-    }
-    if (s.running && s.ssl) {
-        hints.push('Terminal stays black? Open it in a tab once to accept the self-signed certificate, then reload.');
-    }
-    const remote = !['localhost', '127.0.0.1'].includes(location.hostname);
-    if (s.host === '127.0.0.1' && remote) {
-        hints.push('ttyd is bound to 127.0.0.1 — for remote/Tailscale access set <code>TTYD_HOST=0.0.0.0</code> and <code>TTYD_CRED=user:pass</code>, then restart admin.');
-    }
-    hint.innerHTML = hints.join('<br>');
-
-    if (s.running) {
-        if (!frame.classList.contains('live') || frame.dataset.url !== url) {
-            frame.src = url;
-            frame.dataset.url = url;
-            frame.classList.add('live');
-        }
-    } else {
-        frame.classList.remove('live');
-        frame.removeAttribute('src');
-        delete frame.dataset.url;
-    }
-}
-
-async function ttydStart() {
-    const shell = document.getElementById('ttyd-shell').value;
-    showToast('starting ttyd (' + shell + ')...');
-    try {
-        const r = await fetch('/tools/ttyd-start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ shell }),
-        });
-        const d = await r.json();
-        showToast(d.output || d.status);
-    } catch (e) { showToast('ttyd start failed: ' + e); }
-    setTimeout(refreshTtyd, 800);
-}
-
-async function ttydStop() {
-    if (!await confirmDialog('Stop the web terminal?', 'Stop Terminal')) return;
-    try {
-        const r = await fetch('/tools/ttyd-stop', { method: 'POST' });
-        const d = await r.json();
-        showToast(d.output ? d.output.split('\n')[0] : 'stopped');
-    } catch (e) { showToast('ttyd stop failed: ' + e); }
-    setTimeout(refreshTtyd, 500);
-}
 
 async function switchDb(dbName) {
     showToast('switching database to ' + dbName + '...');
@@ -913,7 +690,7 @@ async function switchDb(dbName) {
         });
         const d = await r.json();
         if (r.ok) {
-            showToast('database changed successfully' + (d.restarted ? ' (restarting Loom)' : ''));
+            showToast('database changed successfully' + (d.restarted ? ' (restarting EXO)' : ''));
         } else {
             showToast('failed to change database: ' + (d.error || 'unknown error'));
         }
@@ -964,8 +741,8 @@ async function saveDbStorage() {
         return;
     }
     const msg = copyCurrent
-        ? 'Save this DB location, stop Main Loom, copy the current SQLite files, then restart Main Loom?'
-        : 'Save this DB location and restart Main Loom? If the DB does not exist, a new empty DB will be created.';
+        ? 'Save this DB location, stop Main EXO, copy the current SQLite files, then restart Main EXO?'
+        : 'Save this DB location and restart Main EXO? If the DB does not exist, a new empty DB will be created.';
     if (!await confirmDialog(msg, 'Change Database Location')) return;
     const btn = document.getElementById('btn-db-save');
     if (btn) btn.disabled = true;
@@ -977,7 +754,7 @@ async function saveDbStorage() {
         });
         const d = await r.json();
         if (r.ok) {
-            showToast('database location saved' + (d.restarted ? ' and Main Loom restarted' : ''));
+            showToast('database location saved' + (d.restarted ? ' and Main EXO restarted' : ''));
             await loadDatabases();
             await loadDbStorage();
             setTimeout(refreshAll, 1500);
@@ -1000,23 +777,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (await confirmDialog('Shut down the admin server?', 'Shutdown Admin')) adminAction('shutdown');
     });
     document.getElementById('btn-specs-refresh').addEventListener('click', loadSpecs);
-    document.getElementById('btn-ttyd-start').addEventListener('click', ttydStart);
-    document.getElementById('btn-ttyd-stop').addEventListener('click', ttydStop);
+    document.getElementById('btn-activity-refresh').addEventListener('click', refreshSupervision);
+    document.getElementById('btn-openrouter-refresh')?.addEventListener('click', () => loadOpenRouterUsage({ force: true }));
+    document.getElementById('btn-acceptance-refresh')?.addEventListener('click', () => loadAcceptance({ force: true }));
+    document.getElementById('btn-extensions-refresh')?.addEventListener('click', loadExtensions);
+    document.getElementById('btn-extension-register')?.addEventListener('click', registerExtension);
     document.getElementById('btn-llama-switch').addEventListener('click', llamaSwitchModel);
     document.getElementById('btn-llama-unload').addEventListener('click', llamaUnloadForComfy);
     document.getElementById('btn-llama-reload').addEventListener('click', llamaReloadSelected);
-    document.getElementById('btn-hermes-status').addEventListener('click', hermesStatus);
-    document.getElementById('btn-prometheus-restart').addEventListener('click', prometheusRestart);
-    document.getElementById('btn-prometheus-stop').addEventListener('click', prometheusStop);
-    document.getElementById('btn-attendant-llama-stop').addEventListener('click', () => attendantStop('llama'));
-    document.getElementById('btn-attendant-dream-stop').addEventListener('click', () => attendantStop('dream'));
     document.getElementById('btn-db-refresh').addEventListener('click', loadDbStorage);
     document.getElementById('btn-db-save').addEventListener('click', saveDbStorage);
 
     await loadDatabases();
     await loadDbStorage();
     await loadMeta();
-    const saved = localStorage.getItem('loom-admin-view');
+    const requested = location.hash.slice(1);
+    const saved = document.getElementById('view-' + requested) ? requested : localStorage.getItem('loom-admin-view');
     if (saved && document.getElementById('view-' + saved)) setView(saved);
     else setView('overview');  // default view is overview
     refreshAll();

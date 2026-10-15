@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-# app-Kayleighbot.js is an OneDrive-sync artifact, not the live file — excluded.
+# app-sync-conflict.js is an OneDrive-sync artifact, not the live file — excluded.
 UI_JS_FILES = [STATIC_DIR / "app.js", STATIC_DIR / "chat.js"]
 
 # A line is a "CC-family whitelist" if it mentions both claude and gemini mode

@@ -24,23 +24,59 @@
     })();
     var _rafId = null;
     var _started = false;
+    var _appearance = window.EXOAppearance?.settings() || {color: 'original', grid: false, stationary: false, fps: 30};
+    var _visualUniforms = null;
+
+    function _useExoloom() {
+        const legacy = container.querySelector(':scope > canvas');
+        if (_appearance.theme === 'exoloom' && window.EXOScene) {
+            if (_rafId !== null) { cancelAnimationFrame(_rafId); _rafId = null; }
+            window.AcidburnGalaxy?.stop();
+            if (legacy) legacy.style.display = 'none';
+            EXOScene.apply(_appearance, _enabled);
+            return true;
+        }
+        window.EXOScene?.clear();
+        if (legacy) legacy.style.display = '';
+        return false;
+    }
 
     // Public API for the settings toggle.
     window.LoomBlackhole = {
+        setAppearance: function (value) {
+            _appearance = value;
+            if (_useExoloom()) return;
+            if (_visualUniforms) {
+                _visualUniforms.exoTint.value.set(window.EXOAppearance.colors[value.color]);
+                _visualUniforms.exoNeon.value = value.color === 'original' ? 0 : 1;
+                _visualUniforms.exoGrid.value = value.grid ? 1 : 0;
+            }
+            if (_enabled && !_started && typeof THREE !== 'undefined') _bootstrap();
+            else if (_enabled && renderer && _rafId === null) {
+                if (galaxyTexture) AcidburnGalaxy.start(() => { galaxyTexture.needsUpdate = true; });
+                animate();
+            }
+        },
         isEnabled: function () { return _enabled; },
         enable: function () {
             if (_enabled) return;
             _enabled = true;
             try { localStorage.setItem('loom-blackhole-disabled', '0'); } catch {}
             container.style.display = '';
+            if (_useExoloom()) return;
             // First-time enable after page load: kick off the loader.
             if (!_started) { _bootstrap(); }
-            else if (typeof animate === 'function') { animate(); }
+            else if (renderer) {
+                if (galaxyTexture) AcidburnGalaxy.start(() => { galaxyTexture.needsUpdate = true; });
+                animate();
+            }
         },
         disable: function () {
             _enabled = false;
             try { localStorage.setItem('loom-blackhole-disabled', '1'); } catch {}
             if (_rafId !== null) { cancelAnimationFrame(_rafId); _rafId = null; }
+            window.AcidburnGalaxy?.stop();
+            window.EXOScene?.apply(_appearance, false);
             container.style.display = 'none';
         },
     };
@@ -49,6 +85,7 @@
     // run so all the helper functions (and _bootstrap below) are defined —
     // window.LoomBlackhole.enable() needs to be able to fire them later.
     if (!_enabled) container.style.display = 'none';
+    _useExoloom();
 
     if (typeof THREE === 'undefined') {
         console.warn('[Blackhole] Three.js not loaded, using CSS fallback');
@@ -94,6 +131,8 @@ const float SPECTRUM_TEX_RATIO_RANGE = 6.48053329012;
 
 uniform vec2 resolution;
 uniform float time;
+uniform vec3 exoTint;
+uniform float exoNeon, exoGrid;
 uniform vec3 cam_pos;
 uniform vec3 cam_x;
 uniform vec3 cam_y;
@@ -269,9 +308,14 @@ void main() {
                     // doppler shift
                     temperature /= ray_doppler_factor * doppler_factor;
 
-                    color += texture2D(accretion_disk_texture, tex_coord)
-                        * accretion_intensity
-                        * BLACK_BODY_COLOR(temperature);
+                    vec4 diskColor = texture2D(accretion_disk_texture, tex_coord)
+                        * accretion_intensity * BLACK_BODY_COLOR(temperature);
+                    float luminance = dot(diskColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    diskColor.rgb = mix(diskColor.rgb, exoTint * luminance * 1.8, exoNeon);
+                    vec2 cell = abs(fract(vec2(r * 1.4, atan(isec.x, isec.y) * 12.0 / M_PI)) - 0.5);
+                    float gridLine = smoothstep(0.43, 0.49, max(cell.x, cell.y));
+                    diskColor.rgb = mix(diskColor.rgb, diskColor.rgb * (0.18 + 1.8 * gridLine), exoGrid);
+                    color += diskColor;
                 }
             }
         }
@@ -416,11 +460,11 @@ void main() {
             galaxyTexture.wrapT = THREE.RepeatWrapping;
             textures.galaxy = galaxyTexture;
 
-            AcidburnGalaxy.start(function () {
-                if (galaxyTexture) {
-                    galaxyTexture.needsUpdate = true;
-                }
-            });
+            if (_enabled && _appearance.theme !== 'exoloom') {
+                AcidburnGalaxy.start(function () {
+                    if (galaxyTexture) galaxyTexture.needsUpdate = true;
+                });
+            }
 
             console.log('[Blackhole] Acidburn galaxy texture ready (animated)');
             onTextureLoaded();
@@ -455,6 +499,9 @@ void main() {
         camera.position.set(cm[2], cm[6], cm[10]);
 
         var uniforms = {
+            exoTint: { value: new THREE.Color(window.EXOAppearance?.colors[_appearance.color] || '#ffffff') },
+            exoNeon: { value: _appearance.color === 'original' ? 0 : 1 },
+            exoGrid: { value: _appearance.grid ? 1 : 0 },
             time: { value: 0.0 },
             resolution: { value: new THREE.Vector2() },
             cam_pos: { value: new THREE.Vector3() },
@@ -467,6 +514,7 @@ void main() {
             galaxy_texture: { value: textures.galaxy },
             spectrum_texture: { value: textures.spectra },
         };
+        _visualUniforms = uniforms;
 
         updateUniforms = function () {
             uniforms.resolution.value.x = renderer.domElement.width;
@@ -496,7 +544,7 @@ void main() {
         onWindowResize();
         window.addEventListener('resize', onWindowResize, false);
 
-        animate();
+        if (_enabled && !_useExoloom()) animate();
         console.log('[Blackhole] Schwarzschild raytracer initialized');
     }
 
@@ -525,14 +573,18 @@ void main() {
         return Math.min(diff, 0.1); // cap at 100ms to avoid jumps
     }
 
-    function animate() {
+    var _lastPaint = 0;
+    function animate(timestamp) {
         if (!_enabled) { _rafId = null; return; }
         _rafId = requestAnimationFrame(animate);
+        if (timestamp && timestamp - _lastPaint < 1000 / (_appearance.fps || 30)) return;
+        _lastPaint = timestamp || 0;
         render();
     }
 
     function render() {
-        observer.move(getFrameDuration());
+        var duration = getFrameDuration();
+        observer.move(_appearance.stationary ? 0 : duration);
         updateCamera();
         updateUniforms();
         renderer.render(scene, camera);
@@ -559,5 +611,5 @@ void main() {
         }
     }
 
-    if (_enabled) _bootstrap();
+    if (_enabled && _appearance.theme !== 'exoloom') _bootstrap();
 })();

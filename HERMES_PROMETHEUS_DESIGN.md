@@ -1,5 +1,7 @@
 # Prometheus + Attendant Hermes design
 
+> Historical design only. Hermes, Dream Space and Prometheus were retired from EXO on 2026-09-06; this document is not an active implementation plan.
+
 > Agreed 2026-07-07 in a design conversation. Not yet implemented.
 > Persistent memory: `project_hermes_prometheus_design.md` (auto-loaded via MEMORY.md).
 

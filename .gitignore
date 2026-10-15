@@ -85,14 +85,19 @@ attached_*.webp
 .env
 .env.*
 
-# User config (persisted settings from UI; per-bot variants like config-Kayleighbot.json)
+# Cloudflare development cache and local Worker state
+.wrangler/
+
+# User config (persisted settings from UI; per-bot variants like config-sync-conflict.json)
 config.json
 config-*.json
+# Admin-managed OpenRouter model slugs (overrides model_catalog.json; see model_registry.py)
+model_overrides.json
 
-# OneDrive sync conflicts / per-bot duplicate copies (e.g. admin-Kayleighbot.js,
-# app-Kayleighbot.js, index-Kayleighbot.html). These are OneDrive-generated
-# duplicates, not source — never track anything with the Kayleighbot suffix.
-*Kayleighbot*
+# OneDrive sync conflicts / per-bot duplicate copies (e.g. admin-sync-conflict.js,
+# app-sync-conflict.js, index-sync-conflict.html). These are OneDrive-generated
+# duplicates, not source — never track anything with the sync-conflict suffix.
+*sync-conflict*
 
 # Screenshots
 Screenshot*.png
@@ -181,10 +186,18 @@ haikus.md
 # pytest cache
 .pytest_cache/
 .pytest_tmp/
+.pytest-*/
 pytest-tmp-*/
+# Workspace-local pytest basetemps from development probes
+/.tmp_agent_*/
+/.tmp_parallel_*/
+/.tmp_permission_*/
+/.tmp_pytest_*/
+/.tmp_chat_workspace_*/
 
 # Generated workspaces
 workspaces/
+ExoHome/
 
 # Runtime-generated / per-machine artifacts (never track)
 .mcp.json

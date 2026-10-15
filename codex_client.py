@@ -5,6 +5,7 @@ approval requests instead of using non-interactive `codex exec`.
 """
 
 import asyncio
+from html import escape
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from loom_agent_prompt import prepend_loom_agent_context
+from loom_agent_prompt import loom_agent_contract_block, merge_system_prompts
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ _IGNORED_APP_SERVER_EVENTS = {
     "remoteControl/status/changed",
     "serverRequest/resolved",
     "turn/started",
+    "thread/tokenUsage/updated",
+    "thread.tokenUsage.updated",
 }
 
 _IGNORED_APP_SERVER_ITEM_TYPES = {
@@ -44,57 +47,10 @@ def _codex_config_args(key: str, value: str) -> list[str]:
     return ["-c", f"{key}={value}"]
 
 
-def _nrol_mcp_config(conv_id: int, server_port: int, force: bool = False) -> dict:
-    if not force and os.environ.get("NROL_AO_AUTO_MCP", "1") in {"0", "false", "False"}:
-        return {}
-    root = Path(__file__).parent
-    nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
-    nrol_server = root / "mcp_servers" / "nrol_ao" / "server.py"
-    if not nrol_repo.exists() or not nrol_server.is_file():
-        return {}
-
-    env = {
-        "NROL_AO_REPO": str(nrol_repo),
-        **(
-            {"NROL_AO_STATE_DIR": os.environ["NROL_AO_STATE_DIR"]}
-            if os.environ.get("NROL_AO_STATE_DIR", "").strip()
-            else {}
-        ),
-        "NROL_AO_ACTIVITY_DIR": os.environ.get(
-            "NROL_AO_ACTIVITY_DIR",
-            str(nrol_repo / "loom" / "mcp_activity"),
-        ),
-        "ALPHA_OMEGA_PORT": os.environ.get("ALPHA_OMEGA_PORT", "8098"),
-        "LOOM_PORT": str(server_port),
-        "LOOM_CONV_ID": str(conv_id),
-        "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-    }
-    try:
-        from config import config as _loom_config
-
-        env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
-        if getattr(_loom_config, "llama_model", ""):
-            env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
-    except Exception:
-        pass
-
-    return {
-        "command": sys.executable,
-        "args": ["-m", "mcp_servers.nrol_ao.server"],
-        "env": env,
-        "required": True,
-        "startup_timeout_sec": 20.0,
-        "tool_timeout_sec": 1200.0,
-        "default_tools_approval_mode": "approve",
-    }
 
 
 def _web_tools_mcp_config() -> dict:
-    """Keyless web_search/web_fetch (DuckDuckGo + trafilatura) for operators.
-
-    Mirrors the claude_client web-tools registration: NROL operators read
-    sources on the open web but codex has no Anthropic WebSearch/WebFetch.
-    """
+    'Keyless web_search/web_fetch (DuckDuckGo + trafilatura) for operators.\n\n    sources on the open web but codex has no Anthropic WebSearch/WebFetch.\n    '
     script = Path(__file__).parent / "mcp_web_tools.py"
     if not script.is_file():
         return {}
@@ -107,50 +63,102 @@ def _web_tools_mcp_config() -> dict:
     }
 
 
-def _ensure_operator_instructions(workspace_root: Path) -> None:
-    """Land the operator role rules where codex auto-loads them: AGENTS.md in cwd.
-
-    The operator workspace is shared across operator conversations, so an
-    idempotent overwrite keeps it current with OPERATOR.md. The app-server
-    baseInstructions field is deliberately not used — it replaces codex's
-    default instructions wholesale instead of adding to them.
-    """
-    operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
-    if operator_md.is_file():
-        (workspace_root / "AGENTS.md").write_text(
-            operator_md.read_text(encoding="utf-8"), encoding="utf-8"
+def _agent_control_mcp_config(
+    conv_id: int,
+    server_port: int,
+    *,
+    agent_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    client_instance_id: str | None = None,
+    workspace_root: str | None = None,
+    local_search: bool = False,
+    history_token: str | None = None,
+) -> dict:
+    """Configure Loom's portable child-run control surface."""
+    script = Path(__file__).parent / "mcp_loom_agents.py"
+    if not script.is_file():
+        return {}
+    env = {
+        "LOOM_CONV_ID": str(conv_id),
+        "LOOM_PORT": str(server_port),
+        "LOOM_WORKSPACE_ROOT": str(workspace_root or Path.cwd()),
+    }
+    if conv_id and workspace_root:
+        from search_space.scopes import issue_scope
+        env["LOOM_HISTORY_TOKEN"] = history_token or issue_scope(
+            conv_id, workspace_root, local=local_search,
+            run_id=agent_run_id or parent_run_id, client_instance_id=client_instance_id,
         )
+    if agent_run_id:
+        env["LOOM_AGENT_RUN_ID"] = str(agent_run_id)
+    if parent_run_id:
+        env["LOOM_PARENT_RUN_ID"] = str(parent_run_id)
+    if client_instance_id:
+        env["LOOM_CLIENT_INSTANCE_ID"] = str(client_instance_id)
+    return {
+        "command": sys.executable,
+        "args": [str(script)],
+        "env": env,
+        "startup_timeout_sec": 20.0,
+        "tool_timeout_sec": 1200.0,
+        "default_tools_approval_mode": "approve",
+    }
 
 
-def _prepare_codex_prompt(
-    prompt: str,
+
+
+def _codex_developer_instructions(
+    configured_instructions: str | None = None,
     backstage_parent_id: int | None = None,
-    nrol_operator: bool = False,
-) -> str:
-    """Inject the Loom contract for ordinary Codex sessions."""
-    if backstage_parent_id or nrol_operator:
-        return prompt
-    return prepend_loom_agent_context(prompt, "codex")
+    
+) -> str | None:
+    """Merge Loom into Codex's additive developer-instruction channel.
 
-
-def _thread_mcp_servers(conv_id: int, server_port: int, nrol_operator: bool = False) -> dict:
-    """MCP servers for a codex thread, keyed by server name.
-
-    Operator threads get exactly nrol-ao + web-tools — the codex mirror of
-    --strict-mcp-config. That holds because the thread config is the whole
-    MCP surface only while ~/.codex/config.toml carries no mcp_servers of
-    its own (true as of 2026-06-11); if user-scope servers ever appear they
-    need explicit `enabled=false` overrides here.
+    ``baseInstructions`` replaces Codex's built-in model instructions and must
+    not be used here.  ``developerInstructions`` is a separate developer-role
+    message that Codex carries with the native thread and restores after
+    compaction.  Preserve any user/project developer instructions resolved by
+    ``config/read`` instead of shadowing them with Loom's request override.
     """
-    servers: dict[str, dict] = {}
-    nrol = _nrol_mcp_config(conv_id, server_port, force=nrol_operator)
-    if nrol:
-        servers["nrol-ao"] = nrol
-    if nrol_operator:
-        web = _web_tools_mcp_config()
-        if web:
-            servers["web-tools"] = web
-    return servers
+    if backstage_parent_id:
+        # Dedicated roles already receive their own instructions. Omitting the
+        # request override lets Codex resolve normal config layers itself.
+        return None
+    return merge_system_prompts(
+        configured_instructions,
+        loom_agent_contract_block("codex"),
+    ) or None
+
+
+def _configured_developer_instructions(config_response: dict) -> str | None:
+    """Extract effective developer instructions from a config/read response."""
+    result = config_response.get("result") if isinstance(config_response, dict) else None
+    config = result.get("config") if isinstance(result, dict) else None
+    value = config.get("developer_instructions") if isinstance(config, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _thread_mcp_servers(
+    conv_id: int,
+    server_port: int,
+    
+    *,
+    agent_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    client_instance_id: str | None = None,
+    workspace_root: str | None = None,
+) -> dict:
+    "Return Loom's thread-scoped MCP surface for Codex.\n\n    "
+    control = _agent_control_mcp_config(
+        conv_id,
+        server_port,
+        agent_run_id=agent_run_id,
+        parent_run_id=parent_run_id,
+        client_instance_id=client_instance_id,
+        workspace_root=workspace_root,
+    )
+    return {"loom-agent-control": control} if control else {}
+
 
 
 def _mcp_server_config_args(name: str, config: dict) -> list[str]:
@@ -299,11 +307,17 @@ def _codex_tool_output(item: dict) -> str:
             return json.dumps(changes, indent=2)
         except TypeError:
             return str(changes)
-    for key in ("aggregated_output", "formatted_output", "output", "result", "text", "content", "error"):
+    for key in ("aggregatedOutput", "aggregated_output", "formatted_output", "output", "result", "text", "content", "error"):
         value = item.get(key)
         if value is not None:
             return _text_from_value(value)
     return ""
+
+
+def _codex_tool_failed(item: dict) -> bool:
+    """A rejected tool is not successful, nor necessarily a failed whole turn."""
+    exit_code = item.get("exitCode", item.get("exit_code"))
+    return item.get("status") in {"failed", "declined"} or exit_code not in (None, 0)
 
 
 def _codex_diff_payload(raw: dict) -> dict:
@@ -347,13 +361,6 @@ def _codex_diff_tool_id(raw: dict) -> str:
     return f"codex-diff:{ident}"
 
 
-def _codex_runner_error(item: dict) -> str:
-    output = _codex_tool_output(item)
-    if "windows sandbox: timed out" in output or "runner pipe-in" in output:
-        return "Codex Windows sandbox runner failed before the command started."
-    return ""
-
-
 def _codex_usage(raw: dict) -> dict | None:
     """Normalize token usage from turn/item payloads when Codex includes it."""
     params = raw.get("params") or {}
@@ -377,6 +384,19 @@ def _codex_usage(raw: dict) -> dict | None:
     usage = next((candidate for candidate in candidates if isinstance(candidate, dict)), None)
     if not usage:
         return None
+
+    # Current app-server envelopes distinguish the last request's context
+    # from cumulative session billing. Never display 'total' as context size.
+    if isinstance(usage.get("last"), dict):
+        last = usage["last"]
+        total = usage.get("total") or {}
+        return {
+            "type": "usage",
+            "input_tokens": int(last.get("inputTokens") or 0),
+            "output_tokens": int(total.get("outputTokens") or 0),
+            "_first_output_tokens": int(last.get("outputTokens") or 0),
+            "context_window": usage.get("modelContextWindow"),
+        }
 
     input_tokens = (
         usage.get("input_tokens")
@@ -462,13 +482,13 @@ def _codex_terminal_status(raw: dict, params: dict | None = None) -> tuple[bool,
     params = params or raw.get("params") or {}
     etype = raw.get("type") or raw.get("method") or ""
     status = _codex_status_value(raw, params)
+    # A thread is a long-lived native conversation, not one model turn.
+    # App-server may report it idle between tool/image-view phases while the
+    # active turn is still running. Treating that as turn completion caused
+    # Loom to kill the app-server and record a synthetic user interruption.
+    # Only an exact turn terminal event may finalize an active generation.
     if etype in ("thread/status/changed", "thread.status.changed"):
-        if status in ("idle", "completed", "complete", "finished", "success", "succeeded"):
-            return True, False, ""
-        if status in ("failed", "error", "cancelled", "canceled", "interrupted"):
-            return True, True, _text_from_value(
-                params.get("error") or raw.get("error") or "Codex thread failed"
-            )
+        return False, False, ""
     if etype in ("turn/status/changed", "turn.status.changed"):
         if status in ("completed", "complete", "finished", "success", "succeeded"):
             return True, False, ""
@@ -477,6 +497,23 @@ def _codex_terminal_status(raw: dict, params: dict | None = None) -> tuple[bool,
                 params.get("error") or raw.get("error") or "Codex turn failed"
             )
     return False, False, ""
+
+
+def _codex_completed_turn_error(raw: dict, params: dict | None = None) -> str:
+    """Extract an error from a terminal turn payload before treating it as success."""
+    params = params or raw.get("params") or {}
+    turn = params.get("turn") or raw.get("turn") or {}
+    error = (
+        turn.get("error")
+        or params.get("error")
+        or raw.get("error")
+    )
+    if error:
+        return _text_from_value(error)
+    status = _codex_status_value(raw, params)
+    if status in {"failed", "error", "cancelled", "canceled", "interrupted"}:
+        return f"Codex turn {status}"
+    return ""
 
 
 def _find_codex_exe() -> str:
@@ -536,6 +573,136 @@ def _normalize_codex_model_selector(model: str) -> str:
     return raw
 
 
+def codex_models_cache_path() -> Path:
+    return Path(os.environ.get("USERPROFILE") or Path.home()) / ".codex" / "models_cache.json"
+
+
+def _parse_codex_models_json(data: dict) -> list[dict]:
+    models = []
+    for m in data.get("models", []):
+        slug = m.get("slug") or m.get("id") or m.get("model")
+        display_name = m.get("display_name") or m.get("displayName") or slug
+        if (
+            slug
+            and display_name
+            and m.get("visibility", "list") != "hide"
+            and m.get("supported_in_api", True) is not False
+        ):
+            models.append({
+                "value": f"codex-{slug}",
+                "label": f"Codex ({display_name})",
+            })
+    return models
+
+
+_CODEX_STREAM_LIMIT = 128 * 1024 * 1024  # 128 MiB buffer for app-server JSON-RPC lines
+_CODEX_COMPLETION_RECHECK_SEC = 15.0
+
+
+async def discover_codex_models(force: bool = False) -> list[dict]:
+    """Query `codex app-server` via JSON-RPC `model/list` or read cached models.
+
+    Returns dropdown model rows: [{"value": "codex-...", "label": "Codex (...)"}].
+    """
+    import time
+    cache_path = codex_models_cache_path()
+    if not force and cache_path.exists():
+        try:
+            st = cache_path.stat()
+            if time.time() - st.st_mtime < 3600.0:
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+                models = _parse_codex_models_json(data)
+                if models:
+                    return models
+        except Exception as e:
+            log.debug(f"[CODEX] Failed reading models cache: {e}")
+
+    # Active discovery via lightweight codex app-server
+    codex_exe = _find_codex_exe()
+    proc = None
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000 | 0x00000200
+        proc = await asyncio.create_subprocess_exec(
+            codex_exe, "app-server", "--stdio", "--disable", "hooks",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_CODEX_STREAM_LIMIT,
+            **kwargs,
+        )
+
+        async def _rpc_call(req_id: int, method: str, params: dict | None = None) -> dict:
+            line = json.dumps({"id": req_id, "method": method, "params": params or {}}) + "\n"
+            proc.stdin.write(line.encode("utf-8"))
+            await proc.stdin.drain()
+            while True:
+                resp_line = await proc.stdout.readline()
+                if not resp_line:
+                    raise EOFError("codex app-server closed stdout")
+                try:
+                    msg = json.loads(resp_line.decode("utf-8", errors="replace"))
+                    if msg.get("id") == req_id:
+                        return msg
+                except json.JSONDecodeError:
+                    continue
+
+        async def _notify(method: str, params: dict | None = None) -> None:
+            line = json.dumps({"method": method, "params": params or {}}) + "\n"
+            proc.stdin.write(line.encode("utf-8"))
+            await proc.stdin.drain()
+
+        async with asyncio.timeout(15.0):
+            await _rpc_call(1, "initialize", {
+                "clientInfo": {"name": "Loom", "version": "1"},
+                "capabilities": {"experimental": True},
+            })
+            await _notify("initialized")
+            list_resp = await _rpc_call(2, "model/list", {})
+
+        raw_models = list_resp.get("result", {}).get("data", [])
+        if raw_models:
+            cache_items = []
+            for m in raw_models:
+                slug = m.get("id") or m.get("model")
+                display_name = m.get("displayName") or m.get("display_name") or slug
+                cache_items.append({
+                    "slug": slug,
+                    "display_name": display_name,
+                    "description": m.get("description", ""),
+                })
+            try:
+                import tempfile
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent,
+                                                 suffix=".tmp", delete=False) as output:
+                    temp_p = Path(output.name)
+                    json.dump({"models": cache_items, "fetched_at": time.time()}, output, indent=2)
+                temp_p.replace(cache_path)
+            except Exception as ce:
+                log.debug(f"[CODEX] Failed saving models_cache.json: {ce}")
+
+            return _parse_codex_models_json({"models": cache_items})
+    except Exception as e:
+        err_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        log.warning(f"[CODEX] Active model discovery failed: {err_detail}")
+    finally:
+        if proc is not None:
+            try:
+                await cancel_codex(proc)
+            except Exception:
+                pass
+
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            return _parse_codex_models_json(data)
+        except Exception:
+            pass
+    return []
+
+
 def _default_codex_model() -> str:
     env_default = os.environ.get("LOOM_CODEX_DEFAULT_MODEL") or os.environ.get("CODEX_MODEL")
     if env_default and env_default.strip():
@@ -546,7 +713,11 @@ def _default_codex_model() -> str:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
         for entry in data.get("models", []):
             slug = entry.get("slug")
-            if slug and entry.get("supported_in_api", True) is not False:
+            if (
+                slug
+                and entry.get("visibility", "list") != "hide"
+                and entry.get("supported_in_api", True) is not False
+            ):
                 return _normalize_codex_model_selector(slug)
     except Exception:
         pass
@@ -627,17 +798,9 @@ def _codex_approval_policy(permission_mode: str | None) -> str:
     return "on-request"
 
 
-def _codex_launch_policies(permission_mode: str | None, nrol_operator: bool = False) -> tuple[str, str]:
-    """(approval_policy, sandbox_mode) for a codex launch.
-
-    Operator threads: read-only sandbox with approvalPolicy=never, so write
-    and escalation attempts fail instead of raising a clickable prompt.
-    Codex cannot drop its shell, so the guarantee is "shell exists but
-    cannot write"; posterior commits still raise their own Loom approval
-    inside the nrol-ao MCP server.
-    """
-    if nrol_operator:
-        return "never", "read-only"
+def _codex_launch_policies(permission_mode: str | None) -> tuple[str, str]:
+    '(approval_policy, sandbox_mode) for a codex launch.\n\n    Operator threads: read-only sandbox with approvalPolicy=never, so write\n    and escalation attempts fail instead of raising a clickable prompt.\n    Codex cannot drop its shell, so the guarantee is "shell exists but\n    cannot write"; posterior commits still raise their own Loom approval\n    '
+    pass
     return _codex_approval_policy(permission_mode), "workspace-write"
 
 
@@ -649,6 +812,7 @@ def _codex_thread_request(
     thread_config: dict | None = None,
     resume_session_id: str | None = None,
     fork_session: bool = False,
+    developer_instructions: str | None = None,
 ) -> tuple[str, dict]:
     """Build the app-server thread request method and params."""
     params = {
@@ -663,9 +827,15 @@ def _codex_thread_request(
     }
     if thread_config:
         params["config"] = thread_config
+    if developer_instructions:
+        # This supplements Codex's base instructions. Supplying it on
+        # resume/fork also upgrades pre-fix Loom threads whose contract only
+        # existed as repeated user-prompt XML.
+        params["developerInstructions"] = developer_instructions
 
     if resume_session_id:
         params["threadId"] = resume_session_id
+        params["excludeTurns"] = True
         return ("thread/fork" if fork_session else "thread/resume"), params
 
     params["sessionStartSource"] = "startup"
@@ -691,10 +861,8 @@ def _app_user_input(prompt: str) -> list[dict]:
     return [{"type": "text", "text": prompt}]
 
 
-def _app_sandbox_policy(cwd: str, nrol_operator: bool = False) -> dict:
-    if nrol_operator:
-        # Operators read sources but never write through the shell.
-        return {"type": "readOnly"}
+def _app_sandbox_policy(cwd: str) -> dict:
+    pass
     return {
         "type": "workspaceWrite",
         "writableRoots": [cwd],
@@ -726,12 +894,52 @@ def _codex_goal_from_response(response: dict) -> dict | None:
     return goal if isinstance(goal, dict) else None
 
 
+def _mcp_approval_params(params: dict, pending_items: dict) -> dict:
+    """Join protocol evidence, never extract tool identity from display prose."""
+    enriched = dict(params)
+    enriched.pop("_loom_mcp_item", None)
+    meta = params.get("_meta") or {}
+    if not isinstance(meta, dict) or meta.get("codex_approval_kind") != "mcp_tool_call":
+        return enriched
+    if not all(params.get(key) for key in ("threadId", "turnId", "serverName")):
+        return enriched
+    args = meta.get("tool_params")
+    candidates = [item for item in pending_items.values()
+                  if item.get("threadId") == params.get("threadId")
+                  and item.get("turnId") == params.get("turnId")
+                  and item.get("server") == params.get("serverName")
+                  and isinstance(args, dict) and item.get("arguments") == args]
+    if len(candidates) == 1:
+        enriched["_loom_mcp_item"] = candidates[0]
+    return enriched
+
+
+def _is_mcp_tool_approval(params: dict) -> bool:
+    meta = params.get("_meta") or {}
+    schema = params.get("requestedSchema") or {}
+    return (params.get("mode") == "form" and isinstance(meta, dict)
+            and meta.get("codex_approval_kind") == "mcp_tool_call"
+            and isinstance(schema, dict) and schema.get("type") == "object"
+            and not schema.get("properties") and not schema.get("required"))
+
+
 def _app_permission_payload(method: str, params: dict) -> tuple[str, dict]:
+    if method == "mcpServer/elicitation/request":
+        item = params.get("_loom_mcp_item") or {}
+        if item.get("server") and item.get("tool") and isinstance(item.get("arguments"), dict):
+            return f"mcp__{item['server']}__{item['tool']}", dict(item["arguments"])
+        # An ambiguous join may be reviewed once, but cannot inherit a read
+        # classification or remembered tool grant based on its display title.
+        return "MCPToolApproval", {k: v for k, v in params.items() if k != "_loom_mcp_item"}
     if method == "item/commandExecution/requestApproval":
         command = params.get("command") or params.get("cmd") or params.get("argv") or params.get("execCommand")
-        if isinstance(command, list):
-            command = " ".join(str(part) for part in command)
-        return "Bash", {"command": command or "", **params}
+        from permission_commands import display_argv
+        payload = dict(params)
+        if isinstance(command, list) and all(isinstance(part, str) for part in command):
+            payload["command_argv"] = command[:]
+            command = display_argv(command)
+        payload["command"] = command or ""
+        return "Bash", payload
     if method == "item/fileChange/requestApproval":
         return "Edit", params
     if method == "item/permissions/requestApproval":
@@ -751,6 +959,9 @@ def _requested_permissions(params: dict) -> dict:
 
 def _app_approval_response(method: str, allow: bool, always: bool, params: dict | None = None) -> dict:
     params = params or {}
+    if method == "mcpServer/elicitation/request":
+        # Remembered rules remain Loom-owned; never grant MCP-wide persistence.
+        return {"action": "accept" if allow else "decline", "content": {} if allow else None}
     decision = "acceptForSession" if allow and always else ("accept" if allow else "decline")
     if method == "item/permissions/requestApproval":
         if allow:
@@ -771,6 +982,29 @@ def _app_approval_response(method: str, allow: bool, always: bool, params: dict 
     return {"decision": decision}
 
 
+def _permission_feedback_text(result: dict, *, allow: bool) -> str:
+    """Format meaningful permission feedback without inventing a user choice."""
+    feedback = str(result.get("feedback") or "").strip()
+    source = str(result.get("decision_source") or "")
+    if not feedback and not allow and source.startswith("loom_"):
+        feedback = str(result.get("message") or "").strip()
+    if not feedback:
+        return ""
+    source_attr = escape(source or "user", quote=True)
+    if allow:
+        decision = "allowed"
+    elif source == "loom_policy":
+        decision = "blocked"
+    elif source and source != "user":
+        decision = "cancelled"
+    else:
+        decision = "denied"
+    return (
+        f'<loom_permission_feedback result="{decision}" source="{source_attr}">'
+        f"{escape(feedback)}</loom_permission_feedback>"
+    )
+
+
 async def _post_loom_permission(
     server_port: int,
     conv_id: int,
@@ -788,12 +1022,24 @@ async def _post_loom_permission(
         "approval_method": method,
         "permission_scope": permission_scope,
     }
+    for env_name, payload_name in (
+        ("LOOM_AGENT_RUN_ID", "agent_run_id"),
+        ("LOOM_CLIENT_INSTANCE_ID", "client_instance_id"),
+    ):
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            task = asyncio.current_task()
+            attr_name = "_agent_run_id" if payload_name == "agent_run_id" else "_client_instance_id"
+            value = str(getattr(task, attr_name, "") or "").strip() if task else ""
+        if value:
+            payload[payload_name] = value
     if permission_request_handler is not None:
         try:
             return await permission_request_handler(payload)
         except Exception as exc:
-            log.exception("[CODEX] Direct Loom permission handler failed")
-            return {"allow": False, "message": f"Loom permission handler failed: {exc}"}
+            log.warning("[CODEX] Direct Loom permission handler failed (%s)", type(exc).__name__)
+            return {"allow": False, "decision_source": "bridge_error",
+                    "message": f"Loom permission handler failed ({type(exc).__name__})."}
 
     def _post() -> dict:
         body = json.dumps(payload).encode("utf-8")
@@ -807,7 +1053,8 @@ async def _post_loom_permission(
             with urllib.request.urlopen(req, timeout=86400) as resp:
                 return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
         except urllib.error.URLError as exc:
-            return {"allow": False, "message": f"Loom permission bridge failed: {exc}"}
+            return {"allow": False, "decision_source": "bridge_error",
+                    "message": f"Loom permission bridge failed ({type(exc).__name__})."}
 
     return await asyncio.to_thread(_post)
 
@@ -823,7 +1070,7 @@ async def manage_codex_goal(
     objective: str | None = None,
     status: str | None = None,
     token_budget: int | None = None,
-    nrol_operator: bool = False,
+    
 ) -> dict:
     """Run a short app-server control session for Codex thread goal commands."""
     workspace_root = Path(cwd).resolve()
@@ -832,8 +1079,14 @@ async def manage_codex_goal(
 
     codex_model = _loom_model_to_codex(model)
     codex_exe = _find_codex_exe()
-    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode, nrol_operator)
-    mcp_servers_cfg = _thread_mcp_servers(conv_id, server_port, nrol_operator)
+    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode)
+    mcp_servers_cfg = _thread_mcp_servers(
+        conv_id,
+        server_port,
+        
+        client_instance_id=getattr(asyncio.current_task(), "_client_instance_id", None),
+        workspace_root=cwd,
+    )
     mcp_args = [
         arg
         for name, server_cfg in mcp_servers_cfg.items()
@@ -847,8 +1100,12 @@ async def manage_codex_goal(
         "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
         "LOOM_WORKSPACE_ROOT": cwd,
     }
-    if nrol_operator:
-        env["LOOM_NROL_OPERATOR"] = "1"
+    pass
+    if preparation:
+        # Defense in depth for every preparation launch, operator or not:
+        # mark the child as preparation so any downstream tool gate
+        # (cc_permission_hook) denies every tool call.
+        env["LOOM_PREPARATION"] = "1"
 
     kwargs = {}
     if sys.platform == "win32":
@@ -861,7 +1118,7 @@ async def manage_codex_goal(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024,
+        limit=_CODEX_STREAM_LIMIT,
         **kwargs,
     )
 
@@ -934,11 +1191,11 @@ async def manage_codex_goal(
         except Exception:
             pass
         if proc.returncode is None:
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
+            # The npm ``codex.cmd`` wrapper owns a Node/app-server process
+            # tree. Terminating only the wrapper can orphan the actual agent,
+            # so every cleanup path uses the same tree-aware cancellation.
+            await cancel_codex(proc)
+        else:
             await proc.wait()
         if not stdout_task.done():
             stdout_task.cancel()
@@ -1009,24 +1266,109 @@ async def manage_codex_goal(
         await _cleanup()
 
 
+def _completed_rollout_tail(path: str, session_id: str) -> dict | None:
+    """Read terminal evidence from an immutable native session log.
+
+    Bounded to 2 MiB, with the session header checked independently. A newer
+    started/aborted turn prevents accepting an ancestor's completion.
+    """
+    from datetime import datetime
+    with open(path, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        header = json.loads(stream.readline(256 * 1024))
+        if header.get("type") != "session_meta" or (header.get("payload") or {}).get("id") != session_id:
+            return None
+        size = stream.seek(0, 2)
+        offset = max(0, size - 2 * 1024 * 1024)
+        stream.seek(offset)
+        if offset:
+            stream.readline(2 * 1024 * 1024)  # Discard a potentially partial JSON line.
+        tail = stream.read(2 * 1024 * 1024)
+        after = os.fstat(stream.fileno())
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return None
+    for line in reversed(tail.splitlines()):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return None  # A partial/corrupt newest record cannot certify completion.
+        payload = item.get("payload") or {}
+        if item.get("type") != "event_msg" or payload.get("type") not in {"task_complete", "task_started", "turn_aborted"}:
+            continue
+        if payload.get("type") != "task_complete" or not payload.get("turn_id"):
+            return None
+        # task_complete means ended, not necessarily succeeded. Failed native
+        # turns carry error here, and may have no final assistant message.
+        if payload.get("error") or not str(payload.get("last_agent_message") or "").strip():
+            return None
+        return {"id": payload["turn_id"], "status": "completed", "error": None,
+                "startedAt": payload.get("started_at"),
+                "completedAt": datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")).timestamp(),
+                "source": "codex_rollout_task_complete"}
+    return None
+
+
+async def read_codex_last_turn(session_id: str, cwd: str) -> dict | None:
+    """Read only the exact UUIDv7 snapshot's bounded journal tail.
+
+    The installed app-server cannot read unloaded turns without resuming them.
+    Use its local journal instead; do not launch a provider, change its state,
+    scan historical sessions recursively, or add overhead to normal resumes.
+    Unknown IDs/layouts or missing evidence simply remain non-resumable.
+    """
+    from datetime import datetime, timedelta, timezone
+    from uuid import UUID
+
+    def read():
+        ident = UUID(session_id)
+        if ident.version != 7 or str(ident) != session_id:
+            return None
+        day = datetime.fromtimestamp(int(ident.hex[:12], 16) / 1000, timezone.utc)
+        native_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        candidates = []
+        for delta in (0, -1, 1):
+            dated = native_home / "sessions" / (day + timedelta(days=delta)).strftime("%Y/%m/%d")
+            candidates.extend(dated.glob(f"rollout-*-{session_id}.jsonl"))
+        if len(candidates) != 1:
+            return None
+        return _completed_rollout_tail(str(candidates[0]), session_id)
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(read), timeout=2)
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, OverflowError, TimeoutError):
+        log.warning("[CODEX] Prior terminal verification unavailable; preserving history-rebuild policy")
+    return None
+
+
 async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                     model: str = "Codex (GPT-4o)", effort: str = "high",
                     permission_mode: str = "default",
                     resume_session_id: str = None, fork_session: bool = False,
                     backstage_parent_id: int | None = None,
-                    nrol_operator: bool = False,
+                    
                     permission_request_handler=None,
-                    codex_goal: dict | None = None):
-    """Launch Codex app-server and yield Loom-compatible stream events."""
+                    codex_goal: dict | None = None,
+                    permission_scope: str = "",
+                    agent_run_id: str | None = None,
+                    preparation: bool = False):
+    """Launch Codex app-server and yield Loom-compatible stream events.
+
+    preparation=True requests a tool-free transport: read-only sandbox,
+    approval never, empty MCP configuration and no writable roots. Ordinary
+    agent launch defaults are never used for preparation.
+    """
     workspace_root = Path(cwd).resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
     cwd = str(workspace_root)
 
     codex_model = _loom_model_to_codex(model)
     codex_exe = _find_codex_exe()
-    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode, nrol_operator)
-    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-    permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
+    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode)
+    if preparation:
+        approval_policy, sandbox_mode = "never", "read-only"
+    task = asyncio.current_task()
+    gen_key = getattr(task, "_gen_key", None)
+    permission_scope = permission_scope or (f"gen:{gen_key[2]}" if gen_key else "")
     if permission_mode == "plan":
         plan_instruction = (
             "You are running in PLAN MODE. Your task is to analyze the codebase and write a comprehensive "
@@ -1037,11 +1379,24 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         )
         prompt = f"{plan_instruction}\n\n{prompt}"
 
-    if nrol_operator:
-        _ensure_operator_instructions(workspace_root)
-    elif not backstage_parent_id:
-        prompt = _prepare_codex_prompt(prompt, backstage_parent_id, nrol_operator)
-    mcp_servers_cfg = _thread_mcp_servers(conv_id, server_port, nrol_operator)
+    pass
+    effective_agent_run_id = agent_run_id or (f"gen:{gen_key[2]}" if gen_key else None)
+    effective_parent_run_id = getattr(task, "_parent_run_id", None) or (
+        f"gen:{gen_key[2]}" if gen_key and not agent_run_id else None
+    )
+    if preparation:
+        # Tool-free preparation: empty MCP configuration; no agent-control,
+        mcp_servers_cfg = {}
+    else:
+        mcp_servers_cfg = _thread_mcp_servers(
+            conv_id,
+            server_port,
+            
+            agent_run_id=effective_agent_run_id,
+            parent_run_id=effective_parent_run_id,
+            client_instance_id=getattr(task, "_client_instance_id", None),
+            workspace_root=cwd,
+        )
     mcp_args = [
         arg
         for name, server_cfg in mcp_servers_cfg.items()
@@ -1063,7 +1418,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         "approvals_reviewer": "user",
         "sandbox": sandbox_mode,
         "cwd": cwd,
-        "writable_roots": [] if nrol_operator else [cwd],
+        "writable_roots": [] if (preparation) else [cwd],
         "hook_path": None,
         "hook_scope": "disabled",
         "mcp_servers": list(mcp_servers_cfg),
@@ -1076,10 +1431,23 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
         "LOOM_WORKSPACE_ROOT": cwd,
     }
+    if agent_run_id:
+        env["LOOM_AGENT_RUN_ID"] = str(agent_run_id)
+    if permission_scope:
+        env["LOOM_PERMISSION_SCOPE"] = str(permission_scope)
+    elif gen_key:
+        env["LOOM_PERMISSION_SCOPE"] = f"gen:{gen_key[2]}"
+    client_instance_id = getattr(task, "_client_instance_id", None)
+    if client_instance_id:
+        env["LOOM_CLIENT_INSTANCE_ID"] = str(client_instance_id)
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
-    if nrol_operator:
-        env["LOOM_NROL_OPERATOR"] = "1"
+    pass
+    if preparation:
+        # Defense in depth for every preparation launch, operator or not:
+        # mark the child as preparation so any downstream tool gate
+        # (cc_permission_hook) denies every tool call.
+        env["LOOM_PREPARATION"] = "1"
 
     kwargs = {}
     if sys.platform == "win32":
@@ -1090,7 +1458,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024,
+        limit=_CODEX_STREAM_LIMIT,
         **kwargs
     )
 
@@ -1108,10 +1476,13 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
     stderr_task = asyncio.create_task(_read_stderr())
 
     pending_responses: dict[str | int, asyncio.Future] = {}
+    permission_feedback_tasks: set[asyncio.Task] = set()
+    pending_mcp_items: dict[str, dict] = {}
     app_messages: asyncio.Queue[dict] = asyncio.Queue()
     request_id = 0
 
     async def _read_stdout():
+        stdout_error = None
         try:
             async for line in proc.stdout:
                 line = line.strip()
@@ -1131,7 +1502,29 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 else:
                     await app_messages.put(raw)
         except Exception as e:
-            await app_messages.put({"type": "error", "message": f"Codex app-server stdout failed: {e}"})
+            if isinstance(e, ValueError) and ("chunk exceed the limit" in str(e) or "Separator is not found" in str(e)):
+                stdout_error = f"Codex app-server stdout line exceeded buffer limit: {e}"
+            else:
+                stdout_error = f"Codex app-server stdout failed: {e}"
+        finally:
+            # EOF is terminal even when the pipe closes cleanly. Previously
+            # the reader simply returned and the event stream remained blocked
+            # forever on app_messages.get(), leaving the generation and every
+            # queued continuation behind it permanently active.
+            exit_message = stdout_error or (
+                "Codex app-server closed its output before the turn completed"
+            )
+            for fut in list(pending_responses.values()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError(exit_message))
+            pending_responses.clear()
+            await app_messages.put(
+                {
+                    "type": "codex_app_server_eof",
+                    "message": exit_message,
+                    "returncode": proc.returncode,
+                }
+            )
 
     stdout_task = asyncio.create_task(_read_stdout())
 
@@ -1157,15 +1550,22 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         method = raw.get("method") or ""
         rid = raw.get("id")
         params = raw.get("params") or {}
+        if method == "mcpServer/elicitation/request":
+            if not _is_mcp_tool_approval(params):
+                await app_messages.put({"type": "loom_permission_policy_denied",
+                    "message": "Loom cannot answer this MCP input form; it was cancelled by the bridge, not denied by the user."})
+                await _send({"id": rid, "result": {"action": "cancel", "content": None}})
+                return
+            params = _mcp_approval_params(params, pending_mcp_items)
         if method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
             "item/permissions/requestApproval",
             "item/tool/requestUserInput",
+            "mcpServer/elicitation/request",
         }:
             tool_name, _ = _app_permission_payload(method, params)
             print(f"[CODEX] Waiting for Loom permission: method={method} tool={tool_name} request_id={rid}")
-            print(f"[CODEX] Approval request params: {_compact_json(params)}")
             result = await _post_loom_permission(
                 server_port,
                 conv_id,
@@ -1176,10 +1576,45 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
             )
             allow = bool(result.get("allow"))
             always = bool(result.get("always"))
+            if not allow and result.get("decision_source") == "loom_policy":
+                await app_messages.put(
+                    {
+                        "type": "loom_permission_policy_denied",
+                        "message": result.get("message")
+                        or "Blocked by Loom command policy",
+                    }
+                )
             print(f"[CODEX] Loom permission resolved: method={method} allow={allow} always={always} request_id={rid}")
             response = _app_approval_response(method, allow, always, params)
-            print(f"[CODEX] Approval response payload: {_compact_json(response)}")
             await _send({"id": rid, "result": response})
+            feedback_text = _permission_feedback_text(result, allow=allow)
+            thread_id = str(params.get("threadId") or params.get("thread_id") or "")
+            turn_id = str(params.get("turnId") or params.get("turn_id") or "")
+            if feedback_text and thread_id and turn_id:
+                async def _steer_feedback() -> None:
+                    try:
+                        steer = await _request(
+                            "turn/steer",
+                            {
+                                "threadId": thread_id,
+                                "expectedTurnId": turn_id,
+                                "input": [{"type": "text", "text": feedback_text}],
+                            },
+                        )
+                        if steer.get("error"):
+                            log.warning(
+                                "[CODEX] Permission feedback steering was rejected: %s",
+                                steer["error"],
+                            )
+                    except Exception as exc:
+                        log.warning(
+                            "[CODEX] Could not steer permission feedback into active turn: %s",
+                            exc,
+                        )
+
+                feedback_task = asyncio.create_task(_steer_feedback())
+                permission_feedback_tasks.add(feedback_task)
+                feedback_task.add_done_callback(permission_feedback_tasks.discard)
             return
         await _send({"id": rid, "error": {"code": -32601, "message": f"Loom does not handle {method}"}})
 
@@ -1196,11 +1631,10 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         except Exception:
             pass
         if proc.returncode is None:
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
+            # ``codex.cmd`` is only the root of the app-server process tree.
+            # The generation is not finished until that complete tree exits.
+            await cancel_codex(proc)
+        else:
             await proc.wait()
         if not stdout_task.done():
             stdout_task.cancel()
@@ -1209,6 +1643,11 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         except asyncio.CancelledError:
             pass
         await stderr_task
+        if permission_feedback_tasks:
+            for task in list(permission_feedback_tasks):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*permission_feedback_tasks, return_exceptions=True)
 
     async def _event_stream():
         session_id = resume_session_id or str(conv_id)
@@ -1217,8 +1656,9 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         turn_inflight = False
         turn_activity_seen = False
         active_turn_id = ""
+        pending_terminal_error = ""
         last_usage_input_tokens = 0
-        last_usage_output_tokens = 0
+        last_usage_output_tokens = None
         started_tool_ids: set[str] = set()
         diff_tool_ids: set[str] = set()
         unknown_event_types: set[str] = set()
@@ -1231,7 +1671,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     "initialize",
                     {
                         "clientInfo": {"name": "Loom", "version": "1"},
-                        "capabilities": {"experimental": True},
+                        "capabilities": {"experimental": True, "experimentalApi": True},
                     },
                 )
                 if init.get("error"):
@@ -1242,6 +1682,40 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 app_server_user_agent = str(init_result.get("userAgent") or "").strip()
                 await _send({"method": "initialized"})
 
+                configured_instructions = None
+                config_read = {}
+                if not backstage_parent_id:
+                    try:
+                        config_read = await _request(
+                            "config/read",
+                            {"cwd": cwd, "includeLayers": False},
+                        )
+                        configured_instructions = _configured_developer_instructions(
+                            config_read
+                        )
+                    except Exception as config_exc:
+                        # Contract delivery must not make an otherwise healthy
+                        # app-server unusable on versions predating config/read.
+                        log.warning(
+                            "[CODEX] Could not read configured developer instructions: %s",
+                            config_exc,
+                        )
+                developer_instructions = _codex_developer_instructions(
+                    configured_instructions,
+                    backstage_parent_id,
+                    
+                )
+
+                if not backstage_parent_id:
+                    from context_runtime import admit_rendered
+                    admitted_prompt = await admit_rendered(
+                        prompt, model=codex_model, harness="codex", resume_session_id=resume_session_id,
+                        instructions=developer_instructions or "",
+                        runtime_context=((config_read.get("result") or {}).get("config") or {}).get("model_context_window"),
+                    )
+                else:
+                    admitted_prompt = prompt
+
                 method, thread_params = _codex_thread_request(
                     cwd,
                     codex_model,
@@ -1250,6 +1724,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     {"mcp_servers": mcp_servers_cfg} if mcp_servers_cfg else None,
                     resume_session_id,
                     fork_session,
+                    developer_instructions,
                 )
 
                 thread_start = await _request(
@@ -1258,7 +1733,12 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 )
                 if thread_start.get("error"):
                     await _cleanup()
-                    yield {"type": "error", "message": json.dumps(thread_start["error"])}
+                    yield {
+                        "type": "error",
+                        "message": f"Codex app-server launch failed: {json.dumps(thread_start['error'])}",
+                        "launch_failed": True,
+                        "resume_failed": bool(resume_session_id),
+                    }
                     return
 
                 thread_result = thread_start.get("result") or {}
@@ -1301,11 +1781,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         "error": message,
                     }
                     return
-                if "nrol-ao" in mcp_servers_cfg:
-                    yield {
-                        "type": "status",
-                        "text": "NROL MCP configured for this Codex thread; waiting for startup status",
-                    }
+                pass
                 if codex_goal and codex_goal.get("objective"):
                     try:
                         goal_set = await _request(
@@ -1334,18 +1810,23 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     "turn/start",
                     {
                         "threadId": session_id,
-                        "input": _app_user_input(prompt),
+                        "input": _app_user_input(admitted_prompt),
                         "cwd": cwd,
                         "model": codex_model,
                         "approvalPolicy": approval_policy,
                         "approvalsReviewer": "user",
-                        "sandboxPolicy": _app_sandbox_policy(cwd, nrol_operator),
+                        "sandboxPolicy": _app_sandbox_policy(cwd),
                         "effort": _codex_reasoning_effort(effort),
                     },
                 )
                 if turn_start.get("error"):
                     await _cleanup()
-                    yield {"type": "error", "message": json.dumps(turn_start["error"])}
+                    yield {
+                        "type": "error",
+                        "message": f"Codex turn/start failed: {json.dumps(turn_start['error'])}",
+                        "launch_failed": True,
+                        "resume_failed": bool(resume_session_id),
+                    }
                     return
                 turn_result = turn_start.get("result") or {}
                 turn = turn_result.get("turn") or {}
@@ -1359,30 +1840,67 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 turn_inflight = True
             except Exception as e:
                 await _cleanup()
-                yield {"type": "error", "message": f"Codex app-server launch failed: {e}"}
+                yield {
+                    "type": "error",
+                    "message": f"Codex app-server launch failed: {e}",
+                    "launch_failed": True,
+                    "resume_failed": bool(resume_session_id),
+                }
                 return
 
             while True:
-                raw = await app_messages.get()
+                try:
+                    raw = await asyncio.wait_for(app_messages.get(), timeout=10 if pending_terminal_error else _CODEX_COMPLETION_RECHECK_SEC)
+                except asyncio.TimeoutError:
+                    if pending_terminal_error:
+                        raise RuntimeError(f"Codex error without a confirmed terminal turn: {pending_terminal_error}")
+                    # The native turn may finish without delivering turn/completed
+                    # over stdio. Silence and thread-idle are never terminal proof:
+                    # require the exact session journal's successful active turn.
+                    terminal = await read_codex_last_turn(session_id, cwd) if active_turn_id and turn_inflight else None
+                    if not terminal or terminal.get('id') != active_turn_id or terminal.get('status') != 'completed' or terminal.get('error'):
+                        continue
+                    yield {'type': 'status', 'text': 'Codex completed; recovering its missing completion notification.'}
+                    raw = {'method': 'turn/completed', 'params': {
+                        'threadId': session_id, 'turn': {
+                            'id': active_turn_id, 'status': 'completed', 'items': []}}}
                 method = raw.get("method")
                 if method and "id" in raw:
-                    asyncio.create_task(_answer_server_request(raw))
+                    approval_task = asyncio.create_task(_answer_server_request(raw))
+                    permission_feedback_tasks.add(approval_task)
+                    approval_task.add_done_callback(permission_feedback_tasks.discard)
                     continue
 
                 params = raw.get("params") or {}
                 etype = raw.get("type") or method
+                event_thread_id = params.get("threadId") or raw.get("thread_id")
+                event_turn_id = _codex_turn_id(raw, params)
+                if event_thread_id and session_id and event_thread_id != session_id:
+                    continue
+                if event_turn_id and active_turn_id and event_turn_id != active_turn_id:
+                    continue
+                mcp_item = params.get("item") or raw.get("item") or {}
+                if mcp_item.get("type") in {"mcpToolCall", "mcp_tool_call"}:
+                    item_key = _codex_item_id(mcp_item, raw)
+                    if etype in {"item/started", "item.started"}:
+                        pending_mcp_items[item_key] = {**mcp_item, "threadId": event_thread_id, "turnId": event_turn_id}
+                    elif etype in {"item/completed", "item.completed"}:
+                        pending_mcp_items.pop(item_key, None)
                 usage_evt = _codex_usage(raw)
                 if usage_evt:
                     turn_activity_seen = True
                     current_input = int(usage_evt.get("input_tokens") or 0)
                     current_output = int(usage_evt.get("output_tokens") or 0)
                     usage_evt["input_tokens"] = current_input
-                    if current_output >= last_usage_output_tokens:
+                    first_output = usage_evt.pop("_first_output_tokens", current_output)
+                    if last_usage_output_tokens is None:
+                        usage_evt["output_tokens"] = first_output
+                    elif current_output >= last_usage_output_tokens:
                         usage_evt["output_tokens"] = current_output - last_usage_output_tokens
                     else:
                         usage_evt["output_tokens"] = current_output
-                    last_usage_input_tokens = current_input or last_usage_input_tokens
-                    last_usage_output_tokens = current_output or last_usage_output_tokens
+                    last_usage_input_tokens = current_input
+                    last_usage_output_tokens = current_output
                     yield usage_evt
 
                 if etype in ("turn.started", "turn/started"):
@@ -1391,6 +1909,15 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         active_turn_id = event_turn_id
                     if not event_turn_id or not active_turn_id or event_turn_id == active_turn_id:
                         turn_activity_seen = True
+
+                elif etype == "loom_permission_policy_denied":
+                    yield {
+                        "type": "status",
+                        "text": str(
+                            raw.get("message")
+                            or "Blocked by Loom command policy"
+                        ),
+                    }
 
                 elif etype in ("thread.started", "thread/started"):
                     thread = params.get("thread") or raw.get("thread") or {}
@@ -1412,9 +1939,17 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     if (
                         terminal
                         and turn_inflight
-                        and (not active_turn_id or not event_turn_id or event_turn_id == active_turn_id)
-                        and (etype.startswith("turn") or turn_activity_seen)
+                        and active_turn_id
+                        and event_turn_id == active_turn_id
+                        and etype.startswith("turn")
                     ):
+                        if not is_error and not full_text:
+                            is_error = True
+                            err_msg = "Codex app-server became idle without an assistant response"
+                            print(
+                                "[CODEX] Empty terminal status: "
+                                f"{json.dumps(raw, default=str)[:4000]}"
+                            )
                         got_result = True
                         await _cleanup()
                         yield {
@@ -1467,7 +2002,9 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     item = raw.get("item") or params.get("item") or params
                     item_type = item.get("type")
                     item_id = _codex_item_id(item, raw)
-                    if _is_codex_tool_item(item):
+                    if item_type == "contextCompaction":
+                        yield {"type": "status", "text": "Codex is compacting its native context..."}
+                    elif _is_codex_tool_item(item):
                         tool_input = _codex_tool_input(item)
                         started_tool_ids.add(item_id)
                         yield {
@@ -1494,7 +2031,9 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     item_id = _codex_item_id(item, raw)
                     content = _codex_item_text(item)
 
-                    if item_type in ("reasoning", "reasoningSummary", "reasoning_summary", "summary") and content:
+                    if item_type == "contextCompaction":
+                        yield {"type": "status", "text": "Codex native context compactified."}
+                    elif item_type in ("reasoning", "reasoningSummary", "reasoning_summary", "summary") and content:
                         chunk_size = 128
                         for i in range(0, len(content), chunk_size):
                             yield {"type": "thinking_delta", "text": content[i:i+chunk_size]}
@@ -1530,11 +2069,12 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                             "type": "tool_result",
                             "content": _codex_tool_output(item),
                             "tool_id": item_id,
-                            "is_error": item.get("status") == "failed" or item.get("exit_code") not in (None, 0),
+                            "is_error": _codex_tool_failed(item),
                         }
-                        runner_error = _codex_runner_error(item)
-                        if runner_error:
-                            yield {"type": "error", "message": runner_error}
+                        # Tool output is data, not turn authority. Reading a
+                        # log/source file can contain any error wording. Even
+                        # a genuinely failed command can be recovered by the
+                        # agent; only the native terminal event ends the turn.
                     elif item_type in _IGNORED_APP_SERVER_ITEM_TYPES:
                         pass
                     elif item_type and item_type not in unknown_item_types:
@@ -1563,6 +2103,10 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         yield {"type": "text_delta", "text": text}
 
                 elif etype in ("turn.completed", "turn/completed"):
+                    event_turn_id = _codex_turn_id(raw, params)
+                    event_thread_id = params.get("threadId") or raw.get("thread_id")
+                    if (event_turn_id and active_turn_id and event_turn_id != active_turn_id) or (event_thread_id and event_thread_id != session_id):
+                        continue
                     turn = params.get("turn") or raw.get("turn") or {}
                     for item in turn.get("items") or []:
                         item_id = _codex_item_id(item, raw)
@@ -1579,32 +2123,75 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                                 "type": "tool_result",
                                 "content": _codex_tool_output(item),
                                 "tool_id": item_id,
-                                "is_error": item.get("status") == "failed" or item.get("exit_code") not in (None, 0),
+                                "is_error": _codex_tool_failed(item),
                             }
-                            runner_error = _codex_runner_error(item)
-                            if runner_error:
-                                yield {"type": "error", "message": runner_error}
                         elif (
                             item.get("type") in ("agent_message", "agentMessage", "message", "assistant_message", "assistantMessage", "output_text")
                             or item.get("role") == "assistant"
                         ) and content and not full_text:
                             full_text += content
                             yield {"type": "text_delta", "text": content}
+                    completion_error = _codex_completed_turn_error(raw, params)
+                    if not completion_error and not full_text:
+                        completion_error = "Codex turn completed without an assistant response"
+                    if completion_error:
+                        print(
+                            "[CODEX] Empty or failed turn/completed: "
+                            f"{json.dumps(raw, default=str)[:4000]}"
+                        )
                     got_result = True
                     await _cleanup()
                     yield {
                         "type": "result",
-                        "is_error": False,
+                        "is_error": bool(completion_error),
+                        "terminal_confirmed": bool(active_turn_id and event_turn_id == active_turn_id),
+                        "error_code": (turn.get("error") or {}).get("codexErrorInfo") if isinstance(turn.get("error"), dict) else None,
                         "result_text": full_text,
                         "session_id": session_id,
+                        "error": completion_error,
                     }
                     break
 
-                elif etype in ("turn.failed", "turn/failed", "error", "warning"):
+                elif etype in ("warning", "configWarning") or (etype == "error" and params.get("willRetry")):
+                    yield {"type": "status", "text": str(params.get("message") or "Codex is retrying an upstream request")}
+
+                elif etype == "error":
+                    # App-server reports an error before turn/completed. It is
+                    # not permission to kill the thread before it saves that
+                    # terminal state. Bound the wait if the terminal is lost.
+                    event_turn_id = _codex_turn_id(raw, params)
+                    if event_turn_id and active_turn_id and event_turn_id != active_turn_id:
+                        continue
+                    error = params.get("error") or raw.get("error") or {}
+                    pending_terminal_error = str(error.get("message") if isinstance(error, dict) else error) or str(params.get("message") or "Provider error")
+                    yield {"type": "status", "text": pending_terminal_error}
+
+                elif etype in ("turn.failed", "turn/failed"):
                     got_result = True
                     error = raw.get("error") or params.get("error") or {}
                     err_msg = error.get("message") if isinstance(error, dict) else error
                     err_msg = err_msg or raw.get("message") or params.get("message") or "Unknown error"
+                    await _cleanup()
+                    yield {
+                        "type": "result",
+                        "is_error": True,
+                        "result_text": full_text,
+                        "session_id": session_id,
+                        "error": err_msg,
+                    }
+                    break
+
+                elif etype == "codex_app_server_eof":
+                    got_result = True
+                    err_msg = str(
+                        raw.get("message")
+                        or "Codex app-server exited before completing the turn"
+                    )
+                    if raw.get("returncode") not in (None, 0):
+                        err_msg += f" (exit code {raw['returncode']})"
+                    stderr_tail = "\n".join(stderr_lines[-20:]).strip()
+                    if stderr_tail:
+                        err_msg += f"\n{stderr_tail}"
                     await _cleanup()
                     yield {
                         "type": "result",
@@ -1621,6 +2208,12 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     unknown_event_types.add(str(etype))
                     print(f"[CODEX] Ignoring event type={etype}: {json.dumps(raw, default=str)[:500]}")
 
+        except asyncio.CancelledError:
+            # Async-generator cancellation otherwise skips the ordinary code
+            # below this handler.  Do not release Loom's generation lane until
+            # the app-server process tree is confirmed gone.
+            await asyncio.shield(_cleanup())
+            raise
         except Exception as e:
             log.error(f"[CODEX] Error processing event stream: {e}")
             await _cleanup()
@@ -1632,25 +2225,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 "error": str(e),
             }
 
-        try:
-            if proc.stdin and not proc.stdin.is_closing():
-                proc.stdin.close()
-        except Exception:
-            pass
-        if proc.returncode is None:
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-        if not stdout_task.done():
-            stdout_task.cancel()
-        try:
-            await stdout_task
-        except asyncio.CancelledError:
-            pass
-        await stderr_task
+        await _cleanup()
 
         # Emit default result if not already yielded
         if not got_result:
@@ -1672,8 +2247,14 @@ async def cancel_codex(proc):
         if sys.platform == 'win32':
             import subprocess
             try:
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                               capture_output=True, timeout=5)
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode != 0 and proc.returncode is None:
+                    proc.kill()
             except Exception:
                 proc.kill()
         else:
@@ -1682,3 +2263,4 @@ async def cancel_codex(proc):
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()

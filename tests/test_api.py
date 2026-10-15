@@ -1,6 +1,7 @@
 """Tests for REST API endpoints."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -48,6 +49,21 @@ async def test_health_endpoint(client, mock_llama):
     assert "models" in data
 
 
+async def test_extension_host_portal_removed_but_agent_api_discoverable(client):
+    """Owner-specific portals must not install a parallel executor in Main."""
+    response = await client.get("/openapi.json")
+    assert response.status_code == 200
+    paths = response.json()["paths"]
+    assert "/api/conversations/{conv_id}/agent-runs" in paths
+    assert "/api/agent-runs/{run_id}/cancel" in paths
+    assert not any(path.startswith(("/extensions/", "/api/extensions/", "/api/extension-tasks"))
+                   for path in paths)
+    assert (await client.get("/docs")).status_code == 200
+    for path in ("/extensions/fixture/setup", "/api/extension-tasks/capabilities",
+                 "/static/extensions/setup.html", "/static/extensions/setup.js"):
+        assert (await client.get(path)).status_code == 404
+
+
 async def test_ui_entrypoint_and_executable_assets_are_revalidated(client):
     index_resp = await client.get("/")
     chat_resp = await client.get("/static/chat.js")
@@ -56,6 +72,75 @@ async def test_ui_entrypoint_and_executable_assets_are_revalidated(client):
     assert chat_resp.status_code == 200
     assert "no-cache" in index_resp.headers.get("cache-control", "")
     assert "no-cache" in chat_resp.headers.get("cache-control", "")
+
+
+async def test_agent_run_api_preserves_parent_branch_and_requires_explicit_resume(
+    client, tmp_path
+):
+    import server
+
+    class FakeSupervisor:
+        def wake(self):
+            return None
+
+        async def spawn(self, conversation_id, task, **kwargs):
+            return await db.create_agent_run(
+                "api-child-run",
+                conversation_id,
+                task,
+                parent_run_id=kwargs.get("parent_run_id"),
+                parent_message_id=kwargs.get("parent_message_id"),
+                requested_harness=kwargs.get("harness"),
+                requested_model=kwargs.get("model"),
+                model_profile=kwargs.get("profile"),
+                project_dir=kwargs.get("project_dir"),
+                path_scope=kwargs.get("path_scope"),
+                client_instance_id=kwargs.get("client_instance_id"),
+            )
+
+        async def resume(self, run_id):
+            return await db.request_agent_resume(run_id)
+
+    conv = await db.create_conversation(
+        "Agent API", mode="codex", project_dir=str(tmp_path)
+    )
+    user = await db.add_message(conv["id"], "user", "parent prompt")
+    draft = await db.add_message(
+        conv["id"], "assistant", "parent working", parent_id=user["id"],
+        loom_thread_id=user.get("loom_thread_id"),
+    )
+    generation_key = (conv["id"], user["id"], 77)
+    server._generation_snapshots[generation_key] = {
+        "parent_id": user["id"],
+        "draft_msg_id": draft["id"],
+    }
+    original_supervisor = server._agent_supervisor
+    server._agent_supervisor = FakeSupervisor()
+    try:
+        created = await client.post(
+            f"/api/conversations/{conv['id']}/agent-runs",
+            json={
+                "task": "inspect child",
+                "parent_run_id": "gen:77",
+                "project_dir": str(tmp_path),
+            },
+        )
+        assert created.status_code == 200
+        run = created.json()
+        assert run["parent_run_id"] == "gen:77"
+        assert run["parent_message_id"] == draft["id"]
+        assert run["loom_thread_id"] == draft["loom_thread_id"]
+
+        await db.update_agent_run(run["run_id"], status="paused")
+        resumed = await client.post(f"/api/agent-runs/{run['run_id']}/resume")
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "queued"
+
+        not_paused = await client.post(f"/api/agent-runs/{run['run_id']}/resume")
+        assert not_paused.status_code == 409
+    finally:
+        server._agent_supervisor = original_supervisor
+        server._generation_snapshots.pop(generation_key, None)
 
 
 async def test_local_models_endpoint(client, mock_llama):
@@ -78,6 +163,46 @@ async def test_create_weave_conversation(client, mock_llama):
     data = resp.json()
     assert data["title"] == "Weave Test"
     assert data["mode"] == "weave"
+
+
+async def test_branch_pin_api_is_scoped_to_one_conversation(client):
+    conv = await db.create_conversation("Branch Pin API")
+    other = await db.create_conversation("Other Branch Pin API")
+    message = await db.add_message(conv["id"], "user", "Start here")
+
+    created = await client.post(
+        f"/api/conversations/{conv['id']}/branch-pins",
+        json={"message_id": message["id"], "label": "  Lab updates  "},
+    )
+    assert created.status_code == 200
+    pin = created.json()
+    assert pin["label"] == "Lab updates"
+
+    listed = await client.get(f"/api/conversations/{conv['id']}/branch-pins")
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [pin["id"]]
+    assert (await client.get(f"/api/conversations/{other['id']}/branch-pins")).json() == []
+
+    wrong_conversation = await client.post(
+        f"/api/conversations/{other['id']}/branch-pins",
+        json={"message_id": message["id"], "label": "Wrong Loom"},
+    )
+    assert wrong_conversation.status_code == 404
+
+    empty_label = await client.put(
+        f"/api/branch-pins/{pin['id']}", json={"label": "   "}
+    )
+    assert empty_label.status_code == 400
+
+    updated = await client.put(
+        f"/api/branch-pins/{pin['id']}", json={"label": "Playwright lab portal"}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["label"] == "Playwright lab portal"
+
+    deleted = await client.delete(f"/api/branch-pins/{pin['id']}")
+    assert deleted.status_code == 200
+    assert (await client.delete(f"/api/branch-pins/{pin['id']}")).status_code == 404
 
 
 async def test_create_system_only_weave_conversation(client, mock_llama):
@@ -141,8 +266,44 @@ async def test_cc_models_includes_new_openrouter_models(client):
     assert resp.status_code == 200
     groups = {g["group"]: g["models"] for g in resp.json()}
     openrouter = {m["value"] for m in groups.get("OpenRouter", [])}
+    assert "openrouter:z-ai/glm-5.3-flash" in openrouter
     assert "openrouter:openai/gpt-5.6-luna" in openrouter
     assert "openrouter:deepseek/deepseek-v4-flash-0731" in openrouter
+
+
+def test_codex_model_cache_surfaces_only_visible_supported_models(tmp_path, monkeypatch):
+    import server
+
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "models_cache.json").write_text(
+        json.dumps({
+            "models": [
+                {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list", "supported_in_api": True},
+                {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "supported_in_api": True},
+                {"slug": "gpt-old", "display_name": "GPT-Old", "visibility": "list", "supported_in_api": False},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    assert server.load_local_codex_models() == [
+        {"value": "codex-gpt-6-astra", "label": "Codex (GPT-6-Astra)"}
+    ]
+
+
+def test_cc_model_picker_revalidates_registry_across_host_reloads():
+    """A long-lived tab must not retain a pre-reload provider registry forever."""
+    source = Path("static/app.js").read_text(encoding="utf-8")
+    start = source.index("async function populateCCModelDropdowns")
+    end = source.index("function setupEventListeners", start)
+    picker = source[start:end]
+
+    assert "const registry = await API.get('/api/cc-models')" in picker
+    assert "_ccModelsCache = registry" in picker
+    assert "populateSeq !== _ccDropdownPopulateSeq" in picker
+    assert "if (!_ccModelsCache) {" not in picker
 
 
 async def test_create_umans_conversation_blocked_when_disabled(client, monkeypatch):
@@ -525,6 +686,7 @@ async def test_get_conversation_repairs_stale_openrouter_mode(client, mock_llama
         conv["id"],
         cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
     )
+    parent = await db.add_message(conv["id"], "user", "dispatch")
 
     resp = await client.get(f"/api/conversations/{conv['id']}")
 
@@ -588,6 +750,7 @@ async def test_openrouter_generation_dispatches_to_claude_handler(monkeypatch):
         conv["id"],
         cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
     )
+    parent = await db.add_message(conv["id"], "user", "route this exact message")
     calls = []
 
     async def fake_claude_generation(websocket, conv_id, loaded_conv, data):
@@ -602,7 +765,12 @@ async def test_openrouter_generation_dispatches_to_claude_handler(monkeypatch):
     await server._handle_generation(
         None,
         conv["id"],
-        {"action": "generate", "cc_model": "openrouter:deepseek/deepseek-v4-flash-0731"},
+        {
+            "action": "generate",
+            "parent_id": parent["id"],
+            "loom_thread_id": parent["loom_thread_id"],
+            "cc_model": "openrouter:deepseek/deepseek-v4-flash-0731",
+        },
     )
 
     assert calls == [
@@ -687,22 +855,6 @@ async def test_codex_goal_endpoint_sets_goal_and_persists(client, mock_llama, tm
     assert updated["codex_goal_tokens_used"] == 5
 
 
-async def test_create_nrol_operator_conversation(client, mock_llama):
-    """POST /api/conversations with nrol_operator launches a locked CC profile.
-
-    Mode is forced to claude, the flag persists, and project_dir defaults to
-    the neutral operator workspace (never the Loom or engine repo)."""
-    resp = await client.post("/api/conversations", json={
-        "title": "NROL Operator Test",
-        "mode": "claude",
-        "nrol_operator": True,
-        "cc_model": "opus",
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["mode"] == "claude"
-    assert data["nrol_operator"] == 1
-    assert data["project_dir"].replace("\\", "/").endswith("workspaces/nrol_operator")
 
 
 async def test_get_conversation(client, mock_llama):
@@ -750,7 +902,7 @@ async def test_refresh_cc_models_requires_claude_code_token(client, monkeypatch)
     monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
     _FakeAnthropicClient.last_request = None
 
-    resp = await client.post("/api/cc-models/refresh")
+    resp = await client.post("/api/cc-models/refresh?provider=anthropic")
 
     assert resp.status_code == 401
     assert "No Claude Code login found" in resp.json()["detail"]
@@ -766,13 +918,76 @@ async def test_refresh_cc_models_reports_rejected_claude_code_token(client, monk
     _FakeAnthropicClient.response = _FakeAnthropicResponse(401, text="unauthorized")
     _FakeAnthropicClient.last_request = None
 
-    resp = await client.post("/api/cc-models/refresh")
+    resp = await client.post("/api/cc-models/refresh?provider=anthropic")
 
     assert resp.status_code == 401
     assert "Anthropic rejected the login token" in resp.json()["detail"]
     assert "Run `claude`" in resp.json()["detail"]
     assert _FakeAnthropicClient.last_request["headers"]["Authorization"] == "Bearer expired-token"
     assert _FakeAnthropicClient.last_request["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+
+
+async def test_refresh_cc_models_all_succeeds_without_claude_token(client, monkeypatch):
+    import server
+    import gemini_client
+    import codex_client
+
+    monkeypatch.setattr(server, "_read_oauth_token", lambda: None)
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
+    _FakeAnthropicClient.last_request = None
+
+    monkeypatch.setattr(
+        gemini_client,
+        "discover_agy_models",
+        lambda: [{"value": "gemini:gemini-2.5-pro", "label": "Gemini 2.5 Pro"}],
+    )
+    async def fake_discover_codex(force=False):
+        return [{"value": "codex:gpt-5", "label": "Codex (GPT-5)"}]
+    monkeypatch.setattr(codex_client, "discover_codex_models", fake_discover_codex)
+    monkeypatch.setattr(server, "CC_MODELS", [
+        {"group": "Anthropic — Auto", "models": []},
+        {"group": "Antigravity", "models": []},
+        {"group": "ChatGPT Codex", "models": []},
+    ])
+
+    resp = await client.post("/api/cc-models/refresh")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "gemini" in data["refreshed"]
+    assert "codex" in data["refreshed"]
+    assert "anthropic" in data["skipped"]
+    assert "credentials.json" in data["skipped"]["anthropic"] or "login found" in data["skipped"]["anthropic"].lower()
+
+
+async def test_refresh_cc_models_all_isolates_provider_failures(client, monkeypatch):
+    import server
+    import gemini_client
+    import codex_client
+
+    monkeypatch.setattr(server, "_read_oauth_token", lambda: "valid-token")
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
+    _FakeAnthropicClient.response = _FakeAnthropicResponse(200, {
+        "data": [{"id": "claude-sonnet-4-5-20260101", "display_name": "Claude Sonnet 4.5"}]
+    })
+
+    def blow_up():
+        raise RuntimeError("Antigravity CLI crashed")
+    monkeypatch.setattr(gemini_client, "discover_agy_models", blow_up)
+    monkeypatch.setattr(server, "load_local_gemini_models", lambda: [])
+
+    async def fake_discover_codex(force=False):
+        return [{"value": "codex:gpt-5", "label": "Codex (GPT-5)"}]
+    monkeypatch.setattr(codex_client, "discover_codex_models", fake_discover_codex)
+
+    resp = await client.post("/api/cc-models/refresh?provider=all")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "anthropic" in data["refreshed"]
+    assert "codex" in data["refreshed"]
+    assert "gemini" in data["skipped"]
+    assert "Antigravity CLI crashed" in data["skipped"]["gemini"]
 
 
 async def test_refresh_cc_models_accepts_valid_claude_code_token(client, monkeypatch):
@@ -829,16 +1044,14 @@ def test_load_local_gemini_models_and_mapping(tmp_path, monkeypatch):
         encoding="utf-8"
     )
 
-    # Monkeypatch home directory path detection
-    def mock_home():
-        return tmp_path
-    monkeypatch.setattr(server.os.environ, "get", lambda k, default=None: str(tmp_path) if k == "USERPROFILE" else default)
-    monkeypatch.setattr(server.Path, "home", mock_home)
+    # Isolate both the current external cache and the legacy read-only fallback.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("EXO_STATE_DIR", str(tmp_path / "state"))
 
     models = server.load_local_gemini_models()
     assert len(models) == 1
     assert models[0]["value"] == "gemini:gemini-3.5-flash-custom"
-    assert models[0]["label"] == "Gemini (Gemini 3.5 Flash Custom)"
+    assert models[0]["label"] == "Gemini 3.5 Flash Custom"
 
     # Discovered selectors are exact launch identities and must not be rewritten
     # by a stale conversation effort setting.

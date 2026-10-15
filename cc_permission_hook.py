@@ -17,6 +17,9 @@ Codex PermissionRequest output format:
 Environment variables (set by Loom when launching CC/agy):
   LOOM_PORT: Port of the Loom server (default: 3000)
   LOOM_CONV_ID: Conversation ID in Loom
+  LOOM_PERMISSION_SCOPE: Exact generation/child-run scope (gen:<n> or agent:<uuid>)
+  LOOM_AGENT_RUN_ID: Supervisor child-run UUID, when this is a child
+  LOOM_CLIENT_INSTANCE_ID: Browser window identity, when known
 """
 import sys
 import json
@@ -46,6 +49,8 @@ def normalize_tool_name(name: str) -> str:
         "google_web_search": "WebSearch",
         "read_url_content": "WebFetch",
         "web_fetch": "WebFetch",
+        "find_by_name": "Glob",
+        "manage_task": "Task",
         "apply_patch": "apply_patch",
     }
     return mapping.get(name, name)
@@ -59,8 +64,13 @@ def clean_arg_val(val):
 
 
 def normalize_tool_args(name: str, args: dict) -> dict:
-    cleaned = {k: clean_arg_val(v) for k, v in args.items()}
-    mapped = {}
+    # Path wrappers from legacy hooks are not content quoting. In particular,
+    # stripping a JSON string's first/last quote corrupts the requested write.
+    path_keys = {"AbsolutePath", "TargetFile", "file_path", "filePath", "Cwd",
+                 "DirectoryPath", "SearchDirectory", "SearchPath"}
+    cleaned = {k: clean_arg_val(v) if k in path_keys else v for k, v in args.items()}
+    # Preserve all supplied destinations while adding canonical aliases.
+    mapped = dict(cleaned)
     if name in ("view_file", "read_file", "read_many_files"):
         mapped["file_path"] = cleaned.get("AbsolutePath", cleaned.get("TargetFile", cleaned.get("file_path", "")))
     elif name in ("write_to_file", "write_file"):
@@ -79,6 +89,10 @@ def normalize_tool_args(name: str, args: dict) -> dict:
         mapped["dir"] = cleaned.get("SearchPath", cleaned.get("dir", ""))
     else:
         mapped = cleaned
+    for source, target in (("Cwd", "cwd"), ("DirectoryPath", "path"),
+                           ("SearchDirectory", "path"), ("SearchPath", "path")):
+        if source in cleaned:
+            mapped.setdefault(target, cleaned[source])
     return mapped
 
 if sys.platform == "win32":
@@ -96,7 +110,7 @@ READ_ONLY = {
     "Explore", "CronList", "ToolSearch", "Agent",
     # Antigravity (agy) tools (snake_case)
     "read_file", "read_many_files", "glob", "grep_search",
-    "list_directory", "google_web_search", "web_fetch",
+    "list_dir", "list_directory", "find_by_name", "google_web_search", "web_fetch",
     "write_todos", "enter_plan_mode",
     "cli_help", "codebase_investigator", "get_internal_docs",
     # MCP web-tools (keyless DuckDuckGo search for local models)
@@ -108,7 +122,7 @@ AGY_TOOLS = {
     "write_to_file", "write_file",
     "replace_file_content", "multi_replace_file_content",
     "run_command", "execute_command", "run_shell_command",
-    "grep_search", "list_dir", "list_directory", "glob",
+    "grep_search", "list_dir", "list_directory", "glob", "find_by_name", "manage_task",
     "search_web", "google_web_search",
     "read_url_content", "web_fetch"
 }
@@ -191,9 +205,10 @@ def main():
     port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
     permission_scope = os.environ.get("LOOM_PERMISSION_SCOPE", "")
+    agent_run_id = os.environ.get("LOOM_AGENT_RUN_ID", "")
+    client_instance_id = os.environ.get("LOOM_CLIENT_INSTANCE_ID", "")
     backstage_parent = os.environ.get("LOOM_BACKSTAGE_PARENT_ID", "")
-    nrol_operator = os.environ.get("LOOM_NROL_OPERATOR", "")
-    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent} nrol={nrol_operator}\n")
+    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent}\n")
 
     if not conv_id:
         # Not running under Loom — pass through
@@ -210,6 +225,14 @@ def main():
     if "hook_event_name" in request:
         event_name = request["hook_event_name"]
 
+    # Current agy uses camelCase envelopes and a top-level decision/reason,
+    # unlike Claude's hookSpecificOutput. Keep legacy hooks compatible.
+    modern_agy = isinstance(request.get("toolCall"), dict)
+    if modern_agy:
+        request["tool_call"] = request["toolCall"]
+        if event_name == "PreToolUse":
+            event_name = "BeforeTool"
+
     raw_tool = request.get("tool")
     tool_name = (
         request.get("tool_name")
@@ -224,7 +247,7 @@ def main():
     if not tool_name and isinstance(request.get("tool_call"), dict):
         tool_call = request["tool_call"]
         tool_name = tool_call.get("tool_name") or tool_call.get("name") or tool_call.get("type") or ""
-    is_agy = tool_name in AGY_TOOLS
+    is_agy = modern_agy or tool_name in AGY_TOOLS
     is_codex = event_name == "PermissionRequest" or tool_name == "apply_patch"
 
     # PostToolUse Hook Flow
@@ -256,6 +279,12 @@ def main():
             "content": output_content,
             "is_error": is_error
         }
+        if permission_scope:
+            payload["permission_scope"] = permission_scope
+        if agent_run_id:
+            payload["agent_run_id"] = agent_run_id
+        if client_instance_id:
+            payload["client_instance_id"] = client_instance_id
         
         for proto in protocols:
             url = f"{proto}://127.0.0.1:{port}/api/cc-tool-result"
@@ -270,6 +299,9 @@ def main():
                 break
             except Exception as e:
                 sys.stderr.write(f"[Hook] PostToolUse result send failed via {proto}: {e}\n")
+        if modern_agy or is_agy:
+            sys.stdout.write("{}")
+            sys.stdout.flush()
         sys.exit(0)
 
     # PreToolUse Hook Flow
@@ -322,6 +354,12 @@ def main():
         "tool_id": tool_id,
         "tool_input": mapped_input
     }
+    if permission_scope:
+        start_payload["permission_scope"] = permission_scope
+    if agent_run_id:
+        start_payload["agent_run_id"] = agent_run_id
+    if client_instance_id:
+        start_payload["client_instance_id"] = client_instance_id
     
     for proto in protocols:
         url = f"{proto}://127.0.0.1:{port}/api/cc-tool-start"
@@ -342,22 +380,26 @@ def main():
     # This forces the agent to use the 'loom-state-cards' MCP server instead.
     if backstage_parent:
         deny_list = {
-            "Write", "Edit", "NotebookEdit", "Bash", "Replace"
+            "Write", "Edit", "NotebookEdit", "Bash", "PowerShell", "Replace"
         }
         if mapped_name in deny_list:
             deny(f"Tool {mapped_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
 
-    # NROL OPERATOR LOCKDOWN:
+    # PREPARATION LOCKDOWN:
+    # Hidden context-preparation runs must be entirely tool-free. When
+    # LOOM_PREPARATION is set, deny every tool before any other policy. This
+    # is defense in depth behind the launch-argument isolation and must never
+    # depend on which mode the caller requested.
+    if os.environ.get("LOOM_PREPARATION", ""):
+        deny(
+            f"Tool {mapped_name} is disabled in preparation mode. "
+            "Preparation produces text-only continuity state and cannot execute tools.",
+            event_name=event_name,
+        )
+
     # Same deny set as backstage — the CLI already strips these via
     # --disallowedTools; this is defense in depth if launch args drift.
-    if nrol_operator:
-        deny_list = {"Write", "Edit", "NotebookEdit", "Bash", "Replace"}
-        if mapped_name in deny_list:
-            deny(
-                f"Tool {mapped_name} is disabled in NROL operator mode. "
-                "Use the nrol-ao MCP tools (typed transitions) instead.",
-                event_name=event_name,
-            )
+    pass
 
     # DENY IMAGE READS:
     # If the tool is reading a file, and the path ends with an image extension, we block it for Llama sessions.
@@ -392,19 +434,16 @@ def main():
                     event_name=event_name,
                 )
 
-    # Auto-approve read-only tools
-    if event_name != "PermissionRequest" and mapped_name in READ_ONLY:
-        allow(f"Read-only tool: {mapped_name}", event_name=event_name)
+    # Ordinary tools use Loom's shared live policy, including reads: an
+    # outside-workspace Read must not bypass the same boundary Goose sees.
 
-    # Auto-approve the nrol-ao MCP surface entirely. Its read tools are
     # side-effect-free, and its mutating tools (commit=true) raise their own
     # Loom permission request from inside the MCP server — with transition,
     # indicator, and evidence context. Prompting here too would double-prompt
     # every commit with a less informative dialog.
-    if event_name != "PermissionRequest" and mapped_name.startswith("mcp__nrol-ao__"):
-        allow(f"nrol-ao MCP tool (commits gated server-side): {mapped_name}", event_name=event_name)
 
     request["loom_conv_id"] = conv_id
+    request["source"] = "antigravity" if is_agy else "claude_code"
     if permission_scope:
         request["permission_scope"] = permission_scope
     request["tool_name"] = mapped_name # Normalize for Loom API
@@ -441,14 +480,20 @@ def main():
                             event_name=event_name,
                         )
                     deny(
-                        "User requested plan revisions in Loom — stay in plan "
-                        "mode and refine the plan.",
+                        ("User requested plan revisions in Loom — stay in plan mode and refine the plan."
+                         if response.get("decision_source") == "user"
+                         else response.get("message") or "Loom plan approval ended without a user decision."),
                         event_name=event_name,
                     )
                 if response.get("allow"):
-                    allow(f"Approved by user in Loom UI via {proto}", event_name=event_name)
+                    allow(
+                        response.get("message")
+                        or response.get("feedback")
+                        or f"Approved by Loom ({response.get('decision_source') or 'unspecified source'})",
+                        event_name=event_name,
+                    )
                 else:
-                    deny(response.get("message", "Denied by user in Loom UI"), event_name=event_name)
+                    deny(response.get("message", "Loom permission request ended without approval"), event_name=event_name)
                 return
         except Exception as e:
             errors.append(f"{proto}: {e}")

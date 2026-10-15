@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "backend": "openrouter",
+      "id": "z-ai/glm-5.3-flash",
+      "label": "GLM 5.3 Flash",
+      "context_length": 1310720,
+      "handoff_threshold": 1150000,
+      "capabilities": {
+        "tools": true
+      },
+      "routes": [
+        "openrouter",
+        "goose",
+        "goose_smart",
+        "weave"
+      ]
+    },
+    {
+      "backend": "openrouter",
+      "id": "z-ai/glm-5.2",
+      "label": "GLM 5.2",
+      "context_length": 1000000,
+      "handoff_threshold": 880000,
+      "capabilities": {
+        "tools": true
+      },
+      "routes": [
+        "openrouter",
+        "goose",
+        "goose_smart",
+        "weave"
+      ]
+    },
+    {
+      "backend": "openrouter",
+      "id": "moonshotai/kimi-k2.7-code",
+      "label": "Kimi K2.7 Code",
+      "context_length": 262144,
+      "handoff_threshold": 225000,
+      "capabilities": {
+        "tools": true
+      },
+      "routes": [
+        "openrouter",
+        "goose",
+        "weave"
+      ]
+    },
+    {
+      "backend": "openrouter",
+      "id": "openai/gpt-5.6-luna",
+      "label": "GPT 5.6 Luna",
+      "context_length": 1050000,
+      "handoff_threshold": 880000,
+      "capabilities": {
+        "tools": true
+      },
+      "routes": [
+        "openrouter",
+        "goose",
+        "weave"
+      ]
+    },
+    {
+      "backend": "openrouter",
+      "id": "deepseek/deepseek-v4-flash-0731",
+      "label": "DeepSeek V4 Flash 0731",
+      "context_length": 1048576,
+      "handoff_threshold": 880000,
+      "capabilities": {
+        "tools": true
+      },
+      "routes": [
+        "openrouter",
+        "goose",
+        "weave"
+      ]
+    }
+  ],
+  "fallback_groups": {
+    "anthropic": [
+      {
+        "value": "sonnet",
+        "label": "Sonnet"
+      },
+      {
+        "value": "sonnet[1m]",
+        "label": "Sonnet (1M)"
+      },
+      {
+        "value": "claude-sonnet-5-5",
+        "label": "Claude Sonnet 5.5"
+      },
+      {
+        "value": "opus",
+        "label": "Opus"
+      },
+      {
+        "value": "opus[1m]",
+        "label": "Opus (1M)"
+      },
+      {
+        "value": "haiku",
+        "label": "Haiku"
+      }
+    ],
+    "codex": [
+      {
+        "value": "codex-gpt-6.1-sol",
+        "label": "Codex (GPT-6.1-Sol)"
+      },
+      {
+        "value": "codex-gpt-6-astra",
+        "label": "Codex (GPT-6-Astra)"
+      },
+      {
+        "value": "codex-gpt-6-sol",
+        "label": "Codex (GPT-6-Sol)"
+      },
+      {
+        "value": "codex-gpt-6-luna",
+        "label": "Codex (GPT-6-Luna)"
+      },
+      {
+        "value": "codex-gpt-5.6-sol",
+        "label": "Codex (GPT-5.6-Sol)"
+      },
+      {
+        "value": "codex-gpt-5.6-terra",
+        "label": "Codex (GPT-5.6-Terra)"
+      }
+    ],
+    "gemini": [
+      {
+        "value": "Gemini 3.8 Flash (High)",
+        "label": "Gemini 3.8 Flash (High)"
+      },
+      {
+        "value": "Gemini 3.8 Flash (Medium)",
+        "label": "Gemini 3.8 Flash (Medium)"
+      },
+      {
+        "value": "Gemini 3.8 Flash (Low)",
+        "label": "Gemini 3.8 Flash (Low)"
+      },
+      {
+        "value": "Gemini 3.7 Flash (High)",
+        "label": "Gemini 3.7 Flash (High)"
+      },
+      {
+        "value": "Gemini 3.7 Flash (Medium)",
+        "label": "Gemini 3.7 Flash (Medium)"
+      },
+      {
+        "value": "Gemini 3.7 Flash (Low)",
+        "label": "Gemini 3.7 Flash (Low)"
+      },
+      {
+        "value": "Gemini 3.6 Flash (High)",
+        "label": "Gemini 3.6 Flash (High)"
+      },
+      {
+        "value": "Gemini 3.6 Flash (Medium)",
+        "label": "Gemini 3.6 Flash (Medium)"
+      },
+      {
+        "value": "Gemini 3.6 Flash (Low)",
+        "label": "Gemini 3.6 Flash (Low)"
+      },
+      {
+        "value": "Gemini 3.1 Pro (High)",
+        "label": "Gemini 3.1 Pro (High)"
+      },
+      {
+        "value": "Gemini 3.1 Pro (Low)",
+        "label": "Gemini 3.1 Pro (Low)"
+      },
+      {
+        "value": "Claude Sonnet 4.6 (Thinking)",
+        "label": "Claude Sonnet 4.6 (Thinking)"
+      },
+      {
+        "value": "Claude Opus 4.6 (Thinking)",
+        "label": "Claude Opus 4.6 (Thinking)"
+      },
+      {
+        "value": "GPT-OSS 120B (Medium)",
+        "label": "GPT-OSS 120B (Medium)"
+      }
+    ],
+    "umans": [
+      {
+        "value": "umans-coder",
+        "label": "Umans Coder (Kimi K2.7-Code)"
+      },
+      {
+        "value": "umans-kimi-k2.7",
+        "label": "Umans Kimi K2.7 (always thinks)"
+      },
+      {
+        "value": "umans-glm-5.2",
+        "label": "Umans GLM 5.2 (largest context)"
+      },
+      {
+        "value": "umans-flash",
+        "label": "Umans Flash (light, high-interactivity)"
+      }
+    ]
+  }
+}

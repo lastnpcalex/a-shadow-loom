@@ -1,22 +1,4 @@
-"""Track A Phase 0.5 gating probe: long-argument Dream tool-call stress test.
-
-The §2.2 probes verified Dream returns clean tool_calls for short arguments
-({"location":"Paris"}) and multi-turn use. But the real deliberation payload
-shape is a *multi-paragraph* `analysis` string inside JSON tool arguments —
-exactly the case that could trip a length/JSON-boundary bug in DiffusionGemma's
-nuspy adapter. This probe closes that gap before the full A.2 tool surface is
-built.
-
-Lives here (tests/) rather than mcp_servers/nrol_ao_engine/ because it is a
-gating probe, not engine code. It hits the live Dream sidecar at :8787 and is
-skipped when that sidecar is down, so the normal suite never depends on the
-GPU being warm.
-
-Run the live probe explicitly:
-    C:\\Python314\\python.exe -m pytest tests/test_dream_long_argument_probe.py -v
-or force-run even when the sidecar is up but the module-level skip fires:
-    LOOM_RUN_LIVE_DREAM_PROBE=1 pytest tests/test_dream_long_argument_probe.py -v
-"""
+'Track A Phase 0.5 gating probe: long-argument Dream tool-call stress test.\n\nThe §2.2 probes verified Dream returns clean tool_calls for short arguments\n({"location":"Paris"}) and multi-turn use. But the real deliberation payload\nshape is a *multi-paragraph* `analysis` string inside JSON tool arguments —\nexactly the case that could trip a length/JSON-boundary bug in DiffusionGemma\'s\nnuspy adapter. This probe closes that gap before the full A.2 tool surface is\nbuilt.\n\ngating probe, not engine code. It hits the live Dream sidecar at :8787 and is\nskipped when that sidecar is down, so the normal suite never depends on the\nGPU being warm.\n\nRun the live probe explicitly:\n    C:\\Python314\\python.exe -m pytest tests/test_dream_long_argument_probe.py -v\nor force-run even when the sidecar is up but the module-level skip fires:\n    LOOM_RUN_LIVE_DREAM_PROBE=1 pytest tests/test_dream_long_argument_probe.py -v'
 
 from __future__ import annotations
 
@@ -27,8 +9,8 @@ import time
 import httpx
 import pytest
 
-DREAM_HOST = os.environ.get("NROL_AO_DREAM_HOST") or os.environ.get("DREAM_HOST") or "http://127.0.0.1:8787"
-DREAM_MODEL = os.environ.get("NROL_AO_DREAM_MODEL") or os.environ.get("DREAM_MODEL") or ""
+DREAM_HOST = os.environ.get("DREAM_HOST") or "http://127.0.0.1:8787"
+DREAM_MODEL = os.environ.get("DREAM_MODEL") or ""
 N_CALLS = int(os.environ.get("DREAM_LONG_PROBE_N", "20"))
 REQUEST_TIMEOUT = 300.0
 MIN_ANALYSIS_LEN = 400  # matches §4.1 phase-3 metric floor

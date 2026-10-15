@@ -15,12 +15,11 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_all_engines_cache():
-    """Clear the module-level cache so each test starts cold."""
+def _reset_all_engines_cache(monkeypatch):
+    """Isolate cache AND its asyncio lock for pytest's per-test event loops."""
     import server
-    server._ALL_ENGINES_CACHE = None
-    yield
-    server._ALL_ENGINES_CACHE = None
+    monkeypatch.setattr(server, "_ALL_ENGINES_CACHE", None)
+    monkeypatch.setattr(server, "_ALL_ENGINES_REFRESH_LOCK", asyncio.Lock())
 
 
 async def test_concurrent_callers_share_one_refresh(client):

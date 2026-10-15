@@ -1,27 +1,39 @@
-"""Model context-window table + handoff gate.
+"""Model classification and legacy context-threshold compatibility helpers.
 
-Used by the generation pipeline to decide, for a given target model and branch
-size, whether we need to run a pre-generation compact-and-handoff before
-letting the target model see the branch.
-
-1M-context Anthropic models always skip the gate. Everything else (standard
-Anthropic, Gemini, local llama) trips the gate if the active branch's
-cumulative token estimate exceeds a per-target threshold.
+These thresholds apply when Loom must rebuild a provider session from the
+canonical branch, or when it can compact a Claude session before switching to
+a smaller target. Native agent continuations retain provider-side context and
+must not be gated by the cumulative size of Loom's stored branch. Production
+agent admission and handoff checks use replay_budget's destination-aware full
+payload estimate, not these legacy branch-length thresholds.
 """
+
+import re as _re
+import model_registry
+
 
 # ~12% safety margin under each provider's real window, because token_estimate
 # is len(content)//3 and can drift on code-heavy or tool-heavy turns.
 THRESHOLD_ANTHROPIC_STD = 175_000   # 200k window → 175k gate
+THRESHOLD_CODEX = 239_000           # Codex history rebuild into a 272k effective window
 THRESHOLD_GEMINI = 175_000          # Gemini 1M+ but treated as non-1M for CC handoff
 THRESHOLD_LOCAL_LLAMA = 220_000     # local llama-server runs Qwen 262k-context;
                                     # 220k leaves ~16% headroom for token-estimate drift
-THRESHOLD_OPENROUTER_GLM_52 = 880_000
-THRESHOLD_OPENROUTER_KIMI_K27_CODE = 225_000
-THRESHOLD_OPENROUTER_GPT_56_LUNA = 880_000
-THRESHOLD_OPENROUTER_DEEPSEEK_V4_FLASH = 880_000
 
 
-import re as _re
+def _catalog_threshold(model_id):
+    definition = model_registry.REGISTRY.model(model_id)
+    if definition:
+        return definition.get("handoff_threshold") or int(definition["context_length"] * 0.875)
+    return THRESHOLD_ANTHROPIC_STD
+
+
+# Backwards-compatible exports, derived from data rather than copied budgets.
+THRESHOLD_OPENROUTER_GLM_53_FLASH = _catalog_threshold("z-ai/glm-5.3-flash")
+THRESHOLD_OPENROUTER_GLM_52 = _catalog_threshold("z-ai/glm-5.2")
+THRESHOLD_OPENROUTER_KIMI_K27_CODE = _catalog_threshold("moonshotai/kimi-k2.7-code")
+THRESHOLD_OPENROUTER_GPT_56_LUNA = _catalog_threshold("openai/gpt-5.6-luna")
+THRESHOLD_OPENROUTER_DEEPSEEK_V4_FLASH = _catalog_threshold("deepseek/deepseek-v4-flash-0731")
 
 # claude-<family>-<major>[-<minor>][-date], minor optional (matches server.py).
 _1M_ID_RE = _re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?")
@@ -65,15 +77,7 @@ def is_1m_anthropic(model_id: str) -> bool:
 
 def _context_model_id(model_id: str) -> str:
     """Normalize Loom wrapper selectors before applying context gates."""
-    if not model_id:
-        return ""
-    m = model_id.lower()
-    if not m.startswith("goose:"):
-        return m
-    body = m.split(":", 1)[1]
-    if body.startswith("auto:"):
-        body = body.split(":", 1)[1]
-    return body
+    return model_registry.unwrap_goose(model_id).lower()
 
 
 def is_anthropic(model_id: str) -> bool:
@@ -81,35 +85,23 @@ def is_anthropic(model_id: str) -> bool:
     sonnet/opus/haiku alias or a full `claude-<family>-...` ID, with optional
     `[1m]` suffix. Used by routing to decide between cloud Anthropic, Gemini,
     and local-llama paths."""
-    if not model_id:
-        return False
-    mid = _context_model_id(model_id)
-    base = mid.split("[")[0] if "[" in mid else mid
-    bl = base.lower()
-    if bl in ("sonnet", "opus", "haiku"):
-        return True
-    return bl.startswith(("claude-fable-", "claude-opus-", "claude-sonnet-", "claude-haiku-"))
+    return model_registry.resolve(_context_model_id(model_id)).get("backend") == "anthropic"
 
 
 def is_gemini(model_id: str) -> bool:
-    if not model_id:
-        return False
-    return _context_model_id(model_id).startswith("gemini")
+    return model_registry.resolve(_context_model_id(model_id)).get("mode") == "gemini"
+
+
+def is_codex(model_id: str) -> bool:
+    """True for Codex selectors and raw OpenAI model IDs.
+
+    The numeric GPT match deliberately excludes names such as ``gpt-oss``.
+    """
+    return model_registry.resolve(_context_model_id(model_id)).get("mode") == "codex"
 
 
 def is_openrouter(model_id: str) -> bool:
-    if not model_id:
-        return False
-    ml = _context_model_id(model_id)
-    return (
-        ml.startswith("openrouter:")
-        or ml in {
-            "z-ai/glm-5.2",
-            "moonshotai/kimi-k2.7-code",
-            "openai/gpt-5.6-luna",
-            "deepseek/deepseek-v4-flash-0731",
-        }
-    )
+    return model_registry.is_openrouter(model_id)
 
 
 def _openrouter_slug(model_id: str) -> str:
@@ -118,27 +110,25 @@ def _openrouter_slug(model_id: str) -> str:
 
 
 def is_local_llama(model_id: str) -> bool:
-    """Local llama models — anything not Anthropic or Gemini."""
+    """Local llama models — anything not owned by a remote provider."""
     if not model_id:
         return False
-    if is_gemini(model_id) or is_anthropic(model_id) or is_openrouter(model_id):
+    if (
+        is_gemini(model_id)
+        or is_codex(model_id)
+        or is_anthropic(model_id)
+        or is_openrouter(model_id)
+    ):
         return False
     return True
 
 
 def handoff_threshold(target_model: str) -> int:
-    """Token threshold above which a non-1M target needs a compact-handoff."""
+    """Safe payload threshold for a history rebuild or Claude handoff."""
     if is_openrouter(target_model):
-        slug = _openrouter_slug(target_model)
-        if slug == "z-ai/glm-5.2":
-            return THRESHOLD_OPENROUTER_GLM_52
-        if slug == "moonshotai/kimi-k2.7-code":
-            return THRESHOLD_OPENROUTER_KIMI_K27_CODE
-        if slug == "openai/gpt-5.6-luna":
-            return THRESHOLD_OPENROUTER_GPT_56_LUNA
-        if slug == "deepseek/deepseek-v4-flash-0731":
-            return THRESHOLD_OPENROUTER_DEEPSEEK_V4_FLASH
-        return THRESHOLD_ANTHROPIC_STD
+        return _catalog_threshold(target_model)
+    if is_codex(target_model):
+        return THRESHOLD_CODEX
     if is_local_llama(target_model):
         return THRESHOLD_LOCAL_LLAMA
     if is_gemini(target_model):
@@ -147,8 +137,12 @@ def handoff_threshold(target_model: str) -> int:
 
 
 def needs_handoff(target_model: str, branch_tokens: int) -> bool:
-    """Fast gate check. Runs on every generation; most turns exit at the
-    first line (1M target → skip)."""
+    """Whether a prospective rebuild/handoff exceeds the target payload bound.
+
+    Callers must first establish that the turn actually needs a history
+    rebuild or has a compactable Claude source. This is not a native-session
+    context check.
+    """
     if is_1m_anthropic(target_model):
         return False
     return branch_tokens > handoff_threshold(target_model)
@@ -162,6 +156,8 @@ def provider_label(target_model: str) -> str:
         return "Gemini"
     if is_openrouter(target_model):
         return "OpenRouter"
+    if is_codex(target_model):
+        return "Codex"
     if is_local_llama(target_model):
         return "Local"
     return "Anthropic"

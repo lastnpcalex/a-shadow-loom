@@ -28,8 +28,57 @@ async function apiError(res, method, url) {
 function isMobileDevice() {
     const hasMouse = window.matchMedia('(any-pointer: fine)').matches;
     return window.matchMedia('(pointer: coarse)').matches
-        && window.matchMedia('(max-width: 768px)').matches
+        && window.matchMedia('(max-width: 768px), (max-width: 1100px) and (max-height: 500px)').matches
         && !hasMouse;
+}
+
+let _loomMobileViewportBaseline = 0;
+let _loomMobileViewportInitialized = false;
+
+function syncTrueMobileViewport() {
+    const root = document.documentElement;
+    const trueMobile = isMobileDevice();
+    root.classList.toggle('true-mobile', trueMobile);
+
+    if (!trueMobile) {
+        _loomMobileViewportBaseline = 0;
+        root.classList.remove('mobile-keyboard-open');
+        root.style.removeProperty('--loom-visual-viewport-height');
+        root.style.removeProperty('--loom-mobile-composer-max-height');
+        return;
+    }
+
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+
+    const viewportHeight = Math.round(viewport.height);
+    root.style.setProperty('--loom-visual-viewport-height', `${viewportHeight}px`);
+    root.style.setProperty(
+        '--loom-mobile-composer-max-height',
+        `${Math.max(72, Math.min(120, Math.round(viewportHeight * 0.32)))}px`,
+    );
+
+    const composerFocused = document.activeElement === document.getElementById('user-input');
+    if (!composerFocused || viewportHeight > _loomMobileViewportBaseline) {
+        _loomMobileViewportBaseline = viewportHeight;
+    }
+    const keyboardOpen = composerFocused
+        && _loomMobileViewportBaseline - viewportHeight > 100;
+    root.classList.toggle('mobile-keyboard-open', keyboardOpen);
+}
+
+function initTrueMobileViewport() {
+    if (_loomMobileViewportInitialized) return;
+    _loomMobileViewportInitialized = true;
+    syncTrueMobileViewport();
+
+    window.addEventListener('resize', syncTrueMobileViewport);
+    document.addEventListener('focusin', syncTrueMobileViewport);
+    document.addEventListener('focusout', () => requestAnimationFrame(syncTrueMobileViewport));
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncTrueMobileViewport);
+        window.visualViewport.addEventListener('scroll', syncTrueMobileViewport);
+    }
 }
 
 function truthySetting(value) {
@@ -150,12 +199,15 @@ const State = {
     selectedCharacterId: null,
     messages: [],
     treeData: [],
+    loomCursor: null,  // server-owned exact thread/leaf for this page
+    loomCursors: {},   // conversation_id -> last server cursor revision
     branchNames: {},  // msg_id → branch label (computed from tree data)
     ws: null,
     isStreaming: false,
     pendingImages: [],  // [{path, url}, ...] — max 5
     pendingReply: null,  // {msgId, label, text} — highlight-to-reply excerpt
     bookmarks: [],
+    branchPins: [],  // conversation-scoped exact-path navigation shortcuts
     stateCards: [],
     config: {},
     convFilter: 'all',
@@ -172,6 +224,7 @@ const State = {
     })(),
     branchCount: 1,  // number of response branches to generate (Weave/OODA only)
     activeGenerations: {},  // gen_id -> { parent_id } of all active generations in this tree
+    agentRuns: [],  // supervisor-owned child runs; never inserted into messages/tree
 };
 
 function findBranchLeaf(nodes) {
@@ -197,42 +250,295 @@ function _tabBranchKey(convId) {
     return `loom-tab-branch:${convId}`;
 }
 
+function _tabModelKey(convId, threadId = null) {
+    if (convId == null) return null;
+    const tid = threadId || State.loomCursor?.thread_id || 'default';
+    return `loom-tab-model-explicit:${convId}:${tid}`;
+}
+
+function _getTabPreferredModel(conv) {
+    if (!conv) return null;
+    const convId = conv.id;
+    const threadId = State.loomCursor?.thread_id || 'default';
+    try {
+        return sessionStorage.getItem(_tabModelKey(convId, threadId)) || null;
+    } catch {
+        return null;
+    }
+}
+
+function _rememberTabPreferredModel(convId, model) {
+    if (!convId || !model) return;
+    const threadId = State.loomCursor?.thread_id || 'default';
+    try {
+        const key = _tabModelKey(convId, threadId);
+        if (key) sessionStorage.setItem(key, model);
+    } catch {}
+}
+
+let _explicitCCModel = null;
+
+function _branchLastUsedCCModel(messages = State.messages) {
+    for (let i = (messages?.length || 0) - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (message?.role !== 'assistant') continue;
+        let attestation = message.model_attestation;
+        if (typeof attestation === 'string') {
+            try { attestation = JSON.parse(attestation); } catch { attestation = null; }
+        }
+        const requested = attestation && typeof attestation === 'object'
+            ? attestation.requested_model : null;
+        let model = requested || message.cc_model_used;
+        if (!requested && typeof model === 'string' && model.endsWith('@dream-shim')) {
+            model = `dream:${model.slice(0, -'@dream-shim'.length)}`;
+        }
+        if (typeof model === 'string' && model.trim()) {
+            const trimmed = model.trim();
+            const am = trimmed.match(/^claude-(opus|sonnet|haiku)-/i);
+            if (am) {
+                const fam = am[1].toLowerCase();
+                return trimmed.includes('[1m]') ? `${fam}[1m]` : fam;
+            }
+            return trimmed;
+        }
+    }
+    return null;
+}
+
+function _selectedCCModelForBranch(conv) {
+    if (!conv) return null;
+    const threadId = State.loomCursor?.thread_id || null;
+    if (_explicitCCModel?.convId === String(conv.id)
+        && (!_explicitCCModel.threadId || !threadId || _explicitCCModel.threadId === threadId)) {
+        return _explicitCCModel.model;
+    }
+    const branchModel = State.loomCursor?.leaf_message_id == null && State.loomCursor
+        ? null : _branchLastUsedCCModel();
+    return branchModel || _getTabPreferredModel(conv) || conv.cc_model || null;
+}
+
+function _rememberExplicitCCModel(convId, model) {
+    if (!convId || !model) return;
+    _explicitCCModel = {
+        convId: String(convId),
+        threadId: State.loomCursor?.thread_id || null,
+        model,
+    };
+    _rememberTabPreferredModel(convId, model);
+}
+
+function _clearExplicitCCModel() {
+    _explicitCCModel = null;
+}
+
+const NEW_THREAD_CURSOR = '__new_thread__';
+const _loomRouteBase = location.pathname === '/app' || location.pathname.startsWith('/app/') ? '/app/' : '/';
+let _conversationLoadRequestSeq = 0;
+let _newThreadInFlight = false;
+
+function isNewConversationThread(convId) {
+    if (convId == null) return false;
+    const cursor = State.loomCursors?.[String(convId)];
+    if (cursor && cursor.leaf_message_id == null) return true;
+    return sessionStorage.getItem(_tabBranchKey(convId)) === NEW_THREAD_CURSOR;
+}
+
+function rememberNewConversationThread(convId) {
+    if (convId == null) return;
+    sessionStorage.setItem(_tabBranchKey(convId), NEW_THREAD_CURSOR);
+    if (String(State.currentConvId) === String(convId) && State.currentView !== 'home') {
+        updateLoomRoute(convId, NEW_THREAD_CURSOR, State.currentView);
+    }
+}
+
 function rememberConversationLeaf(convId, leafId) {
     if (convId == null || leafId == null) return;
     sessionStorage.setItem(_tabBranchKey(convId), String(leafId));
+    if (String(State.currentConvId) === String(convId) && State.currentView !== 'home') {
+        updateLoomRoute(convId, leafId, State.currentView);
+    }
 }
 
-function findDescendantBranchLeaf(treeData, startId) {
-    const nodes = treeData || [];
-    const start = nodes.find(n => String(n.id) === String(startId));
-    if (!start) return null;
-    const children = new Map();
-    for (const node of nodes) {
-        if (node.parent_id == null) continue;
-        const key = String(node.parent_id);
-        if (!children.has(key)) children.set(key, []);
-        children.get(key).push(node);
+function _composerDraftStorageKey(convId, cursor = null) {
+    if (convId == null) return null;
+    const selected = cursor || State.loomCursors?.[String(convId)] || null;
+    const threadId = selected?.thread_id || 'unselected';
+    const leafId = selected?.leaf_message_id ?? 'root';
+    return `loom-composer-draft:${convId}:${threadId}:${leafId}`;
+}
+
+function saveComposerDraft(convId = State.currentConvId, cursor = State.loomCursor) {
+    if (convId == null && typeof saveCasualDraft === 'function') saveCasualDraft();
+    const input = document.getElementById('user-input');
+    const key = _composerDraftStorageKey(convId, cursor);
+    if (!input || !key) return;
+    const describeContext = document.getElementById('describe-context')?.value || '';
+    const draft = {
+        text: input.value,
+        pendingImages: State.pendingImages || [],
+        pendingReply: State.pendingReply || null,
+        describeContext,
+    };
+    if (draft.text || draft.pendingImages.length || draft.pendingReply || describeContext) {
+        sessionStorage.setItem(key, JSON.stringify(draft));
+    } else {
+        sessionStorage.removeItem(key);
     }
-    // Follow only an unambiguous linear continuation. At a fork, stay on the
-    // remembered node until this tab explicitly follows one child; choosing the
-    // newest descendant would let a sibling agent steal the tab on reload.
-    let current = start;
-    while (true) {
-        const next = children.get(String(current.id)) || [];
-        if (next.length !== 1) return current;
-        current = next[0];
+}
+
+function restoreComposerDraft(convId = State.currentConvId, cursor = State.loomCursor) {
+    const input = document.getElementById('user-input');
+    const key = _composerDraftStorageKey(convId, cursor);
+    if (!input || !key) return;
+    const raw = sessionStorage.getItem(key);
+    let draft = { text: raw || '', pendingImages: [], pendingReply: null, describeContext: '' };
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') draft = parsed;
+        } catch {}
     }
+    input.value = draft.text || '';
+    State.pendingImages = Array.isArray(draft.pendingImages) ? draft.pendingImages : [];
+    State.pendingReply = draft.pendingReply || null;
+    const describeInput = document.getElementById('describe-context');
+    if (describeInput) describeInput.value = draft.describeContext || '';
+    if (typeof renderImagePreviews === 'function') renderImagePreviews();
+    if (typeof renderReplyQuoteBar === 'function') renderReplyQuoteBar();
+    if (typeof autoResizeTextarea === 'function') autoResizeTextarea();
+}
+
+function _storeLoomCursor(cursor) {
+    if (!cursor) return null;
+    const convId = String(cursor.conversation_id);
+    const existing = State.loomCursors[convId];
+    if (existing && Number(existing.revision || 0) > Number(cursor.revision || 0)) {
+        return existing;
+    }
+    State.loomCursors[convId] = cursor;
+    if (String(State.currentConvId) === convId) State.loomCursor = cursor;
+    return cursor;
+}
+
+function _loomThreadIdForLeaf(leafId, treeData = State.treeData) {
+    if (leafId == null) return null;
+    const node = (treeData || []).find(item => String(item.id) === String(leafId))
+        || (State.messages || []).find(item => String(item.id) === String(leafId));
+    if (node?.loom_thread_id) return node.loom_thread_id;
+    if (String(State._followingDraftMsgId ?? '') === String(leafId)
+        && State.loomCursor?.thread_id) return State.loomCursor.thread_id;
+    return null;
+}
+
+async function selectServerLoomCursor(convId, leafId, treeData = State.treeData) {
+    const threadId = _loomThreadIdForLeaf(leafId, treeData);
+    if (!threadId) throw new Error('The selected message has no Loom thread identity');
+    const known = State.loomCursors?.[String(convId)] || null;
+    if (known
+        && String(known.thread_id) === String(threadId)
+        && String(known.leaf_message_id) === String(leafId)) {
+        return _storeLoomCursor(known);
+    }
+    const payload = {
+        client_instance_id: _loomClientInstanceId,
+        loom_thread_id: threadId,
+        leaf_message_id: leafId,
+    };
+    if (known) payload.expected_revision = known.revision;
+    try {
+        const cursor = await API.post(`/api/conversations/${convId}/cursor`, payload);
+        return _storeLoomCursor(cursor);
+    } catch (err) {
+        if (err.status !== 409) throw err;
+        const current = await API.get(
+            `/api/conversations/${convId}/cursor/${encodeURIComponent(_loomClientInstanceId)}`
+        );
+        if (String(current.thread_id) === String(threadId)
+            && String(current.leaf_message_id) === String(leafId)) {
+            return _storeLoomCursor(current);
+        }
+        throw err;
+    }
+}
+
+async function createServerLoomThreadCursor(convId) {
+    let known = State.loomCursors?.[String(convId)] || null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const payload = {
+            client_instance_id: _loomClientInstanceId,
+        };
+        if (known) payload.expected_revision = known.revision;
+        try {
+            const result = await API.post(`/api/conversations/${convId}/threads`, payload);
+            _clearExplicitCCModel();
+            return _storeLoomCursor(result.cursor);
+        } catch (err) {
+            if (err.status !== 409 || attempt !== 0) throw err;
+            // A terminal event can advance this page's cursor while the user
+            // is starting a standalone root. Refresh this exact page cursor
+            // and retry the same explicit action once; never guess a revision
+            // and never consult conversation-global branch state.
+            known = await API.get(
+                `/api/conversations/${convId}/cursor/${encodeURIComponent(_loomClientInstanceId)}`
+            );
+            _storeLoomCursor(known);
+        }
+    }
+    throw new Error('Could not create a new Loom thread');
 }
 
 function findLoadableConversationLeaf(treeData, convId) {
     const rememberedId = convId == null ? null : sessionStorage.getItem(_tabBranchKey(convId));
+    if (rememberedId === NEW_THREAD_CURSOR) return null;
     if (rememberedId != null) {
         const remembered = (treeData || []).find(n => String(n.id) === String(rememberedId));
-        if (remembered) return findDescendantBranchLeaf(treeData, remembered.id) || remembered;
+        // A remembered branch is an exact per-window cursor. Advancing to even
+        // one new child here lets a different agent move this window on focus,
+        // reconnect, or reload. Only explicit navigation and a generation this
+        // window follows may advance the cursor via rememberConversationLeaf().
+        if (remembered) return remembered;
     }
     const activeLeaf = findActiveConversationLeaf(treeData);
     if (activeLeaf) return activeLeaf;
     return findBranchLeaf(treeData || []);
+}
+
+function updateLoomRoute(convId, leafId, view) {
+    if (!window.history?.replaceState) return;
+    const url = new URL(window.location.href);
+    url.pathname = _loomRouteBase + (view === 'search' ? 'search' : '');
+    url.searchParams.delete('folders');
+    if (view === 'home' || view === 'search' || convId == null) {
+        url.searchParams.delete('conversation');
+        url.searchParams.delete('branch');
+        url.searchParams.delete('thread');
+        url.searchParams.delete('view');
+        if (view === 'home') url.searchParams.set('folders', '');
+    } else {
+        url.searchParams.set('conversation', String(convId));
+        if (leafId === NEW_THREAD_CURSOR) {
+            url.searchParams.delete('branch');
+            url.searchParams.set('thread', 'new');
+        } else {
+            url.searchParams.delete('thread');
+            if (leafId != null) url.searchParams.set('branch', String(leafId));
+            else url.searchParams.delete('branch');
+        }
+        url.searchParams.set('view', view === 'tree' ? 'tree' : 'chat');
+    }
+    window.history.replaceState(null, '', url.href.replace(/([?&])folders=(?=&|$)/, '$1folders'));
+}
+
+function conversationWindowUrl(convId, { newThread = false } = {}) {
+    const url = new URL(window.location.href);
+    url.pathname = _loomRouteBase;
+    url.searchParams.delete('folders');
+    url.searchParams.set('conversation', String(convId));
+    url.searchParams.delete('branch');
+    if (newThread) url.searchParams.set('thread', 'new');
+    else url.searchParams.delete('thread');
+    url.searchParams.set('view', 'chat');
+    return url.href;
 }
 
 function saveFolderCollapsed() {
@@ -313,10 +619,17 @@ const FOLDER_ICON_OPEN_SVG = '<svg class="conv-folder-icon" width="14" height="1
 
 // ── View Switching ──
 function switchView(view) {
+    if (view !== State.currentView && typeof saveCasualDraft === 'function') saveCasualDraft();
+    if (typeof _workspaceNavigationEpoch !== 'undefined') _workspaceNavigationEpoch++;
+    if (State.currentView === 'search' && view !== 'search' && typeof clearSearchSpaceChat === 'function') clearSearchSpaceChat();
     State.currentView = view;
+    if (typeof scheduleWorkspaceRender === 'function') scheduleWorkspaceRender();
     if (!State._restoringView) {
-        localStorage.setItem('loom-last-view', view);
         sessionStorage.setItem('loom-tab-view', view);
+        const rememberedLeaf = State.currentConvId == null
+            ? null
+            : sessionStorage.getItem(_tabBranchKey(State.currentConvId));
+        updateLoomRoute(State.currentConvId, rememberedLeaf, view);
     }
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById(`view-${view}`).classList.add('active');
@@ -326,6 +639,8 @@ function switchView(view) {
     const title = document.getElementById('conv-title');
     const breadcrumb = document.getElementById('breadcrumb-trail');
     const treeBtn = document.getElementById('btn-to-tree');
+    const branchNav = document.getElementById('branch-nav-bar');
+    const branchPinsPanel = document.getElementById('branch-pins-panel');
     const globalBmBtn = document.getElementById('btn-bookmarks-global');
     const globalBmPanel = document.getElementById('bookmarks-panel-global');
     const statePanelTree = document.getElementById('btn-state-panel-tree');
@@ -333,14 +648,16 @@ function switchView(view) {
 
     // Hide panels on view switch
     globalBmPanel?.classList.add('hidden');
+    branchPinsPanel?.classList.add('hidden');
     statePanel?.classList.add('hidden');
     const inputArea = document.getElementById('input-area');
 
-    if (view === 'home') {
+    if (view === 'home' || view === 'search') {
         inputArea?.classList.add('hidden');
         sep?.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
+        branchNav?.classList.add('hidden');
         treeBtn.classList.add('hidden');
 
         globalBmBtn?.classList.remove('hidden');
@@ -352,15 +669,21 @@ function switchView(view) {
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.add('hidden');
+        branchNav?.classList.remove('hidden');
         treeBtn.classList.add('hidden');
+        updateBranchNavigation();
         // Close canvas fullview when returning to tree
         if (typeof closeCanvasFullview === 'function') closeCanvasFullview();
         if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 
         globalBmBtn?.classList.remove('hidden');
+        // Keep the long-standing shared composer in tree view. Sending from
+        // here creates a standalone root; selecting a branch is navigation,
+        // never an implicit destination for this composer.
         inputArea?.classList.remove('hidden');
         const userInput = document.getElementById('user-input');
-        if (userInput) userInput.placeholder = 'Create a branch...';
+        if (userInput) userInput.placeholder = 'Start a new thread...';
+        requestAnimationFrame(() => autoResizeTextarea());
         // Show state panel button in tree only for OODA-enabled Weave
         const isOodaWeave = State.currentConv?.mode === 'weave' && State.currentConv?.ooda_enabled;
         if (isOodaWeave) statePanelTree?.classList.remove('hidden');
@@ -370,6 +693,7 @@ function switchView(view) {
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.remove('hidden');
+        branchNav?.classList.remove('hidden');
         treeBtn.classList.remove('hidden');
         updateBreadcrumbs();
         if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
@@ -378,6 +702,7 @@ function switchView(view) {
         inputArea?.classList.remove('hidden');
         const userInput = document.getElementById('user-input');
         if (userInput) userInput.placeholder = 'Write your message...';
+        requestAnimationFrame(() => autoResizeTextarea());
         // Refresh messages when switching back to chat (picks up responses
         // that completed while on tree/home view)
         // Skip if we just did switchToBranch (data is already fresh)
@@ -390,6 +715,7 @@ function switchView(view) {
         sep?.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
+        branchNav?.classList.add('hidden');
         treeBtn.classList.add('hidden');
 
         globalBmBtn?.classList.add('hidden');
@@ -397,6 +723,7 @@ function switchView(view) {
         inputArea?.classList.add('hidden');
     }
     if (typeof renderCodexGoalRow === 'function') renderCodexGoalRow();
+    if (typeof syncBrowserTabIdentity === 'function') syncBrowserTabIdentity();
 }
 
 // ── Breadcrumb Navigation ──
@@ -439,7 +766,7 @@ function updateBreadcrumbs() {
     if (State.messages.length > 0) {
         const rootMsg = State.messages[0];
         const rootLabel = State.branchNames[rootMsg.id] || '1';
-        crumbs.push({ label: 'root', msgId: rootMsg.id, title: 'Navigate to root' });
+        crumbs.push({ label: rootLabel, displayLabel: 'root', msgId: rootMsg.id, title: `Navigate to root (${rootLabel})` });
     }
 
     // Find fork points in the path (messages with siblings)
@@ -471,8 +798,9 @@ function updateBreadcrumbs() {
         return head + '…' + tail;
     }
     function _crumbBtn(c) {
-        const safeTitle = escapeHtml((c.title || '') + (c.label ? ' — double-click to copy full path' : ''));
-        return `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" data-full-label="${escapeHtml(c.label || '')}" title="${safeTitle}">${escapeHtml(_truncateLabel(c.label || ''))}</button>`;
+        const safeTitle = escapeHtml(c.title || 'Navigate to this point');
+        const displayLabel = c.displayLabel || c.label || '';
+        return `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" data-full-label="${escapeHtml(c.label || '')}" title="${safeTitle}">${escapeHtml(_truncateLabel(displayLabel))}</button>`;
     }
 
     // Render — collapse middle crumbs if more than 3
@@ -504,7 +832,7 @@ function updateBreadcrumbs() {
     }
 
     // Full branch path (copied when the button at the end is clicked)
-    const fullPath = crumbs.map(c => c.label).filter(Boolean).join(' > ');
+    const fullPath = messageBranchPath(lastMsg.id);
 
     // Dedicated copy button at the end of the trail. Double-click on crumbs
     // doesn't work because single-click navigates — by the time the dblclick
@@ -530,8 +858,7 @@ function updateBreadcrumbs() {
             const full = trail.dataset.fullPath || '';
             if (!full) { showToast('No path to copy'); return; }
             try {
-                await navigator.clipboard.writeText(full);
-                showToast('Branch path copied');
+                await copyMessageBranchPath(lastMsg.id);
             } catch {
                 showToast('Copy failed', 'error');
             }
@@ -550,10 +877,448 @@ function updateBreadcrumbs() {
             }
         });
     }
+    updateBranchNavigation();
 }
 
 // ── Toast Notifications ──
 // ── Loading Overlay ──
+function currentBranchMessage() {
+    if (!State.messages || !State.messages.length) return null;
+    return State.messages[State.messages.length - 1];
+}
+
+function currentBranchPath() {
+    const current = currentBranchMessage();
+    return current ? (State.branchNames?.[current.id] || '') : '';
+}
+
+function messageBranchPath(messageId, conversationId = State.currentConvId) {
+    const sameTree = String(conversationId) === String(State.currentConvId);
+    const nodes = new Map((sameTree ? State.treeData || [] : []).map(node => [Number(node.id), node]));
+    const labels = [];
+    const seen = new Set();
+    let node = nodes.get(Number(messageId));
+    while (node && !seen.has(node.id)) {
+        seen.add(node.id);
+        const label = State.branchNames?.[node.id];
+        if (label) labels.unshift(label);
+        node = nodes.get(Number(node.parent_id));
+    }
+    const workspace = sameTree ? String(State.currentConv?.project_dir || State.currentConv?.folder || State.currentConv?.title || '')
+        .split(/[\\/]/).filter(Boolean).pop() : '';
+    return `${workspace ? encodeURIComponent(workspace) + '/' : ''}tree:${conversationId}/${labels.join('/') || 'root'}/msg:${messageId}`;
+}
+
+function parseMessageBranchPath(value) {
+    const match = String(value || '').trim().replace(/^`|`$/g, '').match(/(?:^|\/)tree:(\d+)\/.*\/msg:(\d+)$/);
+    return match ? {conversationId: Number(match[1]), messageId: Number(match[2])} : null;
+}
+
+async function copyMessageBranchPath(messageId, conversationId = State.currentConvId, source = null) {
+    const path = messageBranchPath(messageId, conversationId);
+    const input = document.getElementById('branch-path-input');
+    let copied = false;
+    try { await navigator.clipboard.writeText(path); copied = true; } catch (_) {}
+    if (source) {
+        document.querySelector('.message-path-feedback')?.remove();
+        const feedback = document.createElement('span');
+        feedback.className = 'message-path-feedback';
+        feedback.setAttribute('role', 'status');
+        feedback.textContent = copied ? 'Path copied' : 'Clipboard unavailable; path ready in Paste + Go';
+        document.body.appendChild(feedback);
+        const bounds = source.getBoundingClientRect();
+        feedback.style.left = `${Math.max(8, Math.min(bounds.left, innerWidth - feedback.offsetWidth - 8))}px`;
+        feedback.style.top = `${bounds.bottom + feedback.offsetHeight + 8 < innerHeight ? bounds.bottom + 6 : Math.max(8, bounds.top - feedback.offsetHeight - 6)}px`;
+        setTimeout(() => feedback.remove(), 2000);
+        if (!copied && input) { input.value = path; input.dataset.pendingPath = path; }
+        return path;
+    }
+    const status = document.getElementById('branch-path-status');
+    if (status) status.textContent = copied ? 'Path copied' : 'Path ready';
+    if (!copied && input) { input.value = path; input.dataset.pendingPath = path; }
+    showToast(copied ? 'Message path copied' : 'Clipboard unavailable; path placed in Paste + Go');
+    return path;
+}
+
+function resolveBranchPath(value) {
+    let raw = String(value || '').trim();
+    if (!raw) return null;
+    if (raw.startsWith('`') && raw.endsWith('`') && raw.length > 1) {
+        raw = raw.slice(1, -1).trim();
+    }
+    const address = parseMessageBranchPath(raw);
+    if (address) {
+        return address.conversationId === Number(State.currentConvId)
+            && (State.treeData || []).some(node => Number(node.id) === address.messageId) ? address.messageId : null;
+    }
+
+    const namedPin = (State.branchPins || []).find(
+        pin => String(pin.label || '').trim().toLowerCase() === raw.toLowerCase()
+    );
+    if (namedPin && (State.treeData || []).some(node => node.id === namedPin.message_id)) {
+        return namedPin.message_id;
+    }
+
+    const messageRef = raw.match(/^(?:msg(?:age)?\s*[:#]?|#)\s*(\d+)$/i);
+    if (messageRef) {
+        const messageId = parseInt(messageRef[1]);
+        return (State.treeData || []).some(node => node.id === messageId) ? messageId : null;
+    }
+
+    // Breadcrumb copies contain "root > fork > leaf". The final computed
+    // label uniquely identifies the exact message in this conversation.
+    const parts = raw.split(/\s*(?:>|›|\/)\s*/).filter(Boolean);
+    const targetLabel = (parts[parts.length - 1] || '').trim();
+    if (targetLabel.toLowerCase() === 'root') {
+        return State.messages?.[0]?.id || null; // compatibility with older copies
+    }
+    for (const [messageId, label] of Object.entries(State.branchNames || {})) {
+        if (String(label).trim() === targetLabel) return parseInt(messageId);
+    }
+    return null;
+}
+
+async function navigateToBranchPath(value) {
+    const address = parseMessageBranchPath(value);
+    if (address && address.conversationId !== Number(State.currentConvId)) {
+        await loadConversation(address.conversationId);
+        if (Number(State.currentConvId) !== address.conversationId) return false;
+    }
+    const messageId = resolveBranchPath(value);
+    if (!messageId) {
+        showToast('Branch path not found in this Loom', 'error');
+        return false;
+    }
+    await switchToBranch(messageId, messageId, { exact: true });
+    const input = document.getElementById('branch-path-input');
+    if (input) { delete input.dataset.pendingPath; input.value = ''; input.title = ''; }
+    const status = document.getElementById('branch-path-status');
+    if (status) status.textContent = '';
+    State._skipLoadOnChat = true;
+    switchView('chat');
+    document.getElementById('branch-pins-panel')?.classList.add('hidden');
+    return true;
+}
+
+function branchPinPath(pin) {
+    return State.branchNames?.[pin.message_id] || '';
+}
+
+async function refreshBranchPinPath(messageId) {
+    if (!State.currentConvId || !messageId || typeof computeBranchNames !== 'function') {
+        return '';
+    }
+    const convId = State.currentConvId;
+    const treeData = await API.get(`/api/conversations/${convId}/tree`);
+    if (String(State.currentConvId) !== String(convId)) return '';
+
+    // A live assistant draft can be persisted before the browser's cached
+    // tree snapshot contains it. Rebuild the path map from an authoritative
+    // post-pin snapshot so a valid live pin never renders as unavailable.
+    State.treeData = treeData;
+    if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
+    const nodeMap = {};
+    const childrenMap = {};
+    const roots = [];
+    for (const node of treeData) {
+        nodeMap[node.id] = node;
+        childrenMap[node.id] = [];
+    }
+    for (const node of treeData) {
+        if (node.parent_id && nodeMap[node.parent_id]) {
+            childrenMap[node.parent_id].push(node.id);
+        } else {
+            roots.push(node.id);
+        }
+    }
+    State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
+    return State.branchNames?.[messageId] || '';
+}
+
+function setBranchPinEditor(pin = null) {
+    const labelInput = document.getElementById('branch-pin-label');
+    const saveButton = document.getElementById('btn-save-branch-pin');
+    const pathText = document.getElementById('branch-pin-current-path');
+    if (!labelInput || !saveButton || !pathText) return;
+    if (pin) {
+        labelInput.dataset.editPinId = String(pin.id);
+        labelInput.value = pin.label || '';
+        labelInput.placeholder = 'Edit pin label';
+        saveButton.textContent = 'Save label';
+        pathText.textContent = `Editing: ${branchPinPath(pin) || 'unavailable path'}`;
+    } else {
+        delete labelInput.dataset.editPinId;
+        const current = currentBranchMessage();
+        const existing = current
+            ? (State.branchPins || []).find(item => item.message_id === current.id)
+            : null;
+        labelInput.value = existing?.label || '';
+        labelInput.placeholder = 'Label current branch';
+        saveButton.textContent = existing ? 'Update pin' : 'Pin current';
+        pathText.textContent = `Current: ${currentBranchPath() || 'no branch selected'}`;
+    }
+}
+
+function renderBranchPins() {
+    const list = document.getElementById('branch-pins-list');
+    const suggestions = document.getElementById('branch-path-suggestions');
+    if (!list || !suggestions) return;
+
+    suggestions.innerHTML = '';
+    for (const pin of State.branchPins || []) {
+        const path = branchPinPath(pin);
+        if (!path) continue;
+        const option = document.createElement('option');
+        option.value = path;
+        option.label = pin.label || path;
+        suggestions.appendChild(option);
+    }
+
+    if (!State.branchPins || State.branchPins.length === 0) {
+        list.innerHTML = '<div class="branch-pins-empty">No branch pins in this Loom yet.</div>';
+        return;
+    }
+
+    const currentId = currentBranchMessage()?.id;
+    list.innerHTML = State.branchPins.map(pin => {
+        const path = branchPinPath(pin);
+        const currentClass = pin.message_id === currentId ? ' current' : '';
+        const disabled = path ? '' : ' disabled';
+        return `<div class="branch-pin-item${currentClass}" data-pin-id="${pin.id}">
+            <button class="branch-pin-open" type="button" data-message-id="${pin.message_id}"${disabled}>
+                <span class="branch-pin-label-text">${escapeHtml(pin.label || 'Pinned branch')}</span>
+                <span class="branch-pin-path-text">${escapeHtml(path || 'Unavailable path')}</span>
+            </button>
+            <button class="branch-pin-edit" type="button" title="Edit label">&#9998;</button>
+            <button class="branch-pin-delete" type="button" title="Remove pin">&times;</button>
+        </div>`;
+    }).join('');
+
+    list.querySelectorAll('.branch-pin-open').forEach(button => {
+        button.addEventListener('click', async () => {
+            if (button.disabled) return;
+            await navigateToBranchPath(`msg:${button.dataset.messageId}`);
+        });
+    });
+    list.querySelectorAll('.branch-pin-edit').forEach(button => {
+        button.addEventListener('click', () => {
+            const pinId = parseInt(button.closest('.branch-pin-item').dataset.pinId);
+            const pin = State.branchPins.find(item => item.id === pinId);
+            if (!pin) return;
+            setBranchPinEditor(pin);
+            document.getElementById('branch-pin-label')?.focus();
+            document.getElementById('branch-pin-label')?.select();
+        });
+    });
+    list.querySelectorAll('.branch-pin-delete').forEach(button => {
+        button.addEventListener('click', async () => {
+            const pinId = parseInt(button.closest('.branch-pin-item').dataset.pinId);
+            try {
+                if (!await showLoomConfirm({title: 'Remove pin?', message: 'Remove this pin? The conversation and messages remain.', confirmLabel: 'Remove'})) return;
+                await API.del(`/api/branch-pins/${pinId}`);
+                State.branchPins = State.branchPins.filter(item => item.id !== pinId);
+                setBranchPinEditor();
+                renderBranchPins();
+                updateBranchNavigation();
+                showToast('Branch pin removed');
+            } catch (error) {
+                showToast(error.detail || 'Failed to remove branch pin', 'error');
+            }
+        });
+    });
+}
+
+function updateBranchNavigation() {
+    const input = document.getElementById('branch-path-input');
+    const pinButton = document.getElementById('btn-pin-current-branch');
+    const count = document.getElementById('branch-pin-count');
+    const current = currentBranchMessage();
+    const path = currentBranchPath();
+    if (input) input.disabled = !State.currentConvId;
+    if (count) count.textContent = String((State.branchPins || []).length);
+    if (pinButton) {
+        const pinned = !!current && (State.branchPins || []).some(pin => pin.message_id === current.id);
+        pinButton.classList.toggle('active', pinned);
+        pinButton.innerHTML = pinned ? '&#9733;' : '&#9734;';
+        pinButton.disabled = !current;
+        pinButton.title = pinned ? 'Edit the current branch pin' : 'Pin and label the current branch';
+    }
+    const editor = document.getElementById('branch-pin-label');
+    if (!editor?.dataset.editPinId) {
+        const pathText = document.getElementById('branch-pin-current-path');
+        if (pathText) pathText.textContent = `Current: ${path || 'no branch selected'}`;
+    }
+    renderBranchPins();
+}
+
+function openBranchPins({ focusLabel = false } = {}) {
+    if (State.currentView === 'chat' && typeof workspaceOpenPins === 'function') {
+        workspaceOpenPins();
+        if (focusLabel) document.getElementById('workspace-pin-current').click();
+        return;
+    }
+    const panel = document.getElementById('branch-pins-panel');
+    if (!panel) return;
+    document.getElementById('bookmarks-panel-global')?.classList.add('hidden');
+    panel.classList.remove('hidden');
+    setBranchPinEditor();
+    renderBranchPins();
+    if (focusLabel) {
+        const input = document.getElementById('branch-pin-label');
+        input?.focus();
+        input?.select();
+    }
+}
+
+async function startNewConversationThread() {
+    if (!State.currentConvId || _newThreadInFlight) return;
+    saveComposerDraft();
+    _newThreadInFlight = true;
+    // A conversation/branch load may still be resolving after this window was
+    // opened or foregrounded. Invalidate it before installing the root cursor
+    // so its late response cannot restore an older branch and switch us back to
+    // tree view.
+    const convId = State.currentConvId;
+    const requestSeq = ++_conversationLoadRequestSeq;
+    const generationContinues = !!State.isStreaming;
+    showLoading();
+    try {
+        await createServerLoomThreadCursor(convId);
+    } catch (err) {
+        _newThreadInFlight = false;
+        if (requestSeq === _conversationLoadRequestSeq) hideLoading();
+        showToast(err.detail || err.message || 'Failed to create a standalone thread', 'error');
+        return;
+    }
+    if (requestSeq !== _conversationLoadRequestSeq
+        || String(State.currentConvId) !== String(convId)) {
+        _newThreadInFlight = false;
+        return;
+    }
+    if (typeof removeStreamingMessage === 'function') removeStreamingMessage();
+    if (typeof _clearTerminalStreamState === 'function') {
+        _clearTerminalStreamState({ clearParallel: true });
+    }
+    if (typeof hideGenStatus === 'function') hideGenStatus();
+    if (typeof hideRetryBar === 'function') hideRetryBar();
+    if (typeof clearPendingReply === 'function') clearPendingReply({ persist: false });
+    rememberNewConversationThread(convId);
+    State.messages = [];
+    State._skipLoadOnChat = true;
+    switchView('chat');
+    hideLoading();
+    if (typeof renderMessages === 'function') renderMessages();
+    updateBranchNavigation();
+    const input = document.getElementById('user-input');
+    if (input) {
+        restoreComposerDraft(convId, State.loomCursor);
+        input.placeholder = 'Start a new thread...';
+        input.focus();
+    }
+    showToast(generationContinues
+        ? 'New thread ready; the previous agent continues in the background'
+        : 'New thread ready');
+    _newThreadInFlight = false;
+}
+
+async function saveBranchPin() {
+    const labelInput = document.getElementById('branch-pin-label');
+    if (!labelInput) return;
+    const label = labelInput.value.trim();
+    if (!label) {
+        showToast('Give this branch pin a label', 'error');
+        labelInput.focus();
+        return;
+    }
+
+    try {
+        const editPinId = parseInt(labelInput.dataset.editPinId || '');
+        let saved;
+        if (editPinId) {
+            saved = await API.put(`/api/branch-pins/${editPinId}`, { label });
+        } else {
+            const current = currentBranchMessage();
+            if (!current) return;
+            saved = await API.post(`/api/conversations/${State.currentConvId}/branch-pins`, {
+                message_id: current.id,
+                label,
+            });
+        }
+        State.branchPins = [saved, ...State.branchPins.filter(
+            pin => pin.id !== saved.id && pin.message_id !== saved.message_id
+        )];
+        if (!branchPinPath(saved)) {
+            await refreshBranchPinPath(saved.message_id);
+        }
+        setBranchPinEditor();
+        updateBranchNavigation();
+        showToast(editPinId ? 'Branch pin label updated' : 'Branch pinned');
+    } catch (error) {
+        showToast(error.detail || 'Failed to save branch pin', 'error');
+    }
+}
+
+function initBranchNavigation() {
+    const bar = document.getElementById('branch-nav-bar');
+    const panel = document.getElementById('branch-pins-panel');
+    const pathInput = document.getElementById('branch-path-input');
+
+    document.getElementById('btn-branch-go')?.addEventListener('click', () => {
+        navigateToBranchPath(pathInput?.value || '');
+    });
+    document.getElementById('btn-branch-paste')?.addEventListener('click', async () => {
+        try {
+            pathInput.value = await navigator.clipboard.readText();
+            pathInput.dataset.pendingPath = pathInput.value;
+            pathInput.focus();
+        } catch (_) {
+            pathInput.focus();
+            showToast('Paste the copied path into this field');
+        }
+    });
+    document.getElementById('btn-new-thread')?.addEventListener('click', startNewConversationThread);
+    pathInput?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            navigateToBranchPath(pathInput.value);
+        } else if (event.key === 'Escape') {
+            delete pathInput.dataset.pendingPath;
+            const current = currentBranchMessage();
+            pathInput.value = '';
+            document.getElementById('branch-path-status').textContent = '';
+            pathInput.blur();
+        }
+    });
+    pathInput?.addEventListener('focus', () => pathInput.select());
+    pathInput?.addEventListener('input', () => {
+        pathInput.dataset.pendingPath = pathInput.value;
+        const status = document.getElementById('branch-path-status');
+        if (status) status.textContent = '';
+    });
+    document.getElementById('btn-pin-current-branch')?.addEventListener('click', () => {
+        openBranchPins({ focusLabel: true });
+    });
+    document.getElementById('btn-branch-pins')?.addEventListener('click', () => {
+        if (panel?.classList.contains('hidden')) openBranchPins();
+        else panel.classList.add('hidden');
+    });
+    document.getElementById('btn-close-branch-pins')?.addEventListener('click', () => {
+        panel?.classList.add('hidden');
+    });
+    document.getElementById('btn-save-branch-pin')?.addEventListener('click', saveBranchPin);
+    document.getElementById('branch-pin-label')?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            saveBranchPin();
+        } else if (event.key === 'Escape') {
+            setBranchPinEditor();
+        }
+    });
+    document.addEventListener('click', event => {
+        if (bar && !bar.contains(event.target)) panel?.classList.add('hidden');
+    });
+}
+
 function showLoading(text) {
     let overlay = document.getElementById('loading-overlay');
     if (!overlay) {
@@ -577,6 +1342,7 @@ function hideLoading() {
 }
 
 function showToast(message, type = 'info') {
+    if (typeof addInfoNotification === 'function') { addInfoNotification(message, type); return; }
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.textContent = message;
@@ -590,6 +1356,7 @@ function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 
 // ── Init ──
 async function init() {
+    initTrueMobileViewport();
     try {
         const [chars, convs, cfg, personas, lore] = await Promise.all([
             API.get('/api/characters'),
@@ -614,23 +1381,48 @@ async function init() {
     renderHomeLore();
     setupEventListeners();
     initInlineCCControls();
+    if (location.pathname === _loomRouteBase + 'search' || new URLSearchParams(location.search).get('view') === 'search') {
+        document.getElementById('btn-search-space-open').click();
+        void populateCCModelDropdowns();
+        checkHealth();
+        return;
+    }
     await populateCCModelDropdowns();
     // Paste handler registered in setupEventListeners
-    // Restore last page: view first, then conversation if applicable
-    // sessionStorage is per-tab and survives refresh; localStorage is the cross-tab default
-    const lastConv = parseInt(sessionStorage.getItem('loom-tab-conv') || localStorage.getItem('loom-last-conv'));
-    const lastView = sessionStorage.getItem('loom-tab-view') || localStorage.getItem('loom-last-view');
-    if (lastView === 'home' || !lastView) {
+    // Restore this window only. Cross-window localStorage made a newly opened
+    // Loom window jump to whichever conversation another window used last.
+    // Explicit URL state wins so Open-in-window and duplicated URLs are stable.
+    const route = new URLSearchParams(window.location.search);
+    const routeConv = parseInt(route.get('conversation'));
+    const routeBranch = parseInt(route.get('branch'));
+    const routeNewThread = route.get('thread') === 'new';
+    const lastConv = routeConv;
+    const lastView = routeConv
+        ? (route.get('view') || 'chat')
+        : sessionStorage.getItem('loom-tab-view');
+    if (!routeConv && (route.has('folders') || route.get('view') === 'folders')) {
+        switchView('home');
+    } else if (!routeConv && !route.get('view')) {
+        let recovery;
+        try { recovery = JSON.parse(sessionStorage.getItem('exo-casual-draft') || 'null'); } catch (_) {}
+        if (recovery?.creation) startCasualChat({fresh: false});
+        else await openExoHomeChat();
+    } else if (lastView === 'home' || route.get('view') === 'home') {
         switchView('home');
     } else if (lastConv && State.conversations.find(c => c.id === lastConv)) {
         State._restoringView = true;  // prevent loadConversation from overwriting lastView
-        await loadConversation(lastConv);
+        await loadConversation(lastConv, {
+            initialLeafId: routeBranch || null,
+            newThread: routeNewThread || (!!routeConv && !routeBranch && route.get('view') !== 'tree'
+                && !sessionStorage.getItem(_tabBranchKey(routeConv))),
+        });
         State._restoringView = false;
         if (lastView === 'tree' || lastView === 'chat') {
             switchView(lastView);
         }
     } else {
-        switchView('home');
+        if (typeof startCasualChat === 'function') startCasualChat({ fresh: false });
+        else switchView('home');
     }
     checkHealth();
 }
@@ -683,7 +1475,9 @@ async function checkHealth(retries = 2) {
                         );
                     }
                 } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini' || State.currentConv.mode === 'goose' || State.currentConv.mode === 'umans') {
-                    updateInlineCCControls(State.currentConv);
+                    if (State.currentConv.mode === 'local' || loadedGguf !== _ccLocalModelState.loaded) {
+                        updateInlineCCControls(State.currentConv);
+                    }
                 }
             }
         }
@@ -712,10 +1506,8 @@ function renderConversationList() {
         convs = convs.filter(c => c.mode === 'hermes');
     } else if (State.convFilter === 'dream') {
         convs = convs.filter(c => c.mode === 'dream');
-    } else if (State.convFilter === 'nrol') {
-        convs = convs.filter(c => !!c.nrol_operator);
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini' || c.mode === 'goose' || c.mode === 'umans') && !c.nrol_operator);
+        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini' || c.mode === 'goose' || c.mode === 'umans'));
     }
 
     if (convs.length === 0) {
@@ -934,20 +1726,18 @@ function buildConvItem(conv) {
 
     const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans';
     const ccModel = (conv.cc_model || '').toLowerCase();
-    const isNrol = isCCMode && !!conv.nrol_operator;
-    const isGemini = isCCMode && !isNrol && ccModel.includes('gemini');
-    const isCodex = isCCMode && !isNrol && ccModel.startsWith('codex');
-    const isGoose = isCCMode && !isNrol && ccModel.startsWith('goose:');
-    const isUmans = isCCMode && !isNrol && ccModel.startsWith('umans-');
-    const isOpenRouter = isCCMode && !isNrol && _isOpenRouterModel(ccModel);
-    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex && !isGoose && !isUmans && !isOpenRouter;
+    const isGemini = isCCMode && ccModel.includes('gemini');
+    const isCodex = isCCMode && ccModel.startsWith('codex');
+    const isGoose = isCCMode && ccModel.startsWith('goose:');
+    const isUmans = isCCMode && ccModel.startsWith('umans-');
+    const isOpenRouter = isCCMode && _isOpenRouterModel(ccModel);
+    const isClaude = isCCMode && !isGemini && !isCodex && !isGoose && !isUmans && !isOpenRouter;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const isDream = conv.mode === 'dream';
     const isMinimalWeave = conv.mode === 'weave' && truthySetting(conv.system_only);
     const isDreamWeaver = conv.mode === 'weave' && _isDreamEngineModel(conv.local_model);
-    const charName = isNrol ? (conv.cc_model || 'NROL-AO')
-        : isGemini ? (conv.cc_model || 'Gemini')
+    const charName = isGemini ? (conv.cc_model || 'Gemini')
         : isCodex ? (conv.cc_model || 'Codex')
         : isGoose ? (conv.cc_model || 'Goose')
         : isUmans ? (conv.cc_model || 'Umans')
@@ -960,8 +1750,7 @@ function buildConvItem(conv) {
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isNrol ? '<span class="mode-badge" title="NROL-AO epistemic engine operator — typed transitions only">NROL-AO {Operator}</span>'
-        : isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
+    const modeBadge = isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
         : isCodex ? '<span class="mode-badge" title="ChatGPT Codex in the browser">Loom {Codex}</span>'
         : isGoose ? '<span class="mode-badge" title="Goose ACP in the browser">Loom {Goose}</span>'
         : isUmans ? '<span class="mode-badge" title="Claude Code powered by Umans AI (api.code.umans.ai)">Umans {Remote}</span>'
@@ -978,6 +1767,10 @@ function buildConvItem(conv) {
     const starClass = starred ? 'conv-star-btn active' : 'conv-star-btn';
     const nsfwOn = conv.nsfw ? 1 : 0;
     const nsfwClass = nsfwOn ? 'conv-nsfw-btn active' : 'conv-nsfw-btn';
+    const parallelAgents = !!conv.parallel_agents_enabled;
+    const windowTitle = parallelAgents
+        ? 'Start a new thread in another Loom window'
+        : 'Open in another Loom window';
 
     const pathFull = conv.project_dir || '';
     const pathShort = pathFull ? pathFull.split(/[\\/]/).slice(-2).join('/') : '';
@@ -1001,9 +1794,11 @@ function buildConvItem(conv) {
             ${pathHtml}
         </div>
         <div class="conv-actions">
+            <button class="char-action-btn conv-window-btn" title="${windowTitle}">&#8599;</button>
             <button class="char-action-btn conv-folder-btn" title="${escapeHtml(folderTip)}">${FOLDER_ICON_CLOSED_SVG}</button>
             <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
             <button class="char-action-btn conv-export-btn" title="Export">↓</button>
+            <button class="char-action-btn conv-fork-btn" title="Fork into a separate conversation" aria-label="Fork conversation">⑂</button>
             <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
         </div>
     `;
@@ -1036,8 +1831,30 @@ function buildConvItem(conv) {
     });
 
     // Click title/meta to open
-    div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
-    div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
+    div.querySelector('.conv-title-text').addEventListener('click', () => openConversationSpace(conv.id));
+    div.querySelector('.conv-meta').addEventListener('click', () => openConversationSpace(conv.id));
+    div.querySelector('.conv-fork-btn').addEventListener('click', async event => {
+        event.stopPropagation();
+        try {
+            const tree = await API.get(`/api/conversations/${conv.id}/tree`);
+            const leaf = [...tree].sort((a, b) => Number(b.id) - Number(a.id))[0];
+            if (!leaf) { showToast('Add a message before forking this conversation'); return; }
+            const fork = await API.post(`/api/conversations/${conv.id}/fork/${leaf.id}`);
+            State.conversations.unshift(fork); renderConversationList();
+            showToast(`Fork created: ${fork.title}`);
+        } catch (error) { showToast(error.detail || 'Fork failed', 'error'); }
+    });
+
+    // Give multi-agent workspaces an explicit, addressable fresh-thread path.
+    // The new window must not inherit the database-wide active branch.
+    div.querySelector('.conv-window-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        window.open(
+            conversationWindowUrl(conv.id, { newThread: parallelAgents }),
+            '_blank',
+            'noopener',
+        );
+    });
 
     // Folder move
     div.querySelector('.conv-folder-btn').addEventListener('click', (e) => {
@@ -1063,7 +1880,7 @@ function buildConvItem(conv) {
             const span = document.createElement('span');
             span.className = 'conv-title-text';
             span.textContent = newTitle;
-            span.addEventListener('click', () => loadConversation(conv.id));
+            span.addEventListener('click', () => openConversationSpace(conv.id));
             input.replaceWith(span);
             if (newTitle !== currentTitle) {
                 try {
@@ -1071,6 +1888,7 @@ function buildConvItem(conv) {
                     conv.title = updated.title;
                     if (State.currentConv && State.currentConv.id === conv.id) {
                         State.currentConv.title = updated.title;
+                        if (typeof syncBrowserTabIdentity === 'function') syncBrowserTabIdentity();
                     }
                 } catch { showToast('Failed to rename', 'error'); }
             }
@@ -1200,35 +2018,44 @@ function showFolderDropdown(anchorBtn, conv) {
 }
 
 // ── Load Conversation → Tree View ──
-async function loadConversation(convId) {
+async function loadConversation(convId, options = {}) {
+    saveComposerDraft();
+    _clearExplicitCCModel();
+    const requestSeq = ++_conversationLoadRequestSeq;
+    const loadIsCurrent = () => (
+        requestSeq === _conversationLoadRequestSeq
+        && String(State.currentConvId) === String(convId)
+        && (!options.isCurrent || options.isCurrent())
+    );
     showLoading();
+    try {
     // Clear compactify banner when switching conversations
     const compBanner = document.getElementById('compactify-banner');
     if (compBanner) compBanner.classList.add('hidden');
     // A quoted excerpt belongs to the conversation it was selected in
     if (typeof clearPendingReply === 'function') clearPendingReply();
     State.currentConvId = convId;
-    localStorage.setItem('loom-last-conv', convId);
+    if (typeof resetAgentActivity === 'function') resetAgentActivity();
+    State.loomCursor = State.loomCursors?.[String(convId)] || null;
     sessionStorage.setItem('loom-tab-conv', convId);
+    if (options.newThread) rememberNewConversationThread(convId);
 
-    const [conv, treeData, bookmarks] = await Promise.all([
+    const [conv, treeData, bookmarks, branchPins, agentRuns] = await Promise.all([
         API.get(`/api/conversations/${convId}`),
         API.get(`/api/conversations/${convId}/tree`),
         API.get('/api/bookmarks'),
+        API.get(`/api/conversations/${convId}/branch-pins`),
+        API.get(`/api/conversations/${convId}/agent-runs`).catch(() => []),
     ]);
+    if (!loadIsCurrent()) return;
 
     State.currentConv = conv;
-    // Re-evaluate the Hermes model-liveness indicator for this conv's mode.
-    // updateHermesModelIndicator reads the cached per-backend liveness state
-    // (fed by hermes_model_state WS broadcasts) and renders the indicator for
-    // THIS conv's backend only — so a Hermes conv shows llama's state, a Dream
-    // conv shows dream's state. Passing no backend = "re-render from cache".
-    if (typeof updateHermesModelIndicator === 'function') {
-        updateHermesModelIndicator(null, null);
-    }
+    if (typeof syncBrowserTabIdentity === 'function') syncBrowserTabIdentity();
     State.treeData = treeData;
     if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
     State.bookmarks = bookmarks || [];
+    State.branchPins = branchPins || [];
+    State.agentRuns = Array.isArray(agentRuns) ? agentRuns : [];
     if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
 
     // Backstage UI: banner when viewing a backstage child, hide the entry
@@ -1243,6 +2070,7 @@ async function loadConversation(convId) {
     // Load state cards if OODA is enabled
     if (conv.ooda_enabled) {
         State.stateCards = await API.get(`/api/conversations/${convId}/state`);
+        if (!loadIsCurrent()) return;
     } else {
         State.stateCards = [];
     }
@@ -1262,18 +2090,43 @@ async function loadConversation(convId) {
 
     // Also load the active branch for chat. If active flags were lost, fall
     // back to an actual tree leaf so persisted DB messages still display.
-    const leaf = findLoadableConversationLeaf(treeData, convId);
+    const requestedLeaf = options.newThread || options.initialLeafId == null
+        ? null
+        : treeData.find(n => String(n.id) === String(options.initialLeafId));
+    const cursorLeaf = options.newThread || State.loomCursor?.leaf_message_id == null
+        ? null
+        : treeData.find(n => String(n.id) === String(State.loomCursor.leaf_message_id));
+    const selectedLeaf = options.newThread
+        ? null
+        : requestedLeaf || cursorLeaf || findLoadableConversationLeaf(treeData, convId);
+    const leaf = requestedLeaf && typeof _submittedReplyLeaf === 'function'
+        ? _submittedReplyLeaf(treeData, selectedLeaf) : selectedLeaf;
     if (leaf) {
-        State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+        await selectServerLoomCursor(convId, leaf.id, treeData);
+        if (!loadIsCurrent()) return;
+        const branchMessages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+        if (!loadIsCurrent()) return;
+        State.messages = branchMessages;
         rememberConversationLeaf(convId, leaf.id);
     } else {
+        const reusableEmptyCursor = !options.newThread
+            && State.loomCursor
+            && String(State.loomCursor.conversation_id) === String(convId)
+            && State.loomCursor.leaf_message_id == null;
+        if (!reusableEmptyCursor) await createServerLoomThreadCursor(convId);
+        if (!loadIsCurrent()) return;
+        rememberNewConversationThread(convId);
         State.messages = [];
     }
 
     connectWebSocket(convId);
+    if (typeof renderAgentActivity === 'function') renderAgentActivity();
     renderTree();
     renderMessages();
+    restoreComposerDraft(convId, State.loomCursor);
+    if (options.newThread && typeof restoreExoHomeBlankDraft === 'function') restoreExoHomeBlankDraft();
     await updateInlineCCControls(conv);
+    if (!loadIsCurrent()) return;
     if (typeof renderCodexGoalRow === 'function') renderCodexGoalRow();
 
     // If only a linear conversation (no forks), go straight to chat
@@ -1282,7 +2135,10 @@ async function loadConversation(convId) {
         return siblings.length > 1;
     });
 
-    if (hasForks) {
+    if (options.newThread) {
+        State._skipLoadOnChat = true;
+        switchView('chat');
+    } else if (hasForks) {
         switchView('tree');
         // Auto-center the loom after rendering
         if (typeof centerLoom === 'function') {
@@ -1291,7 +2147,12 @@ async function loadConversation(convId) {
     } else {
         switchView('chat');
     }
-    hideLoading();
+    return true;
+    } finally {
+        // Cursor/database failures must never strand the blocking overlay.
+        // An obsolete load cannot hide the overlay owned by a newer request.
+        if (requestSeq === _conversationLoadRequestSeq) hideLoading();
+    }
 }
 
 // ── Create Conversation ──
@@ -1326,24 +2187,6 @@ async function createConversation() {
         return;
     }
 
-    if (mode === 'nrol') {
-        const ccModel = document.getElementById('cc-model').value;
-        const ccEffort = document.getElementById('cc-effort').value;
-        const conv = await API.post('/api/conversations', {
-            title,
-            mode: 'claude',
-            nrol_operator: true,
-            cc_model: ccModel,
-            cc_effort: ccEffort,
-        });
-        State.conversations.unshift(conv);
-        closeModal('modal-new-conv');
-        document.getElementById('new-conv-title').value = '';
-        renderConversationList();
-        await loadConversation(conv.id);
-        switchView('chat');
-        return;
-    }
 
     if (mode === 'local' || mode === 'hermes' || mode === 'dream') {
         const localModel = document.getElementById('local-model').value;
@@ -1538,19 +2381,22 @@ async function loadDirBrowser(path) {
 
 // ── Inline CC Model/Effort Controls ──
 
+function _retiredHarnessMode(conv) {
+    return ['hermes', 'dream', 'prometheus'].includes(String(conv?.mode || '').toLowerCase());
+}
+
 async function updateInlineCCControls(conv) {
+    const selectionRevision = _inlineCCSelectionRevision;
     const controls = document.getElementById('cc-inline-controls');
     const weaveControls = document.getElementById('weave-inline-controls');
-    const dreamControls = document.getElementById('dream-inline-controls');
     const statePanelChat = document.getElementById('btn-state-panel-chat');
     if (!controls) return;
     // Hide all inline control bars up front; the active mode's branch reveals its own.
     controls.classList.add('hidden');
     weaveControls?.classList.add('hidden');
-    dreamControls?.classList.add('hidden');
+    document.getElementById('retired-harness-notice')?.classList.toggle('hidden', !_retiredHarnessMode(conv));
 
-    // Weave-only bits inside the weave inline bar — hidden when we borrow that
-    // bar for Hermes (which has none of OODA / backstage / branch-state / multi-branch).
+    // Weave-only bits; minimal Weave hides the full RP controls.
     const _oodaLabel = document.getElementById('ooda-toggle-inline')?.closest('.ooda-toggle');
     const _backstageBtn = document.getElementById('btn-backstage');
     const _branchCountCtl = document.getElementById('branch-count-control');
@@ -1572,52 +2418,23 @@ async function updateInlineCCControls(conv) {
         setBranchCount(1);  // CC / Braid / Codex / Gemini: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
-        const permSel = document.getElementById('cc-permission-mode-inline');
-        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? '' : (isGoose ? 'goose:openrouter:z-ai/glm-5.2' : 'sonnet')));
+        const ccModel = _selectedCCModelForBranch(conv) || (isGemini ? 'gemini:gemini-3.7-flash-medium' : (isCodex ? '' : (isGoose ? 'goose:openrouter:z-ai/glm-5.2' : 'sonnet')));
         await populateCCModelDropdowns(ccModel);
         
-        effortSel.value = conv.cc_effort || 'high';
-        if (permSel) permSel.value = (isCodex || isGemini) ? 'default' : (conv.cc_permission_mode || 'default');
+        if (State.currentConv !== conv || selectionRevision !== _inlineCCSelectionRevision) return;
+        effortSel.value = _geminiEffortVariants(modelSel.value).find(item=>item.value===modelSel.value)?.effort
+            || _preferredModelEffort(modelSel.value) || conv.cc_effort || 'high';
         
         const resolvedModel = modelSel.value;
-        if (resolvedModel && resolvedModel !== ccModel) {
-            conv.cc_model = resolvedModel;
-            API.put(`/api/conversations/${conv.id}`, { cc_model: resolvedModel }).catch(console.error);
-        }
         
-        const modelSupportsEffort = _supportsEffortValue(resolvedModel);
+        const modelSupportsEffort = _supportsEffortValue(resolvedModel) || _geminiEffortVariants(resolvedModel).length > 1;
         // Braid picks its model in Settings (cfg-braid-model); the cc-model/effort
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
         effortSel.style.display = (isBraid || !modelSupportsEffort) ? 'none' : '';
         _syncEffortOptionsForModel('cc-effort-inline', resolvedModel);
-        // Codex / Gemini Plan mode is hidden as it does not do anything
-        if (permSel) permSel.style.display = (isCodex || isGemini) ? 'none' : '';
+        _syncMatchingModelOption(modelSel, effortSel.value);
         statePanelChat?.classList.add('hidden');
-    } else if (conv && conv.mode === 'hermes') {
-        // Borrow the Weave inline bar for its model dropdown, but strip
-        // the weave-only controls — Hermes is single-branch, no OODA/backstage.
-        controls.classList.add('hidden');
-        weaveControls?.classList.remove('hidden');
-        _setWeaveOnlyBits(false);
-        statePanelChat?.classList.add('hidden');
-        setBranchCount(1);
-        const weaveSel = document.getElementById('weave-model-inline');
-        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '', false, false, true);
-        const incogW = document.getElementById('incognito-toggle-weave');
-        if (incogW) incogW.checked = !!conv.incognito;
-    } else if (conv && conv.mode === 'dream') {
-        // Dream: its own inline bar — single-branch, no OODA/backstage.
-        controls.classList.add('hidden');
-        weaveControls?.classList.add('hidden');
-        dreamControls?.classList.remove('hidden');
-        _setWeaveOnlyBits(false);
-        statePanelChat?.classList.add('hidden');
-        setBranchCount(1);
-        const dreamSel = document.getElementById('dream-model-inline');
-        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '', true, false, false);
-        const incogD = document.getElementById('incognito-toggle-dream');
-        if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
         const isMinimalWeave = truthySetting(conv.system_only);
         controls.classList.add('hidden');
@@ -1635,8 +2452,6 @@ async function updateInlineCCControls(conv) {
         if (weaveSel) {
             _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
         }
-        const incogW2 = document.getElementById('incognito-toggle-weave');
-        if (incogW2) incogW2.checked = !!conv.incognito;
     } else {
         controls.classList.add('hidden');
         weaveControls?.classList.add('hidden');
@@ -1660,30 +2475,22 @@ async function updateInlineCCControls(conv) {
 // Treat both alias (opus/sonnet/haiku) and full IDs (claude-fable-5,
 // claude-opus-4-6, etc.) as
 // Anthropic for UI gating. Mirrors model_context.is_anthropic() server-side.
-const _ANTHROPIC_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
 function _isAnthropicValue(v) {
-    if (!v) return false;
-    const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
-    return _ANTHROPIC_ALIASES.has(base)
-        || /^claude-(fable|opus|sonnet|haiku)-/.test(base);
+    return EXOModelRegistry.resolve(v).backend === 'anthropic';
 }
 function _isOpusValue(v) {
     if (!v) return false;
     const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
     return base === 'opus' || base.startsWith('claude-opus-');
 }
-// Mirrors _agentKindForModel's codex detection in chat.js.
 function _isCodexValue(v) {
-    if (!v) return false;
-    const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
-    return base.startsWith('codex') || base.startsWith('gpt-5')
-        || base === 'gpt-4o' || base.startsWith('o3') || base.startsWith('o4');
+    return EXOModelRegistry.resolve(v).mode === 'codex';
 }
 function _isUmansValue(v) {
-    return (v || '').toLowerCase().startsWith('umans-');
+    return EXOModelRegistry.resolve(v).mode === 'umans';
 }
 function _isGooseValue(v) {
-    return (v || '').toLowerCase().startsWith('goose:');
+    return EXOModelRegistry.resolve(v).mode === 'goose';
 }
 function _isOpenRouterValue(v) {
     return _isOpenRouterModel(v);
@@ -1691,17 +2498,40 @@ function _isOpenRouterValue(v) {
 // Anthropic, Codex, OpenRouter, and Goose-backed models can take a
 // thinking-effort knob. Gemini/local models do not use this control.
 function _supportsEffortValue(v) {
+    const declared = EXOModelRegistry.resolve(v).capabilities?.effort;
+    if (typeof declared === 'boolean') return declared;
     return _isAnthropicValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
 }
 function _allowsXhighEffortValue(v) {
+    const declared = EXOModelRegistry.resolve(v).capabilities?.xhigh;
+    if (typeof declared === 'boolean') return declared;
     return _isOpusValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
 }
 function _allowsMaxEffortValue(v) {
+    const declared = EXOModelRegistry.resolve(v).capabilities?.max;
+    if (typeof declared === 'boolean') return declared;
     return _isOpusValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
+}
+function _geminiEffortVariants(model, select = document.getElementById('cc-model-inline')) {
+    const match=String(model || '').match(/^(gemini:.+)-(low|medium|high|xhigh)$/);
+    if(!match || !select)return [];
+    return [...select.options].filter(option=>!option.disabled).flatMap(option=>{
+        const variant=option.value.match(/^(gemini:.+)-(low|medium|high|xhigh)$/);
+        return variant && variant[1]===match[1]?[{value:option.value,effort:variant[2]}]:[];
+    });
 }
 function _syncEffortOptionsForModel(selectId, model) {
     const effortSel = document.getElementById(selectId);
     if (!effortSel) return;
+    const variants=selectId==='cc-effort-inline'?_geminiEffortVariants(model):[];
+    for(const option of effortSel.options) {
+        option.hidden=variants.length>1 && !variants.some(item=>item.effort===option.value);
+        option.disabled=option.hidden;
+    }
+    if(variants.length>1) {
+        if(!variants.some(item=>item.effort===effortSel.value))effortSel.value=variants.find(item=>item.value===model)?.effort || variants[0].effort;
+        return;
+    }
     const maxOpt = effortSel.querySelector('option[value="max"]');
     const xhighOpt = effortSel.querySelector('option[value="xhigh"]');
     const allowMax = _allowsMaxEffortValue(model);
@@ -1712,6 +2542,23 @@ function _syncEffortOptionsForModel(selectId, model) {
         effortSel.value = allowXhigh ? 'xhigh' : 'high';
     } else if (effortSel.value === 'xhigh' && !allowXhigh) {
         effortSel.value = 'high';
+    }
+}
+
+function _syncMatchingModelOption(sel, effort) {
+    if (!sel) return;
+    const variant=_geminiEffortVariants(sel.value,sel).find(item=>item.effort===effort);
+    if(variant){sel.value=variant.value;return;}
+    const val = sel.value;
+    const matchingOpts = Array.from(sel.options).filter(opt => opt.value === val);
+    if (matchingOpts.length > 1) {
+        const exact = matchingOpts.find(opt => opt.dataset.effort === effort);
+        if (exact) {
+            sel.selectedIndex = exact.index;
+        } else {
+            const fallback = matchingOpts.find(opt => !opt.dataset.effort) || matchingOpts[0];
+            sel.selectedIndex = fallback.index;
+        }
     }
 }
 
@@ -1731,19 +2578,15 @@ function _isDreamEngineModel(model) {
 }
 
 function _isOpenRouterModel(model) {
-    const m = (model || '').toLowerCase();
-    return m.startsWith('openrouter:')
-        || m === 'z-ai/glm-5.2'
-        || m === 'moonshotai/kimi-k2.7-code'
-        || m === 'openai/gpt-5.6-luna'
-        || m === 'deepseek/deepseek-v4-flash-0731';
+    return EXOModelRegistry.resolve(model).mode === 'openrouter';
 }
 
 function _gooseRouteModelValue(model) {
     const raw = String(model || '').trim();
     if (!raw || _isGooseValue(raw)) return raw;
     if (_isOpenRouterValue(raw)) {
-        return `goose:openrouter:${raw.replace(/^openrouter:/i, '')}`;
+        const id = EXOModelRegistry.resolve(raw).model_id || raw.replace(/^openrouter:/i, '');
+        return `goose:openrouter:${id}`;
     }
     if (raw.toLowerCase().endsWith('.gguf')) {
         return `goose:llama:${raw}`;
@@ -1906,30 +2749,57 @@ function setBranchCount(n) {
     document.querySelectorAll('.branch-count-pill').forEach(el => el.classList.toggle('active', n > 1));
 }
 
+function _preferredModelEffort(model) {
+    try { return localStorage.getItem(`exo-model-effort:${model}`); } catch { return null; }
+}
+
+let _inlineCCSelectionRevision = 0;
+
 function initInlineCCControls() {
     const modelSel = document.getElementById('cc-model-inline');
     const effortSel = document.getElementById('cc-effort-inline');
     if (!modelSel || !effortSel) return;
+    const saves = new Map();
 
     async function saveCC(field, value) {
         if (!State.currentConvId || !State.currentConv) return;
-        if (field === 'cc_model' && State.currentConv.mode === 'goose') {
-            value = _gooseRouteModelValue(value);
-        }
+        const targetConv = State.currentConv;
+        const targetId = State.currentConvId;
+        const patch = typeof field === 'object' ? {...field} : { [field]: value };
+        if (patch.cc_model && targetConv.mode === 'goose') patch.cc_model = _gooseRouteModelValue(patch.cc_model);
+        Object.assign(targetConv, patch);
+        // Serialize writes within a chat; late responses must never restore old controls.
+        const pending = (saves.get(targetId) || Promise.resolve()).then(() =>
+            API.put(`/api/conversations/${targetId}`, patch));
+        saves.set(targetId, pending.catch(() => {}));
         try {
-            const updated = await API.put(`/api/conversations/${State.currentConvId}`, { [field]: value });
-            Object.assign(State.currentConv, updated);
+            await pending;
         } catch { showToast('Failed to update', 'error'); }
     }
 
     function _syncEffortVisibility(model) {
-        effortSel.style.display = _supportsEffortValue(model) ? '' : 'none';
+        effortSel.style.display = (_supportsEffortValue(model) || _geminiEffortVariants(model).length>1) ? '' : 'none';
         _syncEffortOptionsForModel('cc-effort-inline', model);
     }
 
     modelSel.addEventListener('change', async () => {
-        await saveCC('cc_model', modelSel.value);
-        _syncEffortVisibility(modelSel.value);
+        const revision = ++_inlineCCSelectionRevision;
+        ++_ccDropdownPopulateSeq;
+        const targetConv = State.currentConv;
+        const selectedModel = modelSel.value;
+        const selectedOpt = modelSel.selectedOptions[0];
+        const presetEffort = selectedOpt?.dataset?.effort || _geminiEffortVariants(selectedModel).find(item=>item.value===selectedModel)?.effort
+            || _preferredModelEffort(selectedModel) || effortSel.value || 'high';
+        _rememberExplicitCCModel(State.currentConvId, selectedModel);
+        if (presetEffort) {
+            effortSel.value = presetEffort;
+            if (targetConv) targetConv.cc_effort = presetEffort;
+        }
+        _syncEffortVisibility(selectedModel);
+        _syncMatchingModelOption(modelSel, effortSel.value);
+        try { localStorage.setItem(`exo-model-effort:${selectedModel}`, effortSel.value); } catch {}
+        await saveCC({cc_model: selectedModel, cc_effort: effortSel.value});
+        if (State.currentConv !== targetConv || revision !== _inlineCCSelectionRevision) return;
         if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
         // Update local state immediately so generate messages include the new model
         if (State.currentConv) {
@@ -1938,12 +2808,18 @@ function initInlineCCControls() {
             if (typeof renderMessages === 'function') renderMessages();
         }
     });
-    effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
+    effortSel.addEventListener('change', async () => {
+        ++_inlineCCSelectionRevision;
+        ++_ccDropdownPopulateSeq;
+        const effort = effortSel.value;
+        try { localStorage.setItem(`exo-model-effort:${modelSel.value}`, effort); } catch {}
+        if (State.currentConv) State.currentConv.cc_effort = effort;
+        _syncMatchingModelOption(modelSel, effort);
+        _rememberExplicitCCModel(State.currentConvId, modelSel.value);
+        await saveCC({cc_effort:effort,cc_model:modelSel.value});
+    });
 
     // Llama Server models are now appended by populateCCModelDropdowns()
-
-    const permSel = document.getElementById('cc-permission-mode-inline');
-    if (permSel) permSel.addEventListener('change', () => saveCC('cc_permission_mode', permSel.value));
 
     // OODA toggle
     const oodaToggle = document.getElementById('ooda-toggle-inline');
@@ -1998,7 +2874,7 @@ function initInlineCCControls() {
                         await API.put('/api/config', { llama_model: model, vision_model: model });
                         
                         const adminUrl = _localUrl(location.protocol.slice(0, -1), 3002, '/tools/llama-restart');
-                        const resp = await fetch(adminUrl, { method: 'POST' });
+                        const resp = await fetch(adminUrl, { method: 'POST', credentials: 'include' });
                         const data = await resp.json().catch(() => ({}));
                         
                         if (data.status === 'ok') {
@@ -2016,37 +2892,6 @@ function initInlineCCControls() {
                     }
                 }
             } catch { showToast('Failed to update model', 'error'); }
-        });
-    }
-
-    // Incognito toggle (Hermes/Dream only) — routes through Prometheus when on.
-    // Two checkboxes (weave-inline + dream-inline controls) share one handler.
-    const _syncIncognitoToggles = (checked) => {
-        const w = document.getElementById('incognito-toggle-weave');
-        const d = document.getElementById('incognito-toggle-dream');
-        if (w) w.checked = !!checked;
-        if (d) d.checked = !!checked;
-    };
-    for (const toggleId of ['incognito-toggle-weave', 'incognito-toggle-dream']) {
-        const toggle = document.getElementById(toggleId);
-        if (!toggle) continue;
-        toggle.addEventListener('change', async () => {
-            if (!State.currentConvId || !State.currentConv) return;
-            const incognito = toggle.checked ? 1 : 0;
-            try {
-                await API.put(`/api/conversations/${State.currentConvId}`, { incognito });
-                State.currentConv.incognito = incognito;
-                _syncIncognitoToggles(incognito);
-                // Re-eval the model-liveness indicator for the new incognito
-                // state. updateHermesModelIndicator hides the badge when incognito
-                // is on, and re-renders from the cached liveness when off — so
-                // toggling incognito off shows the indicator immediately instead
-                // of waiting for the next WS liveness broadcast.
-                if (typeof updateHermesModelIndicator === 'function') {
-                    updateHermesModelIndicator(null, null);
-                }
-                showToast(incognito ? 'Incognito on — routing through Prometheus' : 'Incognito off — using the ensouled attendant');
-            } catch { showToast('Failed to toggle Incognito', 'error'); }
         });
     }
 
@@ -2548,24 +3393,42 @@ async function fetchLocalModels() {
 
 // ── Populate CC Model Dropdowns from Server ──
 let _ccModelsCache = null;
+let _ccDropdownPopulateSeq = 0;
+let _ccLocalModelState = {models: [], loaded: null};
 async function populateCCModelDropdowns(selectedValue) {
-    if (!_ccModelsCache) {
-        try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
+    const populateSeq = ++_ccDropdownPopulateSeq;
+    // Revalidate the registry whenever a picker is populated. Tabs commonly stay
+    // open across a Loom host reload; a lifetime-only cache otherwise hides newly
+    // added provider models until the whole browser tab is hard-refreshed.
+    try {
+        const registry = await API.get('/api/cc-models');
+        if (populateSeq !== _ccDropdownPopulateSeq) return;
+        _ccModelsCache = registry;
+    } catch {
+        // Keep a previously loaded registry usable during a transient request
+        // failure, but fail closed when this tab has never loaded one.
+        if (!_ccModelsCache) return;
     }
+    if (populateSeq !== _ccDropdownPopulateSeq) return;
+    EXOModelRegistry.mergeGroups(_ccModelsCache);
+    // Remote conversations must not wait for optional local sidecar probes.
+    // Retain last-known local entries while discovery runs in the background.
+    _renderCCModelDropdowns(selectedValue, _ccLocalModelState.models, _ccLocalModelState.loaded);
     // Fetch the loaded or configured Llama Server model for local CC/Braid. Dream-Claude
     // options come from /api/cc-models as explicit shim-backed entries, not
     // from the generic local-model list.
-    let llamaModels = [];
-    let loadedModel = null;
-    try {
-        const data = await _fetchAllModelsOnce();
+    void _fetchAllModelsOnce().then(data => {
+        if (populateSeq !== _ccDropdownPopulateSeq) return;
         const found = (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.loaded)
             || (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.configured);
-        if (found) {
-            loadedModel = found.name;
-            llamaModels = [loadedModel];
-        }
-    } catch {}
+        _ccLocalModelState = {models: found ? [found.name] : [], loaded: found?.name || null};
+        // Do not restore the selection captured before this async request:
+        // the user may have switched model/conversation in the meantime.
+        _renderCCModelDropdowns(undefined, _ccLocalModelState.models, _ccLocalModelState.loaded);
+    }).catch(() => {});
+}
+
+function _renderCCModelDropdowns(selectedValue, llamaModels, loadedModel) {
     const selects = ['cc-model-inline', 'cc-model', 'cfg-cc-model'];
     for (const id of selects) {
         const sel = document.getElementById(id);
@@ -2579,6 +3442,7 @@ async function populateCCModelDropdowns(selectedValue) {
                 const opt = document.createElement('option');
                 opt.value = m.value;
                 opt.textContent = m.label;
+                if (m.effort) opt.dataset.effort = m.effort;
                 og.appendChild(opt);
             }
             sel.appendChild(og);
@@ -2606,21 +3470,75 @@ async function populateCCModelDropdowns(selectedValue) {
             sel.appendChild(og);
         }
         if (prev) {
-            const isListed = Array.from(sel.options).some(opt => opt.value === prev);
-            if (!isListed && loadedModel && _modelsMatch(prev, loadedModel)) {
+            let isListed = Array.from(sel.options).some(opt => opt.value === prev);
+            const previousMode = EXOModelRegistry.resolve(prev).mode;
+            if (!isListed && previousMode === 'local' && loadedModel
+                && prev.replace(/@llama-server$/i, '').toLowerCase() === loadedModel.toLowerCase()) {
                 prev = loadedModel;
-            } else if (!isListed) {
+                isListed = true;
+            }
+            if (!isListed && previousMode) {
+                const previousRoute = EXOModelRegistry.resolve(prev);
+                const match = Array.from(sel.options).find(opt => {
+                    const candidateRoute = EXOModelRegistry.resolve(opt.value);
+                    if (candidateRoute.mode !== previousMode
+                        || candidateRoute.backend !== previousRoute.backend) return false;
+                    if (opt.value.toLowerCase() === prev.toLowerCase()) return true;
+                    if (candidateRoute.model_id && previousRoute.model_id) {
+                        return candidateRoute.model_id.toLowerCase() === previousRoute.model_id.toLowerCase();
+                    }
+                    // Older Codex rows stored the CLI model without its picker prefix.
+                    if (previousMode === 'codex'
+                        && opt.value.replace(/^codex-/i, '').toLowerCase()
+                            === prev.replace(/^codex-/i, '').toLowerCase()) return true;
+                    // Gemini selector prefix normalization (gemini:xxx <-> xxx)
+                    if (previousMode === 'gemini'
+                        && opt.value.replace(/^gemini:/i, '').toLowerCase()
+                            === prev.replace(/^gemini:/i, '').toLowerCase()) return true;
+                    // Anthropic unlisted/historical version IDs to family aliases
+                    if (previousMode === 'claude' && previousRoute.backend === 'anthropic') {
+                        const am = prev.match(/^claude-(opus|sonnet|haiku)-/i);
+                        if (am) {
+                            const fam = am[1].toLowerCase();
+                            const target = prev.includes('[1m]') ? `${fam}[1m]` : fam;
+                            return opt.value.toLowerCase() === target;
+                        }
+                    }
+                    return false;
+                });
+                if (match) {
+                    prev = match.value;
+                    isListed = true;
+                }
+            }
+            if (!isListed) {
                 // Discovery is allowed to be temporarily incomplete. Keep the
                 // persisted selector authoritative instead of changing models.
                 const og = document.createElement('optgroup');
-                og.label = 'Unavailable';
+                og.label = 'Saved selection';
                 const opt = document.createElement('option');
                 opt.value = prev;
-                opt.textContent = `${prev} (currently unavailable)`;
+                opt.textContent = `${prev} (not in discovered list)`;
                 og.appendChild(opt);
                 sel.appendChild(og);
             }
-            sel.value = prev;
+            const matchingOpts = Array.from(sel.options).filter(opt => opt.value === prev);
+            if (matchingOpts.length > 1) {
+                const currentEffort = (id === 'cfg-cc-model'
+                    ? document.getElementById('cfg-cc-effort')?.value
+                    : (id === 'cc-model'
+                        ? document.getElementById('cc-effort')?.value
+                        : document.getElementById('cc-effort-inline')?.value)) || 'high';
+                const exactMatch = matchingOpts.find(opt => opt.dataset.effort === currentEffort);
+                if (exactMatch) {
+                    sel.selectedIndex = exactMatch.index;
+                } else {
+                    const fallback = matchingOpts.find(opt => !opt.dataset.effort) || matchingOpts[0];
+                    sel.selectedIndex = fallback.index;
+                }
+            } else {
+                sel.value = prev;
+            }
         }
     }
 }
@@ -2628,7 +3546,8 @@ async function populateCCModelDropdowns(selectedValue) {
 // ── Setup Event Listeners ──
 function setupEventListeners() {
     // Home button
-    document.getElementById('btn-home').addEventListener('click', () => {
+    document.getElementById('btn-home').addEventListener('click', () => openExoHomeChat());
+    document.getElementById('btn-folders').addEventListener('click', () => {
         renderConversationList();
         renderHomeCharacters();
         renderHomePersonas();
@@ -2664,6 +3583,7 @@ function setupEventListeners() {
                 try {
                     const updated = await API.put(`/api/conversations/${State.currentConvId}`, { title: newTitle });
                     State.currentConv.title = updated.title;
+                    if (typeof syncBrowserTabIdentity === 'function') syncBrowserTabIdentity();
                     const convInList = State.conversations.find(c => c.id === State.currentConvId);
                     if (convInList) convInList.title = updated.title;
                 } catch {
@@ -2724,6 +3644,8 @@ function setupEventListeners() {
 
     // Home search
     initHomeSearch();
+    initSearchSpace();
+    initBranchNavigation();
 
     // New conversation
     document.getElementById('btn-new-conv-home')?.addEventListener('click', openNewConvModal);
@@ -2804,12 +3726,6 @@ function setupEventListeners() {
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
-            } else if (mode === 'nrol') {
-                // Operator mode: model/effort selectable; workspace is fixed
-                // server-side to a neutral directory, so no project dir field.
-                document.getElementById('cc-model-group').classList.remove('hidden');
-                document.getElementById('cc-effort-group').classList.remove('hidden');
-                showWeaveFields(false);
             } else if (mode === 'local' || mode === 'hermes' || mode === 'dream') {
                 document.getElementById('local-model-group').classList.remove('hidden');
                 document.getElementById('project-dir-group').classList.remove('hidden');
@@ -2827,13 +3743,27 @@ function setupEventListeners() {
     // Model selection — effort shows for Anthropic and Codex models (both
     // backends take the knob). "max" is Opus-only; "xhigh" is Opus or Codex.
     document.getElementById('cc-model').addEventListener('change', () => {
-        const model = document.getElementById('cc-model').value;
+        const sel = document.getElementById('cc-model');
+        const effortSel = document.getElementById('cc-effort');
+        const selectedOpt = sel?.selectedOptions[0];
+        const presetEffort = selectedOpt?.dataset?.effort;
+        if (presetEffort && effortSel) {
+            effortSel.value = presetEffort;
+        }
+        const model = sel ? sel.value : '';
         const effortGroup = document.getElementById('cc-effort-group');
         if (!_supportsEffortValue(model)) {
             effortGroup.classList.add('hidden');
         } else {
             effortGroup.classList.remove('hidden');
             _syncEffortOptionsForModel('cc-effort', model);
+        }
+    });
+    document.getElementById('cc-effort')?.addEventListener('change', () => {
+        const sel = document.getElementById('cc-model');
+        const effortSel = document.getElementById('cc-effort');
+        if (sel && effortSel) {
+            _syncMatchingModelOption(sel, effortSel.value);
         }
     });
 
@@ -2864,6 +3794,7 @@ function setupEventListeners() {
     const globalBmPanel = document.getElementById('bookmarks-panel-global');
     if (globalBmBtn && globalBmPanel) {
         globalBmBtn.addEventListener('click', () => {
+            document.getElementById('branch-pins-panel')?.classList.add('hidden');
             globalBmPanel.classList.toggle('hidden');
             if (!globalBmPanel.classList.contains('hidden')) {
                 renderBookmarksPanel('bookmarks-list-global');
@@ -2875,24 +3806,43 @@ function setupEventListeners() {
     function _switchSettingsTab(tab) {
         document.querySelectorAll('#settings-tabs .toggle-btn').forEach(b => b.classList.remove('active'));
         document.querySelector(`#settings-tabs [data-settings-tab="${tab}"]`).classList.add('active');
-        ['settings-model', 'settings-servers', 'settings-display', 'settings-openrouter', 'settings-advanced'].forEach(id => {
+        ['settings-model', 'settings-permissions', 'settings-display', 'settings-usage'].forEach(id => {
             document.getElementById(id).classList.toggle('hidden', id !== `settings-${tab}`);
         });
-        if (tab === 'servers') _refreshServerLights();
-        if (tab === 'openrouter') _refreshOpenRouterUsage();
+        if (tab === 'usage') { window.loadProviderUsage?.(true); window.loadSettingsOpenRouterUsage?.(); }
     }
     document.querySelectorAll('#settings-tabs .toggle-btn').forEach(btn => {
         btn.addEventListener('click', () => _switchSettingsTab(btn.dataset.settingsTab));
     });
 
+    const permissionsSection = document.getElementById('settings-permissions');
+    permissionsSection.appendChild(document.getElementById('cfg-permission-policy-group'));
+    permissionsSection.appendChild(document.getElementById('cfg-parallel-agents-group'));
+    const profileDescriptions = {
+        strict: 'Allow workspace reads. Ask before edits and commands.',
+        balanced: 'Allow workspace reads and edits. Ask before commands.',
+        trusted: 'Allow workspace reads, edits, and commands. Ask for external paths, sensitive access, network actions, and unknown requests.',
+        trust_review: 'Full Trust allows bridged requests automatically and reviews recognized destructive operations. Unrecognized destructive scripts can pass.',
+    };
+    function updateProfileDescription() {
+        const select = document.getElementById('cfg-permission-profile');
+        document.getElementById('cfg-permission-profile-hint').textContent =
+            (profileDescriptions[select.value] || profileDescriptions.balanced)
+            + ' Native safeguards and role restrictions still apply. File preservation reviews always require a one-time decision.';
+    }
+    document.getElementById('cfg-permission-profile').addEventListener('change', updateProfileDescription);
+    const adminSettingsUrl = new URL(location.origin);
+    adminSettingsUrl.port = '3002'; adminSettingsUrl.hash = 'settings';
+    document.getElementById('settings-admin-link').href = adminSettingsUrl.href;
+    document.getElementById('settings-admin-link').hidden = _loomRouteBase === '/app/';
+
     // Per-render cache so populating 3 model dropdowns from one settings open
     // hits the network once instead of three times.
     let _modelsFetch = null;
     let _visionFetch = null;
-    let _diskModelsFetch = null;
     let _settingsLoadSeq = 0;
     function _invalidateModelCaches() {
-        _modelsFetch = null; _visionFetch = null; _diskModelsFetch = null; _allModelsFetch = null;
+        _modelsFetch = null; _visionFetch = null; _allModelsFetch = null;
     }
     function _fetchModels() {
         if (!_modelsFetch) _modelsFetch = API.get('/api/local/models').catch(() => ({models: []}));
@@ -2901,10 +3851,6 @@ function setupEventListeners() {
     function _fetchVisionModels() {
         if (!_visionFetch) _visionFetch = API.get('/api/local/vision-models').catch(() => ({models: []}));
         return _visionFetch;
-    }
-    function _fetchDiskModels() {
-        if (!_diskModelsFetch) _diskModelsFetch = API.get('/api/disk-models').catch(() => ({models: []}));
-        return _diskModelsFetch;
     }
     function _setSettingsLoading(loading, text = 'Loading settings...') {
         const modal = document.getElementById('modal-settings');
@@ -2923,100 +3869,8 @@ function setupEventListeners() {
         sel.disabled = true;
         sel.innerHTML = `<option value="">${label}</option>`;
     }
-    function _fmtUsd(value) {
-        const n = Number(value || 0);
-        return `$${n.toFixed(2)}`;
-    }
-    async function _refreshOpenRouterUsage() {
-        const errorEl = document.getElementById('openrouter-usage-error');
-        const setText = (id, text) => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = text;
-        };
-        if (errorEl) {
-            errorEl.classList.add('hidden');
-            errorEl.textContent = '';
-        }
-        try {
-            const data = await API.get('/api/openrouter/usage');
-            const limits = data.limits || {};
-            const key = data.current_key || {};
-            const account = data.account || {};
-            const secrets = data.secrets || {};
-            const apiSecret = secrets.api_key || {};
-            const managementSecret = secrets.management_key || {};
-            const secretLabel = (secret, fallbackConfigured) => {
-                if (!secret.configured && !fallbackConfigured) return 'missing';
-                const fallbackText = fallbackConfigured === true ? 'configured' : fallbackConfigured;
-                const base = secret.preview || fallbackText || 'configured';
-                return `${base}${secret.source ? ` (${secret.source})` : ''}`;
-            };
-            setText('or-api-key-status', secretLabel(apiSecret, key.label));
-            setText('or-management-key-status', secretLabel(managementSecret, data.management_key_configured));
-            const weekly = key.usage_weekly ?? 0;
-            const monthly = key.usage_monthly ?? 0;
-            setText('or-weekly-usage', `${_fmtUsd(weekly)} / ${_fmtUsd(limits.weekly_limit_usd)}`);
-            setText('or-monthly-usage', `${_fmtUsd(monthly)} / ${_fmtUsd(limits.monthly_limit_usd)}`);
-            if (account.total_usage !== undefined) {
-                setText('or-account-used', _fmtUsd(account.total_usage));
-                const left = Number(account.total_credits || 0) - Number(account.total_usage || 0);
-                setText('or-credits-left', _fmtUsd(left));
-            } else {
-                setText('or-account-used', data.management_key_configured ? 'unavailable' : 'management key missing');
-                setText('or-credits-left', data.management_key_configured ? 'unavailable' : 'management key missing');
-            }
-            const sourceWarnings = [];
-            if (apiSecret.env_overrides_dotenv) sourceWarnings.push('OPENROUTER_API_KEY environment variable overrides .env');
-            if (managementSecret.env_overrides_dotenv) sourceWarnings.push('OPENROUTER_MANAGEMENT_KEY environment variable overrides .env');
-            const errs = [data.current_key_error, data.account_error, ...sourceWarnings].filter(Boolean);
-            if (errs.length && errorEl) {
-                errorEl.textContent = errs.join(' | ');
-                errorEl.classList.remove('hidden');
-            }
-        } catch (e) {
-            if (errorEl) {
-                errorEl.textContent = e.message || String(e);
-                errorEl.classList.remove('hidden');
-            }
-        }
-    }
-    async function _saveOpenRouterSecrets() {
-        const errorEl = document.getElementById('openrouter-secrets-error');
-        const apiInput = document.getElementById('cfg-openrouter-api-key');
-        const managementInput = document.getElementById('cfg-openrouter-management-key');
-        const btn = document.getElementById('btn-save-openrouter-secrets');
-        const payload = {};
-        if (apiInput && apiInput.value.trim()) payload.api_key = apiInput.value.trim();
-        if (managementInput && managementInput.value.trim()) payload.management_key = managementInput.value.trim();
-        if (errorEl) {
-            errorEl.classList.add('hidden');
-            errorEl.textContent = '';
-        }
-        if (!payload.api_key && !payload.management_key) {
-            if (errorEl) {
-                errorEl.textContent = 'Paste at least one key to save.';
-                errorEl.classList.remove('hidden');
-            }
-            return;
-        }
-        if (btn) btn.disabled = true;
-        try {
-            await API.post('/api/openrouter/secrets', payload);
-            if (apiInput) apiInput.value = '';
-            if (managementInput) managementInput.value = '';
-            showToast('OpenRouter keys saved');
-            await _refreshOpenRouterUsage();
-        } catch (e) {
-            if (errorEl) {
-                errorEl.textContent = e.message || String(e);
-                errorEl.classList.remove('hidden');
-            }
-        } finally {
-            if (btn) btn.disabled = false;
-        }
-    }
     function _primeSettingsLoadingState() {
-        ['cfg-braid-model', 'cfg-hermes-model', 'cfg-weave-model', 'cfg-dream-model',
+        ['cfg-braid-model', 'cfg-weave-model',
          'cfg-cc-model', 'cfg-llama-model-select', 'cfg-mc-kv-quant', 'cfg-mc-mmproj'].forEach(id => {
             _setSelectLoading(id);
         });
@@ -3135,7 +3989,7 @@ function setupEventListeners() {
         _switchSettingsTab('model');
         _primeSettingsLoadingState();
         openModal('modal-settings');
-        _startServerLightPolling();
+
         const cfg = await API.get('/api/config').catch(e => {
             _setSettingsLoading(false);
             document.querySelectorAll('#modal-settings input, #modal-settings select, #modal-settings textarea').forEach(el => {
@@ -3153,14 +4007,46 @@ function setupEventListeners() {
         const conv = State.currentConv;
 
         // Non-async values
-        document.getElementById('cfg-temp').value = cfg.temperature ?? 0.85;
-        document.getElementById('cfg-top-p').value = cfg.top_p ?? 0.92;
-        document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 16384;
+        const policyGroup = document.getElementById('cfg-permission-policy-group');
+        policyGroup?.classList.toggle('hidden', !conv || conv.mode === 'weave');
+        const policySelect = document.getElementById('cfg-permission-profile');
+        if (policySelect) policySelect.value = conv?.permission_profile || 'balanced';
+        updateProfileDescription();
+        const rulesHost = document.getElementById('cfg-permission-rules');
+        if (rulesHost) rulesHost.textContent = conv ? 'Loading branch rules…' : '';
+        if (conv && rulesHost) {
+            const permissionConvId = conv.id;
+            API.get(`/api/conversations/${permissionConvId}/permission-rules`).then(result => {
+                if (settingsSeq !== _settingsLoadSeq || String(State.currentConvId) !== String(permissionConvId)) return;
+                rulesHost.textContent = result.rules.length ? '' : 'No remembered branch rules.';
+                for (const rule of result.rules) {
+                    const row = document.createElement('div');
+                    row.className = 'permission-rule-row';
+                    const text = document.createElement('span');
+                    text.className = 'permission-rule-description';
+                    text.textContent = `Branch #${rule.branch_id} + descendants · ${rule.workspace} · ${rule.description} `;
+                    const revoke = document.createElement('button');
+                    revoke.type = 'button';
+                    revoke.className = 'btn-mini';
+                    revoke.textContent = 'Revoke';
+                    revoke.addEventListener('click', async () => {
+                        revoke.disabled = true;
+                        try {
+                            await API.del(`/api/conversations/${permissionConvId}/permission-rules/${rule.id}`);
+                            row.remove();
+                            if (!rulesHost.children.length) rulesHost.textContent = 'No remembered branch rules.';
+                        } catch (e) { revoke.disabled = false; showToast('Could not revoke rule: ' + e.message, 'error'); }
+                    });
+                    row.append(text, revoke);
+                    rulesHost.appendChild(row);
+                }
+            }).catch(() => {
+                if (settingsSeq === _settingsLoadSeq) rulesHost.textContent = 'Could not load rules; existing grants have not changed.';
+            });
+        }
         const weaveMaxTokens = document.getElementById('cfg-weave-max-tokens');
         if (weaveMaxTokens) weaveMaxTokens.value = cfg.weave_max_tokens ?? 2048;
-        document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
-        document.getElementById('cfg-cc-permission').value = (conv && conv.mode !== 'codex' && conv.cc_permission_mode) || 'default';
         const cfgParallelAgents = document.getElementById('cfg-parallel-agents-enabled');
         if (cfgParallelAgents) cfgParallelAgents.checked = !!(conv && truthySetting(conv.parallel_agents_enabled));
         const dreamMinOutput = document.getElementById('cfg-dream-min-output-tokens');
@@ -3179,22 +4065,24 @@ function setupEventListeners() {
         }
         _setSettingsLoading(true, 'Loading model controls...');
         const settingsJobs = await Promise.allSettled([
-            _loadModelConfigs(),
-            _populateModelDropdown(),
             _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, false, false, true),
-            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel, false, false, true),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
-            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel, true, false, false),
-            populateCCModelDropdowns(conv && conv.cc_model || 'sonnet'),
-            _populateKvQuantDropdown(),
-            _populateMmprojDropdown(),
+            populateCCModelDropdowns(_selectedCCModelForBranch(conv) || 'sonnet'),
         ]);
         if (settingsSeq !== _settingsLoadSeq) return;
+        if (_retiredHarnessMode(conv)) {
+            // Opening settings is not authorization to migrate a historical session.
+            const replacement = document.getElementById('cfg-cc-model');
+            replacement?.insertAdjacentHTML('afterbegin', '<option value="" disabled>Choose a replacement harness/model…</option>');
+            if (replacement) replacement.value = '';
+        }
         const settingsFailures = settingsJobs.filter(r => r.status === 'rejected').length;
         if (settingsFailures) {
             showToast(`${settingsFailures} settings control${settingsFailures === 1 ? '' : 's'} could not load`, 'warning');
         }
         const cfgModelValue = document.getElementById('cfg-cc-model')?.value || '';
+        const cfgModelSelect = document.getElementById('cfg-cc-model');
+        if (cfgModelSelect) cfgModelSelect.dataset.initialModel = cfgModelValue;
         document.getElementById('cfg-cc-effort-group')?.classList.toggle('hidden', !_supportsEffortValue(cfgModelValue));
         _syncEffortOptionsForModel('cfg-cc-effort', cfgModelValue);
         document.querySelectorAll('#modal-settings input, #modal-settings select, #modal-settings textarea').forEach(el => {
@@ -3204,53 +4092,36 @@ function setupEventListeners() {
             el.disabled = false;
         });
 
-        // Show tuning for the selected model
-        const llamaModelSelect = document.getElementById('cfg-llama-model-select');
-        const selModel = llamaModelSelect ? llamaModelSelect.value : '';
-        _showModelTuning(selModel);
-        _refreshLlamaRuntimeStatus();
-
-        // Per-conversation overrides: the settings layout stays invariant —
-        // every group always renders, only the open conversation's group is
-        // editable. Hidden controls are how features get "lost"; disabled
-        // ones stay discoverable. Safe because the save handler only writes
-        // the active mode's fields. Buttons inside groups stay live (the
-        // Anthropic refresh is a global action, not per-conversation).
+        // Show the open conversation's controls. Shared machine settings live
+        // in Admin; saving this panel only writes applicable chat options.
         const mode = conv ? conv.mode : null;
         const ccModelName = conv ? (conv.cc_model || '') : '';
         const agentKind = (conv && typeof _agentKindForModel === 'function') ? _agentKindForModel(ccModelName, conv) : '';
-        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'goose' || mode === 'umans' || mode === 'openrouter';
+        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'goose' || mode === 'umans' || mode === 'openrouter' || _retiredHarnessMode(conv);
         const isActuallyCodex = mode === 'codex' || agentKind === 'codex';
         const isActuallyGemini = mode === 'gemini' || agentKind === 'gemini';
 
         const overrideGroups = {
             'cfg-overrides-loom': hasLoomOverrides,
             'cfg-overrides-braid': mode === 'local',
-            'cfg-overrides-hermes': mode === 'hermes',
             'cfg-overrides-weave': mode === 'weave',
-            'cfg-overrides-dream': mode === 'dream',
+            'cfg-overrides-dream': mode === 'weave', // Shared local response setting.
         };
         for (const [id, active] of Object.entries(overrideGroups)) {
             const group = document.getElementById(id);
             if (!group) continue;
-            group.classList.remove('hidden');
+            group.classList.toggle('hidden', !active);
             group.classList.toggle('overrides-inactive', !active);
             group.querySelectorAll('select, input, textarea').forEach(c => { c.disabled = !active; });
         }
-        const ccPermissionGroup = document.getElementById('cfg-cc-permission')?.closest('.form-group');
-        if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', isActuallyCodex || isActuallyGemini);
         const parallelGroup = document.getElementById('cfg-parallel-agents-group');
-        const supportsParallelAgents = !!(conv && ['claude', 'local', 'hermes', 'dream', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(mode) && conv.project_dir && !truthySetting(conv.nrol_operator));
+        const supportsParallelAgents = !!(conv && ['claude', 'local', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(mode) && conv.project_dir);
         if (parallelGroup) parallelGroup.classList.toggle('hidden', !supportsParallelAgents);
         if (cfgParallelAgents) cfgParallelAgents.disabled = !supportsParallelAgents;
         const ovHint = document.getElementById('cfg-overrides-divider-hint');
         if (ovHint) ovHint.textContent = mode ? '' : '(open a conversation to edit)';
 
         // Advanced
-        document.getElementById('cfg-host').value = cfg.llama_host || '';
-        document.getElementById('cfg-llama-server-exe').value = cfg.llama_server_exe || '';
-        document.getElementById('cfg-context').value = cfg.max_context_tokens || 28000;
-        document.getElementById('cfg-verbatim').value = cfg.verbatim_window || 8;
 
         // Display
         document.getElementById('cfg-blackhole').checked =
@@ -3258,90 +4129,14 @@ function setupEventListeners() {
             || (typeof window.LoomBlackhole === 'undefined');
         document.getElementById('cfg-stream-debug').checked =
             localStorage.getItem('loom-stream-debug') === '1';
-        document.getElementById('cfg-enable-umans-models').checked =
-            truthySetting(cfg.enable_umans_models);
 
-        // OpenRouter
-        document.getElementById('cfg-openrouter-base-url').value = cfg.openrouter_base_url || 'https://openrouter.ai/api/v1';
-        document.getElementById('cfg-openrouter-weekly-limit').value = cfg.openrouter_weekly_limit_usd ?? 12.5;
-        document.getElementById('cfg-openrouter-monthly-limit').value = cfg.openrouter_monthly_limit_usd ?? 50;
-        document.getElementById('cfg-openrouter-prompt-price').value = cfg.openrouter_max_prompt_price_per_mtok ?? 1;
-        document.getElementById('cfg-openrouter-completion-price').value = cfg.openrouter_max_completion_price_per_mtok ?? 4;
-        document.getElementById('cfg-openrouter-api-key').value = '';
-        document.getElementById('cfg-openrouter-management-key').value = '';
-        _refreshOpenRouterUsage();
 
         _setSettingsLoading(false);
-    });
-
-    // Apply settings + restart Llama Server. Saves whatever's in the panel right now
-    // (so llama_model / tuning changes take effect), then
-    // calls admin's llama-restart which stops + waits + starts fresh from
-    // config. ~30-60s for cold model load. Refreshes model caches when done.
-    document.getElementById('btn-llama-restart').addEventListener('click', async () => {
-        const btn = document.getElementById('btn-llama-restart');
-        const orig = btn.textContent;
-        btn.disabled = true;
-        // Save current panel values first so the restart picks them up.
-        const saved = await _saveSettingsFromPanel();
-        if (!saved) return;
-        btn.textContent = '↻ Restarting…';
-        try {
-            const adminUrl = _localUrl(location.protocol.slice(0, -1), 3002, '/tools/llama-restart');
-            const resp = await fetch(adminUrl, { method: 'POST' });
-            const data = await resp.json().catch(() => ({}));
-            if (data.status === 'ok') {
-                showToast('Llama Server restarted: ' + (data.output || '').split('\n')[0]);
-                try { await API.post('/api/local/refresh-models', {}); } catch {}
-                _invalidateModelCaches();
-                await checkHealth();
-                await _refreshLlamaRuntimeStatus();
-            } else {
-                showToast('Llama Server restart failed: ' + (data.output || 'unknown error'), 'error');
-            }
-        } catch (e) {
-            showToast('Llama Server restart failed: ' + (e.message || e) + ' (admin server reachable on :3002?)', 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-        }
-    });
-
-    // Manual refresh — forces the server to re-query Llama Server and rebuild
-    // the cache, then re-populates all dropdowns. Useful after adding/removing models
-    // or after starting/stopping Llama Server.
-    document.getElementById('btn-refresh-models').addEventListener('click', async () => {
-        const btn = document.getElementById('btn-refresh-models');
-        const orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '↻ Refreshing...';
-        try {
-            await API.post('/api/local/refresh-models', {});
-            _invalidateModelCaches();
-            await checkHealth();
-            await Promise.all([
-                _populateModelDropdown(),
-                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', false, false, true),
-                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : '', false, false, true),
-                _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
-                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : '', true, false, false),
-                populateCCModelDropdowns(document.getElementById('cfg-cc-model') ? document.getElementById('cfg-cc-model').value : ''),
-                _refreshLlamaRuntimeStatus(),
-            ]);
-            showToast('Models refreshed');
-        } catch (e) {
-            showToast('Refresh failed: ' + (e.message || e), 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = orig;
-        }
     });
 
     // Manual refresh — queries Anthropic's /v1/models with the local Claude Code
     // subscription token (free, instant, no generation) and rebuilds the
     // Anthropic group's labels with the live version numbers (e.g. "Opus" → "Opus 4.8").
-    document.getElementById('btn-refresh-openrouter-usage')?.addEventListener('click', _refreshOpenRouterUsage);
-    document.getElementById('btn-save-openrouter-secrets')?.addEventListener('click', _saveOpenRouterSecrets);
 
     const btnRefreshCC = document.getElementById('btn-refresh-cc-models');
     if (btnRefreshCC) btnRefreshCC.addEventListener('click', async () => {
@@ -3349,13 +4144,34 @@ function setupEventListeners() {
         btnRefreshCC.disabled = true;
         btnRefreshCC.textContent = '↻ Checking...';
         try {
-            const data = await API.post('/api/cc-models/refresh', {});
-            _ccModelsCache = data.models || null;
             const selected = document.getElementById('cfg-cc-model')
                 ? document.getElementById('cfg-cc-model').value
                 : '';
+            const data = await API.post('/api/cc-models/refresh?provider=all', {});
+            _ccModelsCache = data.models || null;
             await populateCCModelDropdowns(selected);
-            showToast('Anthropic models refreshed');
+
+            const providerLabels = {
+                anthropic: 'Anthropic',
+                gemini: 'Antigravity',
+                codex: 'Codex'
+            };
+            const parts = [];
+            if (Array.isArray(data.refreshed) && data.refreshed.length > 0) {
+                const refreshedNames = data.refreshed.map(p => providerLabels[p] || p);
+                parts.push(`Refreshed ${refreshedNames.join(', ')}`);
+            }
+            if (data.skipped && Object.keys(data.skipped).length > 0) {
+                const skipItems = Object.entries(data.skipped).map(([p, reason]) => {
+                    const name = providerLabels[p] || p;
+                    const cleanReason = String(reason).includes('credentials.json') || String(reason).includes('not found')
+                        ? 'not logged in'
+                        : reason;
+                    return `${name} (${cleanReason})`;
+                });
+                parts.push(`Skipped: ${skipItems.join(', ')}`);
+            }
+            showToast(parts.join('. ') || 'Models refreshed');
         } catch (e) {
             showToast('Refresh failed: ' + (e.detail || e.message || e), 'error');
         } finally {
@@ -3386,9 +4202,23 @@ function setupEventListeners() {
 
     // Settings model change — toggle effort visibility
     document.getElementById('cfg-cc-model').addEventListener('change', () => {
-        const v = document.getElementById('cfg-cc-model').value || '';
+        const sel = document.getElementById('cfg-cc-model');
+        const effortSel = document.getElementById('cfg-cc-effort');
+        const selectedOpt = sel?.selectedOptions[0];
+        const presetEffort = selectedOpt?.dataset?.effort;
+        if (presetEffort && effortSel) {
+            effortSel.value = presetEffort;
+        }
+        const v = sel ? sel.value : '';
         document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_supportsEffortValue(v));
         _syncEffortOptionsForModel('cfg-cc-effort', v);
+    });
+    document.getElementById('cfg-cc-effort')?.addEventListener('change', () => {
+        const sel = document.getElementById('cfg-cc-model');
+        const effortSel = document.getElementById('cfg-cc-effort');
+        if (sel && effortSel) {
+            _syncMatchingModelOption(sel, effortSel.value);
+        }
     });
 
     async function _saveSettingsFromPanel() {
@@ -3402,49 +4232,24 @@ function setupEventListeners() {
             const el = document.getElementById(id);
             return el ? el.value : fallback;
         };
-        const selectedModel = valueOf('cfg-llama-model-select', State.config.llama_model || '') || State.config.llama_model || '';
-
-        if (selectedModel) {
-            _modelConfigs[selectedModel] = _readModelTuning();
-            await _saveModelConfigs();
+        // Chat settings never rewrite machine config or model tuning.
+        if (conv?.mode === 'weave') {
+            const sharedResponseLimits = {
+                weave_max_tokens: Number(valueOf('cfg-weave-max-tokens', State.config.weave_max_tokens)),
+                dream_min_output_tokens: Number(valueOf('cfg-dream-min-output-tokens', State.config.dream_min_output_tokens)),
+            };
+            const saved = await API.put('/api/config', sharedResponseLimits);
+            Object.assign(State.config, saved || sharedResponseLimits);
         }
-
-        const globalCfg = {
-            ...State.config,
-            llama_host: valueOf('cfg-host', State.config.llama_host || ''),
-            llama_model: selectedModel,
-            vision_model: selectedModel,
-            llama_server_exe: valueOf('cfg-llama-server-exe', State.config.llama_server_exe || ''),
-            temperature: parseFloat(valueOf('cfg-temp', State.config.temperature ?? 0.85)),
-            top_p: parseFloat(valueOf('cfg-top-p', State.config.top_p ?? 0.92)),
-            max_tokens: parseInt(valueOf('cfg-max-tokens', State.config.max_tokens ?? 16384)),
-            weave_max_tokens: parseInt(valueOf('cfg-weave-max-tokens', State.config.weave_max_tokens ?? 2048)),
-            repeat_penalty: parseFloat(valueOf('cfg-repeat-penalty', State.config.repeat_penalty ?? 1.12)),
-            max_context_tokens: parseInt(valueOf('cfg-context', State.config.max_context_tokens ?? 28000)),
-            verbatim_window: parseInt(valueOf('cfg-verbatim', State.config.verbatim_window ?? 8)),
-            dream_min_output_tokens: parseInt(valueOf('cfg-dream-min-output-tokens', State.config.dream_min_output_tokens ?? 2048)),
-            enable_umans_models: !!document.getElementById('cfg-enable-umans-models')?.checked,
-            openrouter_base_url: valueOf('cfg-openrouter-base-url', State.config.openrouter_base_url || 'https://openrouter.ai/api/v1'),
-            openrouter_weekly_limit_usd: parseFloat(valueOf('cfg-openrouter-weekly-limit', State.config.openrouter_weekly_limit_usd ?? 12.5)),
-            openrouter_monthly_limit_usd: parseFloat(valueOf('cfg-openrouter-monthly-limit', State.config.openrouter_monthly_limit_usd ?? 50)),
-            openrouter_max_prompt_price_per_mtok: parseFloat(valueOf('cfg-openrouter-prompt-price', State.config.openrouter_max_prompt_price_per_mtok ?? 1)),
-            openrouter_max_completion_price_per_mtok: parseFloat(valueOf('cfg-openrouter-completion-price', State.config.openrouter_max_completion_price_per_mtok ?? 4)),
-        };
-        const savedGlobalCfg = await API.put('/api/config', globalCfg);
-        State.config = savedGlobalCfg || globalCfg;
-        const llamaServerExe = document.getElementById('cfg-llama-server-exe');
-        if (llamaServerExe && State.config.llama_server_exe) {
-            llamaServerExe.value = State.config.llama_server_exe;
-        }
-        _syncLlamaServerLink(State.config.llama_host);
 
         if (conv && State.currentConvId) {
             const updates = {};
-            if (['claude', 'local', 'hermes', 'dream', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(conv.mode) && conv.project_dir && !truthySetting(conv.nrol_operator)) {
+            if (conv.mode !== 'weave') updates.permission_profile = valueOf('cfg-permission-profile', conv.permission_profile || 'balanced');
+            if (['claude', 'local', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(conv.mode) && conv.project_dir) {
                 updates.parallel_agents_enabled = !!document.getElementById('cfg-parallel-agents-enabled')?.checked;
             }
-            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans' || conv.mode === 'openrouter') {
-                let modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : (conv.mode === 'codex' ? '' : 'sonnet')));
+            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans' || conv.mode === 'openrouter' || (_retiredHarnessMode(conv) && valueOf('cfg-cc-model', ''))) {
+                let modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.7 Flash (Medium)' : (conv.mode === 'codex' ? '' : 'sonnet')));
                 if (conv.mode === 'goose') {
                     modelName = _gooseRouteModelValue(modelName);
                 }
@@ -3452,30 +4257,30 @@ function setupEventListeners() {
                 const isActuallyCodex = conv.mode === 'codex' || agentKind === 'codex';
                 const isActuallyGemini = conv.mode === 'gemini' || agentKind === 'gemini';
 
-                updates.cc_model = modelName;
+                const cfgModelSelect = document.getElementById('cfg-cc-model');
+                if (!cfgModelSelect || modelName !== cfgModelSelect.dataset.initialModel) {
+                    updates.cc_model = modelName;
+                }
                 updates.cc_effort = valueOf('cfg-cc-effort', conv.cc_effort || 'high');
-                updates.cc_permission_mode = (isActuallyCodex || isActuallyGemini)
-                    ? 'default'
-                    : valueOf('cfg-cc-permission', conv.cc_permission_mode || 'default');
+                updates.cc_permission_mode = 'default';
             } else if (conv.mode === 'local') {
                 updates.local_model = valueOf('cfg-braid-model', conv.local_model || '');
-            } else if (conv.mode === 'hermes') {
-                updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
                 if (truthySetting(conv.system_only)) {
                     updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
                     updates.minimal_ooda_enabled = !!document.getElementById('cfg-weave-minimal-ooda-enabled')?.checked;
                 }
-            } else if (conv.mode === 'dream') {
-                updates.local_model = valueOf('cfg-dream-model', conv.local_model || '');
             }
             if (Object.keys(updates).length) {
                 const updated = await API.put(`/api/conversations/${State.currentConvId}`, updates);
                 Object.assign(conv, updated);
-                if (updates.cc_model) { const s = document.getElementById('cc-model-inline'); if (s) s.value = updates.cc_model; }
+                if (updates.cc_model) {
+                    _rememberExplicitCCModel(conv.id, updates.cc_model);
+                    const s = document.getElementById('cc-model-inline');
+                    if (s) s.value = updates.cc_model;
+                }
                 if (updates.cc_effort) { const s = document.getElementById('cc-effort-inline'); if (s) s.value = updates.cc_effort; }
-                if (updates.cc_permission_mode) { const s = document.getElementById('cc-permission-mode-inline'); if (s) s.value = updates.cc_permission_mode; }
                 if (updates.local_model) { const s = document.getElementById('weave-model-inline'); if (s) s.value = updates.local_model; }
                 if (typeof renderConversationList === 'function') renderConversationList();
                 if (typeof renderMessages === 'function') renderMessages();
@@ -3492,203 +4297,6 @@ function setupEventListeners() {
         _stopServerLightPolling();
         showToast('Settings saved');
     });
-    let _modelConfigs = {};     // { modelName: { ctx_size, ngl, ... } }
-    let _kvQuantOptions = ["none", "K4", "K4_0", "K5", "K5_0", "K8", "K8_0"];
-
-    async function _loadModelConfigs() {
-        try {
-            const data = await API.get('/api/models-config');
-            _modelConfigs = data.models || {};
-            if (data.kv_quant_options) _kvQuantOptions = data.kv_quant_options;
-        } catch { _modelConfigs = {}; }
-    }
-
-    async function _saveModelConfigs() {
-        try {
-            await API.put('/api/models-config', { models: _modelConfigs });
-        } catch (e) { showToast('Failed to save model configs', 'error'); }
-    }
-
-    function _fmtTokenCount(value) {
-        const n = Number(value || 0);
-        return n ? n.toLocaleString() : '';
-    }
-
-    function _setRuntimeText(id, text, title = '') {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.textContent = text || 'unknown';
-        el.title = title || text || '';
-    }
-
-    function _modelSettingsSummary(modelName) {
-        if (!modelName) return 'none';
-        const mc = _modelConfigs[modelName] || {};
-        const parts = [];
-        if (mc.ctx_size) parts.push(`ctx ${_fmtTokenCount(mc.ctx_size)}`);
-        if (mc.ngl !== undefined && mc.ngl !== null && mc.ngl !== '') parts.push(`GPU ${mc.ngl}`);
-        if (mc.kv_quant) parts.push(`KV ${mc.kv_quant}`);
-        if (mc.flash_attn !== undefined) parts.push(`FA ${mc.flash_attn === false ? 'off' : 'on'}`);
-        if (mc.mmproj) parts.push(`MMProj ${mc.mmproj}`);
-        if (mc.extra_args) parts.push(mc.extra_args);
-        return parts.length ? parts.join(' | ') : 'no saved tuning';
-    }
-
-    async function _refreshLlamaRuntimeStatus() {
-        const root = document.getElementById('llama-runtime-status');
-        if (!root) return;
-        root.dataset.state = 'unknown';
-        _setRuntimeText('llama-runtime-state', 'checking');
-        try {
-            const data = await _fetchAllModelsOnce();
-            const llamaModels = (data.models || []).filter(m => (m.backend || 'llama') === 'llama');
-            const loaded = llamaModels.filter(m => m.loaded);
-            const loadedNames = loaded.map(m => m.name).join(', ') || 'none';
-            const configured = data.target_model || State.config?.llama_model || '';
-            const selected = document.getElementById('cfg-llama-model-select')?.value || configured;
-            const loadedPrimary = loaded[0] || null;
-            const runtime = loadedPrimary?.runtime || {};
-            const runtimeCtx = _fmtTokenCount(runtime.n_ctx);
-            const trainCtx = _fmtTokenCount(runtime.n_ctx_train);
-            const drift = configured && loadedPrimary && !_modelsMatch(configured, loadedPrimary.name);
-            const state = loaded.length ? (drift ? 'online, drift' : 'online') : 'offline';
-            root.dataset.state = loaded.length ? 'online' : 'offline';
-            _setRuntimeText('llama-runtime-state', state);
-            _setRuntimeText('llama-runtime-loaded', loadedNames, loadedNames);
-            _setRuntimeText('llama-runtime-configured', configured || 'none', configured || 'none');
-            _setRuntimeText(
-                'llama-runtime-ctx',
-                runtimeCtx ? `${runtimeCtx}${trainCtx ? ` / ${trainCtx} train` : ''}` : (loaded.length ? 'unknown' : 'none')
-            );
-            _setRuntimeText('llama-runtime-saved-settings', _modelSettingsSummary(selected));
-        } catch (e) {
-            root.dataset.state = 'offline';
-            _setRuntimeText('llama-runtime-state', 'unavailable');
-            _setRuntimeText('llama-runtime-loaded', 'unknown');
-            _setRuntimeText('llama-runtime-configured', State.config?.llama_model || 'unknown');
-            _setRuntimeText('llama-runtime-ctx', 'unknown');
-            _setRuntimeText('llama-runtime-saved-settings', 'unknown');
-        }
-    }
-
-    async function _populateModelDropdown() {
-        const sel = document.getElementById('cfg-llama-model-select');
-        if (!sel) return;
-        try {
-            const data = await _fetchDiskModels();
-            const models = (data.models || []).filter(m => {
-                const name = String(m || '').toLowerCase();
-                return !name.startsWith('mmproj') && !name.includes('mm-projector');
-            });
-            sel.innerHTML = '';
-            for (const m of models) {
-                const opt = document.createElement('option');
-                opt.value = m;
-                opt.textContent = m;
-                sel.appendChild(opt);
-            }
-            // Pre-select the saved llama_model
-            const saved = State.config?.llama_model || '';
-            if (saved && Array.from(sel.options).some(o => o.value === saved)) {
-                sel.value = saved;
-            }
-        } catch (e) {
-            sel.innerHTML = '<option value="">(could not load models)';
-        }
-    }
-
-      function _populateKvQuantDropdown() {
-        const sel = document.getElementById('cfg-mc-kv-quant');
-        if (!sel) return;
-        sel.innerHTML = '';
-        for (const q of _kvQuantOptions) {
-            const opt = document.createElement('option');
-            opt.value = q;
-            opt.textContent = q === 'none' ? 'none (f32)' : q;
-            sel.appendChild(opt);
-        }
-    }
-
-    async function _populateMmprojDropdown() {
-        const sel = document.getElementById('cfg-mc-mmproj');
-        if (!sel) return;
-        sel.innerHTML = '';
-        const noneOpt = document.createElement('option');
-        noneOpt.value = 'none';
-        noneOpt.textContent = 'none';
-        sel.appendChild(noneOpt);
-        try {
-            const data = await _fetchDiskModels();
-            const models = data.models || [];
-            for (const m of models) {
-                const ml = m.toLowerCase();
-                if (ml.includes('mmproj') || ml.includes('mm-projector') || ml.includes('-vl-') || ml.includes('-vision-')) {
-                    const opt = document.createElement('option');
-                    opt.value = m;
-                    opt.textContent = m;
-                    sel.appendChild(opt);
-                }
-            }
-        } catch { /* no mmproj files — "none" is the only option */ }
-    }
-
-    function _showModelTuning(name) {
-        const fields = document.getElementById('model-tuning-fields');
-        if (!fields) return;
-        if (!name || !_modelConfigs[name]) {
-            fields.classList.add('hidden');
-            return;
-        }
-        const mc = _modelConfigs[name];
-        const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
-        const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
-        const setChecked = (id, value) => { const el = document.getElementById(id); if (el) el.checked = value; };
-        setText('model-tuning-model-name', `for ${name}`);
-        setValue('cfg-mc-ctx-size', mc.ctx_size ?? 150000);
-        setValue('cfg-mc-ngl', mc.ngl ?? 999);
-        setValue('cfg-mc-kv-quant', mc.kv_quant ?? 'none');
-        setValue('cfg-mc-threads', mc.threads ?? '');
-        setValue('cfg-mc-batch', mc.batch ?? '');
-        setValue('cfg-mc-ubatch', mc.ubatch ?? '');
-        setChecked('cfg-mc-flash-attn', mc.flash_attn !== false);
-        setChecked('cfg-mc-mlock', !!mc.mlock);
-        setValue('cfg-mc-mmproj', mc.mmproj || 'none');
-        setValue('cfg-mc-extra', mc.extra_args ?? '');
-        fields.classList.remove('hidden');
-    }
-
-    function _readModelTuning() {
-        const valueOf = (id, fallback = '') => {
-            const el = document.getElementById(id);
-            return el ? el.value : fallback;
-        };
-        const checkedOf = (id, fallback = false) => {
-            const el = document.getElementById(id);
-            return el ? el.checked : fallback;
-        };
-        const mmproj = valueOf('cfg-mc-mmproj', 'none');
-        return {
-            ctx_size: parseInt(valueOf('cfg-mc-ctx-size', 150000)) || 150000,
-            ngl: parseInt(valueOf('cfg-mc-ngl', 999)) || 999,
-            kv_quant: valueOf('cfg-mc-kv-quant', 'none'),
-            threads: valueOf('cfg-mc-threads') || null,
-            batch: valueOf('cfg-mc-batch') || null,
-            ubatch: valueOf('cfg-mc-ubatch') || null,
-            flash_attn: checkedOf('cfg-mc-flash-attn', true),
-            mlock: checkedOf('cfg-mc-mlock'),
-            mmproj: mmproj === 'none' ? null : mmproj,
-            extra_args: valueOf('cfg-mc-extra'),
-        };
-    }
-
-    const llamaModelSettingsSelect = document.getElementById('cfg-llama-model-select');
-    if (llamaModelSettingsSelect) {
-        llamaModelSettingsSelect.addEventListener('change', function () {
-            _showModelTuning(this.value);
-            _refreshLlamaRuntimeStatus();
-        });
-    }
-
     // Close modals
     document.querySelectorAll('[data-close-modal]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -3727,7 +4335,10 @@ function setupEventListeners() {
     });
 
     // Auto-resize textarea
-    document.getElementById('user-input').addEventListener('input', autoResizeTextarea);
+    document.getElementById('user-input').addEventListener('input', () => {
+        autoResizeTextarea();
+        saveComposerDraft();
+    });
 
     // Image upload
     document.getElementById('file-input').addEventListener('change', handleImageSelect);
@@ -3772,6 +4383,14 @@ function setupEventListeners() {
 
 function autoResizeTextarea() {
     const ta = document.getElementById('user-input');
+    if (!ta) return;
+    // Draft restoration can run while the shared composer is still hidden.
+    // Measuring a hidden textarea reports a zero-width, near-zero-height box
+    // and used to leave that bad measurement behind as an inline height.
+    if (ta.offsetWidth <= 0 || ta.getClientRects().length === 0) {
+        ta.dataset.resizeWhenVisible = 'true';
+        return;
+    }
     // Measure in an off-screen clone to avoid flex reflow flicker in tree view
     const clone = ta.cloneNode(true);
     clone.style.position = 'absolute';
@@ -3779,9 +4398,10 @@ function autoResizeTextarea() {
     clone.style.height = 'auto';
     clone.style.width = ta.offsetWidth + 'px';
     ta.parentNode.appendChild(clone);
-    const newH = Math.min(clone.scrollHeight, 200) + 'px';
+    const newH = Math.max(42, Math.min(clone.scrollHeight, 200)) + 'px';
     clone.remove();
     ta.style.height = newH;
+    delete ta.dataset.resizeWhenVisible;
 }
 
 // ── Character Grid ──
@@ -3827,11 +4447,13 @@ function clearPendingImages() {
     const descInput = document.getElementById('describe-context');
     if (descInput) descInput.value = '';
     renderImagePreviews();
+    saveComposerDraft();
 }
 
 function removePendingImage(index) {
     State.pendingImages.splice(index, 1);
     renderImagePreviews();
+    saveComposerDraft();
 }
 
 function renderImagePreviews() {
@@ -3855,7 +4477,7 @@ function renderImagePreviews() {
                        <span class="file-thumb-icon">&#128196;</span>
                        <span class="file-thumb-name">${escapeHtml((img.original_name || 'file').slice(-20))}</span>
                    </div>`}
-            <button class="btn-remove-thumb" data-idx="${i}">&#x2715;</button>
+            <button class="btn-remove-thumb" data-idx="${i}" aria-label="Remove ${escapeHtml(img.original_name || 'attachment')}">&#x2715;</button>
         </div>
     `).join('') + `<span class="preview-count">${State.pendingImages.length}/${MAX_PENDING_IMAGES}</span>`;
 
@@ -3864,27 +4486,70 @@ function renderImagePreviews() {
     });
 }
 
-async function attachImage(file) {
-    if (State.pendingImages.length >= MAX_PENDING_IMAGES) {
+let _attachmentUploads = 0;
+const _attachmentUploadsByOwner = new Map();
+function attachmentOwner() {
+    return {key: State.currentConvId == null ? 'exo-casual-draft'
+        : _composerDraftStorageKey(State.currentConvId, State.loomCursor),
+        draftId: typeof _casualDraftId !== 'undefined' ? _casualDraftId : null};
+}
+function attachmentOwnerId(owner) { return `${owner.key}:${owner.key === 'exo-casual-draft' ? owner.draftId : ''}`; }
+function pendingAttachmentUploads() { return _attachmentUploadsByOwner.get(attachmentOwnerId(attachmentOwner())) || 0; }
+async function attachImage(file, owner = attachmentOwner()) {
+    const ownerKey = owner.key, casualDraftId = owner.draftId;
+    const current = attachmentOwner();
+    const sameOwner = attachmentOwnerId(owner) === attachmentOwnerId(current);
+    const savedDraft = JSON.parse(sessionStorage.getItem(ownerKey) || '{}');
+    const completed = sameOwner ? State.pendingImages.length
+        : (savedDraft[ownerKey === 'exo-casual-draft' ? 'images' : 'pendingImages'] || []).length;
+    const ownerId = attachmentOwnerId(owner);
+    if (completed + (_attachmentUploadsByOwner.get(ownerId) || 0) >= MAX_PENDING_IMAGES) {
         showToast(`Max ${MAX_PENDING_IMAGES} attachments allowed`, 'error');
         return;
     }
     // Show uploading placeholder
+    if (sameOwner) saveComposerDraft();
+    _attachmentUploads++;
+    _attachmentUploadsByOwner.set(ownerId, (_attachmentUploadsByOwner.get(ownerId) || 0) + 1);
     const container = document.getElementById('image-preview');
-    container.classList.remove('hidden');
+    if (sameOwner) container.classList.remove('hidden');
     const placeholder = document.createElement('div');
     placeholder.className = 'preview-thumb upload-placeholder';
     placeholder.innerHTML = '<div class="upload-spinner"></div><span class="upload-label">Uploading…</span>';
-    container.appendChild(placeholder);
+    if (sameOwner) container.appendChild(placeholder);
     try {
         const result = await API.upload(file);
-        State.pendingImages.push({
+        const attachment = {
             path: result.path, url: result.url,
             is_image: result.is_image !== false,
             original_name: result.original_name || file.name,
-        });
+        };
+        const currentKey = State.currentConvId == null ? 'exo-casual-draft'
+            : _composerDraftStorageKey(State.currentConvId, State.loomCursor);
+        if (ownerKey === currentKey && (ownerKey !== 'exo-casual-draft'
+            || State.currentView === 'chat' && casualDraftId === _casualDraftId)) {
+            State.pendingImages.push(attachment);
+            saveComposerDraft();
+        } else {
+            // A phone upload can finish after branch navigation. Keep it with
+            // its original composer rather than attaching it to another chat.
+            const saved = JSON.parse(sessionStorage.getItem(ownerKey) || '{}');
+            const field = ownerKey === 'exo-casual-draft' ? 'images' : 'pendingImages';
+            if (ownerKey !== 'exo-casual-draft' || casualDraftId === saved.draft_id) {
+                saved[field] = [...(saved[field] || []), attachment];
+                sessionStorage.setItem(ownerKey, JSON.stringify(saved));
+                showToast('Upload saved with the original chat draft.', 'info');
+            } else {
+                showToast('The original draft was replaced. Attach the file again in this chat.', 'warning');
+            }
+        }
     } catch (err) {
         showToast('File upload failed', 'error');
+    } finally {
+        _attachmentUploads--;
+        const remaining = (_attachmentUploadsByOwner.get(ownerId) || 1) - 1;
+        if (remaining) _attachmentUploadsByOwner.set(ownerId, remaining);
+        else _attachmentUploadsByOwner.delete(ownerId);
     }
     placeholder.remove();
     renderImagePreviews();
@@ -3895,8 +4560,9 @@ async function attachImage(file) {
 async function handleImageSelect(e) {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
+    const owner = attachmentOwner();
     for (const file of files) {
-        await attachImage(file);
+        await attachImage(file, owner);
     }
     e.target.value = '';
 }
@@ -3913,8 +4579,9 @@ async function handleImagePaste(e) {
     }
     if (files.length > 0) {
         e.preventDefault();
+        const owner = attachmentOwner();
         for (const file of files) {
-            await attachImage(file);
+            await attachImage(file, owner);
         }
     }
 }
@@ -4472,12 +5139,381 @@ function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+let _searchSpaceWorkspaces = [];
+let _searchSpaceSession = null;
+let _searchSpaceBusy = false;
+let _searchSpaceRequestEpoch = 0;
+let _searchSpacePendingTimer = null;
+
+function stopSearchSpacePending() {
+    clearInterval(_searchSpacePendingTimer);
+    _searchSpacePendingTimer = null;
+    clearSearchSpaceMotion();
+}
+
+function renderSearchSpacePending(question) {
+    const transcript = document.getElementById('search-space-transcript');
+    const article = document.createElement('article');
+    article.className = 'search-space-turn search-space-pending';
+    article.setAttribute('aria-busy', 'true');
+    const user = document.createElement('div');
+    user.className = 'search-space-user';
+    user.textContent = question;
+    const waiting = document.createElement('div');
+    waiting.className = 'search-space-waiting';
+    waiting.innerHTML = '<span class="stream-waiting-anim clotho-spinner" aria-hidden="true"></span>' +
+        '<span class="search-space-waiting-text" role="status" aria-live="polite">Search sent. Looming results...</span>' +
+        '<span class="search-space-elapsed" aria-hidden="true">0s</span>';
+    article.append(user, waiting);
+    transcript.appendChild(article);
+    transcript.scrollTop = transcript.scrollHeight;
+    const start = Date.now();
+    let frame = 0;
+    let lastNotice = -1;
+    const paint = () => {
+        const seconds = Math.floor((Date.now() - start) / 1000);
+        waiting.querySelector('.clotho-spinner').textContent = _CLOTHO_SPINNER_FRAMES[frame];
+        frame = (frame + 1) % _CLOTHO_SPINNER_FRAMES.length;
+        waiting.querySelector('.search-space-elapsed').textContent = `${seconds}s`;
+        const notice = seconds >= 45 ? 2 : seconds >= 15 ? 1 : 0;
+        if (notice !== lastNotice) {
+            waiting.querySelector('.search-space-waiting-text').textContent = [
+                'Search sent. Looming results...',
+                'Still looming. Waiting for the search response...',
+                'This search is taking longer. You can close this panel to end it.',
+            ][notice];
+            lastNotice = notice;
+        }
+    };
+    paint();
+    _searchSpacePendingTimer = setInterval(paint, _CLOTHO_SPINNER_INTERVAL_MS);
+    return article;
+}
+
+function searchSpaceRemember(key, value) {
+    try { localStorage.setItem(`exo-search-${key}`, JSON.stringify(value)); } catch (_) {}
+}
+
+function searchSpaceRecall(key, fallback) {
+    try { return JSON.parse(localStorage.getItem(`exo-search-${key}`)) ?? fallback; } catch (_) { return fallback; }
+}
+
+function clearSearchSpaceChat() {
+    _searchSpaceRequestEpoch += 1;
+    stopSearchSpacePending();
+    if (_searchSpaceSession?.session_id) {
+        API.del(`/api/search-space/sessions/${encodeURIComponent(_searchSpaceSession.session_id)}`).catch(() => {});
+    }
+    _searchSpaceSession = null;
+    document.getElementById('search-space-transcript')?.replaceChildren();
+    const answer = document.getElementById('search-space-answer');
+    if (answer) answer.textContent = '';
+    const sources = document.getElementById('search-space-sources');
+    if (sources) sources.replaceChildren();
+    const status = document.getElementById('search-space-status');
+    if (status) status.textContent = '';
+}
+
+function renderSearchSpaceTurn(turn) {
+    const transcript = document.getElementById('search-space-transcript');
+    const article = document.createElement('article');
+    article.className = 'search-space-turn';
+    const question = document.createElement('div');
+    question.className = 'search-space-user';
+    question.textContent = turn.question;
+    const answer = document.createElement('div');
+    answer.className = 'search-space-reply';
+    answer.textContent = turn.answer;
+    article.append(question, answer);
+    for (const source of turn.sources || []) {
+        if (!Number.isSafeInteger(source.conversation_id) || !Number.isSafeInteger(source.message_id)) continue;
+        const link = document.createElement('a');
+        link.className = 'search-space-source';
+        const url = new URL(_loomRouteBase, location.origin);
+        url.searchParams.set('conversation', source.conversation_id);
+        url.searchParams.set('branch', source.message_id);
+        url.searchParams.set('view', 'chat');
+        link.href = url.href;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        const date = source.created_at ? new Date(source.created_at * 1000).toLocaleDateString() : '';
+        link.textContent = `${source.source} · ${source.conversation_title}${date ? ` · ${date}` : ''}\n${String(source.snippet || '').replace(/[\[\]]/g, '')}`;
+        article.appendChild(link);
+    }
+    transcript.appendChild(article);
+    transcript.scrollTop = transcript.scrollHeight;
+}
+
+function initSearchSpace() {
+    const open = document.getElementById('btn-search-space-open');
+    const panel = document.getElementById('search-space-panel');
+    if (!open || !panel) return;
+    open.setAttribute('aria-haspopup', 'dialog');
+    open.setAttribute('aria-controls', 'search-space-panel');
+    open.setAttribute('aria-expanded', 'false');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-labelledby', 'search-space-title');
+    open.addEventListener('click', async event => {
+        event.stopPropagation();
+        const host = document.getElementById('workspace-search-host');
+        if (host) host.appendChild(panel);
+        switchView('search');
+        panel.classList.remove('hidden');
+        open.setAttribute('aria-expanded', 'true');
+        document.getElementById('home-search-results')?.classList.add('hidden');
+        await loadSearchSpaceWorkspaces();
+        document.getElementById('search-space-question')?.focus();
+    });
+    panel.addEventListener('click', event => event.stopPropagation());
+    panel.addEventListener('keydown', event => {
+        if (event.key === 'Escape') document.getElementById('btn-search-space-close')?.click();
+    });
+    document.getElementById('btn-search-space-close')?.addEventListener('click', () => {
+        panel.classList.add('hidden');
+        open.setAttribute('aria-expanded', 'false');
+        clearSearchSpaceChat();
+    });
+    document.getElementById('btn-search-space-run')?.addEventListener('click', runSearchSpaceQuery);
+    document.getElementById('btn-search-space-new')?.addEventListener('click', () => {
+        if (_searchSpaceBusy) return;
+        clearSearchSpaceChat();
+        document.getElementById('search-space-question')?.focus();
+    });
+    window.addEventListener('pagehide', () => {
+        if (_searchSpaceSession?.session_id) {
+            try {
+                fetch(`/api/search-space/sessions/${encodeURIComponent(_searchSpaceSession.session_id)}`, {
+                    method: 'DELETE',
+                    keepalive: true
+                });
+            } catch (_) {}
+        }
+    });
+    document.getElementById('search-space-question')?.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && event.shiftKey && !event.isComposing) { event.preventDefault(); runSearchSpaceQuery(); }
+    });
+}
+
+const _SEARCH_LOOM_FRAMES = [
+    "╴╴╴╴╴╴╴╴╴╴",
+    "─╌╌╌╌╌╌╌╌╌",
+    "◆╼╌╌╌╌╌╌╌╌",
+    "╾◆╼╌╌╌╌╌╌╌",
+    "═╾◆╼╌╌╌╌╌╌",
+    "══╾◆╼╌╌╌╌╌",
+    "═══╾◆╼╌╌╌╌",
+    "════╾◆╼╌╌╌",
+    "═════╾◆╼╌╌",
+    "══════╾◆╼╌",
+    "═══════╾◆╼",
+    "════════╾◆",
+    "═════════╾",
+    "══════════",
+    "╌╌╌╌╌╌╌╌╌─",
+];
+let _searchSpaceLoomTimer = null;
+
+function setSearchSpaceMotion(statusEl, text, withShuttle = false) {
+    if (!statusEl) return;
+    if (_searchSpaceLoomTimer) {
+        clearInterval(_searchSpaceLoomTimer);
+        _searchSpaceLoomTimer = null;
+    }
+    const shuttleHtml = withShuttle ? '<span class="loom-anim" aria-hidden="true"></span>' : '';
+    statusEl.innerHTML = `
+        <span class="loading-spinner search-space-spinner" aria-hidden="true"></span>
+        <span class="looming-phase" aria-label="${escapeHtml(text)}">
+            ${shuttleHtml}
+            <span class="looming-text">${escapeHtml(text)}</span>
+            <span class="looming-ellipsis" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+        </span>
+    `;
+    if (withShuttle) {
+        let frame = 0;
+        const animEl = statusEl.querySelector('.loom-anim');
+        if (animEl) {
+            animEl.textContent = _SEARCH_LOOM_FRAMES[0];
+            _searchSpaceLoomTimer = setInterval(() => {
+                frame = (frame + 1) % _SEARCH_LOOM_FRAMES.length;
+                if (animEl) animEl.textContent = _SEARCH_LOOM_FRAMES[frame];
+            }, 120);
+        }
+    }
+}
+
+function clearSearchSpaceMotion() {
+    if (_searchSpaceLoomTimer) {
+        clearInterval(_searchSpaceLoomTimer);
+        _searchSpaceLoomTimer = null;
+    }
+}
+
+async function loadSearchSpaceWorkspaces() {
+    const host = document.getElementById('search-space-workspaces');
+    const status = document.getElementById('search-space-status');
+    if (!host || !status) return;
+    const rememberedScope = searchSpaceRecall('scope', null);
+    setSearchSpaceMotion(status, 'Reading workspace policies');
+    try {
+        _searchSpaceWorkspaces = await API.get('/api/search-space/workspaces');
+        const selected = new Set(
+            rememberedScope !== null ? rememberedScope : _searchSpaceWorkspaces.filter(w => w.policy !== 'excluded').map(w => w.workspace_key)
+        );
+        host.innerHTML = _searchSpaceWorkspaces.map(item => {
+            const checked = selected.has(item.workspace_key) && item.policy !== 'excluded';
+            return `<div class="search-space-workspace" data-workspace-key="${escapeHtml(item.workspace_key)}">
+                <label><input type="checkbox" value="${escapeHtml(item.workspace_key)}" ${item.policy === 'excluded' ? 'disabled' : ''} ${checked ? 'checked' : ''}>
+                    <span><b>${escapeHtml(item.project_dir)}</b><small>${item.conversation_count} conversation${item.conversation_count === 1 ? '' : 's'} · ${item.message_count} messages</small></span></label>
+                <select aria-label="Search policy for ${escapeHtml(item.project_dir)}">
+                    <option value="excluded" ${item.policy === 'excluded' ? 'selected' : ''}>Excluded</option>
+                    <option value="cloud" ${item.policy === 'cloud' ? 'selected' : ''}>Cloud search</option>
+                    <option value="sensitive" ${item.policy === 'sensitive' ? 'selected' : ''}>Sensitive · local only</option>
+                </select>
+            </div>`;
+        }).join('') || '<div class="search-no-results">No conversation workspaces found.</div>';
+        host.querySelectorAll('select').forEach(select => select.addEventListener('change', updateSearchSpacePolicy));
+        host.querySelectorAll('input[type="checkbox"]').forEach(box => box.addEventListener('change', updateSearchSpaceRoute));
+        status.textContent = '';
+        updateSearchSpaceRoute();
+        const nonExcluded = _searchSpaceWorkspaces.filter(w => w.policy !== 'excluded');
+        const scopeSettings = document.getElementById('search-space-scope-settings');
+        if (scopeSettings && nonExcluded.length === 0) {
+            scopeSettings.open = true;
+        }
+    } catch (error) {
+        status.textContent = `Could not load workspaces: ${error.message || error}`;
+    }
+}
+
+async function updateSearchSpacePolicy(event) {
+    const row = event.target.closest('[data-workspace-key]');
+    const item = _searchSpaceWorkspaces.find(workspace => workspace.workspace_key === row?.dataset.workspaceKey);
+    if (!item) return;
+    event.target.disabled = true;
+    try {
+        await API.put('/api/search-space/workspaces/policy', {
+            project_dir: item.project_dir,
+            policy: event.target.value,
+        });
+        await loadSearchSpaceWorkspaces();
+    } catch (error) {
+        showToast(`Search policy failed: ${error.message || error}`, 'error');
+        event.target.disabled = false;
+    }
+}
+
+function selectedSearchSpaceKeys() {
+    return [...document.querySelectorAll('#search-space-workspaces input[type="checkbox"]:checked')]
+        .map(input => input.value);
+}
+
+function updateSearchSpaceRoute() {
+    const keys = new Set(selectedSearchSpaceKeys());
+    const policies = new Set(
+        _searchSpaceWorkspaces.filter(item => keys.has(item.workspace_key)).map(item => item.policy)
+    );
+    const route = document.getElementById('search-space-route');
+    if (!route) return;
+    const local = keys.size > 0 && !(policies.size === 1 && policies.has('cloud'));
+    route.textContent = !keys.size ? 'Select at least one classified workspace'
+        : local ? 'llama-server · local only' : 'GLM 5.3 Flash · OpenRouter';
+    route.classList.toggle('sensitive', local);
+    searchSpaceRemember('scope', [...keys]);
+    const scopeSettings = document.getElementById('search-space-scope-settings');
+    if (scopeSettings) {
+        scopeSettings.querySelector('summary').textContent = keys.size ? `Search scope · ${keys.size} workspace${keys.size === 1 ? '' : 's'}` : 'Choose search scope';
+    }
+}
+
+async function runSearchSpaceQuery() {
+    if (_searchSpaceBusy) return;
+    const composer = document.getElementById('search-space-question');
+    const draft = composer?.value || '';
+    const question = draft.trim();
+    const keys = selectedSearchSpaceKeys();
+    const status = document.getElementById('search-space-status');
+    const answer = document.getElementById('search-space-answer');
+    const sources = document.getElementById('search-space-sources');
+    const run = document.getElementById('btn-search-space-run');
+    if (question.length < 2) {
+        status.textContent = 'Enter a question to search.';
+        return;
+    }
+    if (!keys.length) {
+        status.textContent = 'Select at least one classified workspace in Search scope below.';
+        const scopeSettings = document.getElementById('search-space-scope-settings');
+        if (scopeSettings) scopeSettings.open = true;
+        return;
+    }
+    run.disabled = true;
+    _searchSpaceBusy = true;
+    document.getElementById('btn-search-space-new').disabled = true;
+    document.querySelectorAll('#search-space-workspaces input, #search-space-workspaces select').forEach(el => el.disabled = true);
+    answer.textContent = '';
+    sources.innerHTML = '';
+    const epoch = ++_searchSpaceRequestEpoch;
+    const needsSession = !_searchSpaceSession || [..._searchSpaceSession.workspace_keys].sort().join(',') !== [...keys].sort().join(',');
+    if (needsSession) document.getElementById('search-space-transcript').replaceChildren();
+    const pending = renderSearchSpacePending(question);
+    composer.value = '';
+    composer.disabled = true;
+    status.textContent = needsSession ? 'Preparing search...' : 'Search sent. Waiting for results...';
+    document.getElementById('search-space-scope-settings').open = false;
+    try {
+        if (needsSession) {
+            const session = await API.post('/api/search-space/sessions', {workspace_keys: keys});
+            if (epoch !== _searchSpaceRequestEpoch) {
+                API.del(`/api/search-space/sessions/${encodeURIComponent(session.session_id)}`).catch(() => {});
+                return;
+            }
+            _searchSpaceSession = session;
+            _searchSpaceSession.turns = [];
+        }
+        status.textContent = 'Search sent. Waiting for results...';
+        const result = await API.post(`/api/search-space/sessions/${_searchSpaceSession.session_id}/messages`, {question});
+        if (epoch !== _searchSpaceRequestEpoch) return;
+        stopSearchSpacePending();
+        pending.remove();
+        status.textContent = result.route === 'cloud'
+            ? 'Searched with GLM 5.3 Flash'
+            : 'Searched locally with llama-server';
+        status.textContent += ` · ${result.retrieval_mode === 'semantic+keyword' ? 'semantic + keyword' : 'keyword'}${result.notice ? ` · ${result.notice}` : ''}`;
+        answer.textContent = '';
+        _searchSpaceSession.turns.push(result);
+        renderSearchSpaceTurn(result);
+    } catch (error) {
+        if (epoch !== _searchSpaceRequestEpoch) return;
+        stopSearchSpacePending();
+        pending.removeAttribute('aria-busy');
+        pending.classList.remove('search-space-pending');
+        pending.querySelector('.search-space-waiting').textContent = 'Search failed. Your question is kept below; try again.';
+        composer.value = draft;
+        if (error?.status === 404 || error?.status === 400 && String(error?.detail || '').includes('ended')) {
+            _searchSpaceSession = null;
+        }
+        status.textContent = error.message || String(error);
+    } finally {
+        stopSearchSpacePending();
+        document.getElementById('search-space-question').disabled = false;
+        run.disabled = false;
+        _searchSpaceBusy = false;
+        document.getElementById('btn-search-space-new').disabled = false;
+        document.querySelectorAll('#search-space-workspaces select').forEach(el => el.disabled = false);
+        document.querySelectorAll('#search-space-workspaces input').forEach(el => {
+            el.disabled = _searchSpaceWorkspaces.find(w => w.workspace_key === el.value)?.policy === 'excluded';
+        });
+    }
+}
+
+let _homeSearchRequestSeq = 0;
+
 function initHomeSearch() {
     const input = document.getElementById('home-search-input');
     const resultsEl = document.getElementById('home-search-results');
     if (!input || !resultsEl) return;
     let timeout = null;
     const clearRestoredSearch = () => {
+        _homeSearchRequestSeq += 1;
         input.value = '';
         resultsEl.classList.add('hidden');
         resultsEl.innerHTML = '';
@@ -4487,11 +5523,13 @@ function initHomeSearch() {
     setTimeout(clearRestoredSearch, 0);
 
     input.addEventListener('input', () => {
+        _homeSearchRequestSeq += 1;
         clearTimeout(timeout);
         timeout = setTimeout(() => performHomeSearch(), 250);
     });
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+            _homeSearchRequestSeq += 1;
             input.value = '';
             resultsEl.classList.add('hidden');
             resultsEl.innerHTML = '';
@@ -4499,6 +5537,7 @@ function initHomeSearch() {
     });
     document.addEventListener('click', (e) => {
         if (!e.target.closest('#home-search-container')) {
+            _homeSearchRequestSeq += 1;
             resultsEl.classList.add('hidden');
         }
     });
@@ -4508,6 +5547,7 @@ async function performHomeSearch() {
     const input = document.getElementById('home-search-input');
     const resultsEl = document.getElementById('home-search-results');
     const query = input.value.trim();
+    const requestSeq = ++_homeSearchRequestSeq;
     if (query.length < 2) {
         resultsEl.classList.add('hidden');
         resultsEl.innerHTML = '';
@@ -4515,6 +5555,7 @@ async function performHomeSearch() {
     }
     try {
         const results = await API.get(`/api/search?q=${encodeURIComponent(query)}`);
+        if (requestSeq !== _homeSearchRequestSeq || input.value.trim() !== query) return;
         renderSearchResults(results, query);
     } catch (e) {
         console.error('Home search error:', e);
@@ -4625,4 +5666,8 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Start ──
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', async () => {
+    try { await init(); }
+    catch (error) { showToast(error.detail || error.message || 'Could not open chat', 'error'); }
+    finally { document.body.classList.remove('app-booting'); }
+});

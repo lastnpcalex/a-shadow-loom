@@ -134,8 +134,9 @@ async def health(host: Optional[str] = None, timeout: float = 3.0) -> Optional[d
     """
     h = _resolve_host(host)
     models: list[dict] = []
+    client_timeout = httpx.Timeout(timeout, connect=min(timeout, 1.0))
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
             r = await client.get(f"{h}/health")
             if r.status_code == 200:
                 try:
@@ -147,10 +148,15 @@ async def health(host: Optional[str] = None, timeout: float = 3.0) -> Optional[d
                 mr = await client.get(f"{h}/v1/models")
                 if mr.status_code == 200:
                     models = mr.json().get("data", [])
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return None
     except Exception:
-        models = await list_models(h, timeout=timeout)
+        pass
     if not models:
-        models = await list_models(h, timeout=timeout)
+        try:
+            models = await list_models(h, timeout=timeout)
+        except Exception:
+            models = []
     if models:
         ids = [str(m.get("id") or m.get("name") or "") for m in models if isinstance(m, dict)]
         ids = [m for m in ids if m]

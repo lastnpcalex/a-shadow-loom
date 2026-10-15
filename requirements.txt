@@ -1,7 +1,11 @@
 fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
+# SansIO keepalive support requires Uvicorn 0.44; 0.45 also restores HTTP shutdown behavior.
+uvicorn[standard]>=0.45.0,<1
 aiosqlite>=0.20.0
+tzdata>=2024.1  # IANA timezone rules on Windows for daily activity reports
 httpx>=0.27.0
+requests>=2.34.2,<3
+psutil>=6.0.0
 python-multipart>=0.0.12
 qrcode[pil]>=8.0
 websockets>=13.0
@@ -12,3 +16,5 @@ pytest-asyncio>=0.23.0
 ddgs>=8.0.0
 trafilatura>=2.0.0
 mcp>=1.0.0
+# 0.6.1 preserves compatibility with existing image/video tooling on Python 3.14.
+fastembed==0.6.1

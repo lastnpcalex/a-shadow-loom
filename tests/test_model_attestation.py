@@ -80,23 +80,6 @@ def test_goose_does_not_mislabel_process_configuration_as_verification():
     assert verified["effective_model"] == "openrouter:z-ai/glm-5.2"
 
 
-def test_hermes_attestation_records_acp_model_acknowledgement():
-    import hermes_client
-
-    attestation = hermes_client._hermes_model_attestation(
-        "qwen3.6:27b",
-        "custom:qwen3.6:27b",
-        "custom:qwen3.6:27b",
-        source="hermes_acp_set_model_ack",
-        session_id="hermes-session",
-        verified=True,
-    )
-
-    assert attestation["status"] == "verified"
-    assert attestation["harness"] == "Hermes ACP"
-    assert attestation["model_provider"] == "custom"
-
-
 def test_direct_completion_attestation_uses_response_model():
     import llama_client
 
@@ -136,7 +119,7 @@ async def test_server_persists_and_broadcasts_turn_model_attestation(
     conv = await db.create_conversation("Model identity", mode="claude")
     parent = await db.add_message(conv["id"], "user", "hello")
     draft = await db.add_message(
-        conv["id"], "assistant", "", parent_id=parent["id"]
+        conv["id"], "assistant", "draft", parent_id=parent["id"]
     )
     attestation = {
         "status": "verified",
@@ -159,6 +142,104 @@ async def test_server_persists_and_broadcasts_turn_model_attestation(
     assert sent[-1][1]["attestation"]["harness"] == "Claude Code"
 
 
+@pytest.mark.asyncio
+async def test_visible_attestation_includes_verified_destination_preparation(
+    tmp_database, monkeypatch
+):
+    import asyncio
+    import database as db
+    import server
+
+    async def fake_ws_send(*_args):
+        return None
+
+    monkeypatch.setattr(server, "_ws_send", fake_ws_send)
+    conv = await db.create_conversation("Preparation identity", mode="goose")
+    parent = await db.add_message(conv["id"], "user", "continue")
+    draft = await db.add_message(conv["id"], "assistant", "draft", parent_id=parent["id"])
+    task = asyncio.current_task()
+    old_trace = getattr(task, "_context_trace", None)
+    task._context_trace = {
+        "operation_id": "prep-1",
+        "preparation_calls": [{
+            "route": {"harness": "goose", "model": "glm-5.3-flash", "backend": "openrouter"},
+            "attested_model": "glm-5.3-flash",
+            "accepted": True,
+        }],
+    }
+    try:
+        recorded = await server._record_turn_model_attestation(
+            conv["id"], draft["id"], parent["id"], {
+                "status": "verified", "harness": "Goose ACP",
+                "requested_model": "glm-5.3-flash", "launch_model": "glm-5.3-flash",
+                "effective_model": "glm-5.3-flash", "source": "goose_acp_session_model_state",
+            }
+        )
+    finally:
+        if old_trace is None:
+            delattr(task, "_context_trace")
+        else:
+            task._context_trace = old_trace
+
+    assert recorded["status"] == "verified"
+    assert recorded["preparation"]["status"] == "verified"
+    assert recorded["preparation"]["calls"][0]["backend"] == "openrouter"
+
+
+def test_hidden_different_preparation_model_cannot_render_green():
+    import server
+
+    task = type("TaskEvidence", (), {})()
+    task._context_trace = {
+        "operation_id": "prep-local",
+        "preparation_calls": [{
+            "route": {"harness": "local", "model": "qwen-local", "backend": "llama"},
+            "attested_model": "qwen-local",
+            "accepted": True,
+        }],
+    }
+    result = server._attach_preparation_provenance({
+        "status": "verified", "harness": "Goose ACP",
+        "requested_model": "glm-5.3-flash", "launch_model": "glm-5.3-flash",
+        "effective_model": "glm-5.3-flash",
+    }, task=task)
+
+    assert result["status"] == "unverified"
+    assert result["preparation"]["calls"][0]["effective_model"] == "qwen-local"
+    assert "not verified as the selected destination model" in result["identity_warning"]
+
+
+def test_rejected_preparation_attempt_cannot_hide_behind_accepted_retry():
+    import server
+
+    task = type("TaskEvidence", (), {})()
+    task._context_trace = {
+        "operation_id": "prep-retry",
+        "preparation_calls": [{
+            "route": {"harness": "goose", "model": "glm-5.3-flash"},
+            "attested_model": "glm-5.3-flash", "accepted": True,
+        }],
+        "preparation_attempts": [
+            {
+                "route": {"harness": "local", "model": "qwen-local", "backend": "llama"},
+                "attested_model": "qwen-local", "accepted": False,
+            },
+            {
+                "route": {"harness": "goose", "model": "glm-5.3-flash"},
+                "attested_model": "glm-5.3-flash", "accepted": True,
+            },
+        ],
+    }
+    result = server._attach_preparation_provenance({
+        "status": "verified", "harness": "Goose ACP",
+        "requested_model": "glm-5.3-flash", "effective_model": "glm-5.3-flash",
+    }, task=task)
+
+    assert result["status"] == "unverified"
+    assert result["preparation"]["call_count"] == 2
+    assert result["preparation"]["calls"][0]["effective_model"] == "qwen-local"
+
+
 def test_model_attestation_ui_labels_harness_and_evidence_level():
     source = (Path(__file__).resolve().parent.parent / "static" / "chat.js").read_text(
         encoding="utf-8"
@@ -169,6 +250,8 @@ def test_model_attestation_ui_labels_harness_and_evidence_level():
     assert "['Verification', att.verification_level]" in source
     assert "${escapeHtml(harness)} · ${escapeHtml(model)}" in source
     assert "Goose process configuration" in source
+    assert "['Preparation', preparationLabel]" in source
+    assert "Preparation ${index + 1}" in source
 
 
 def test_legacy_codex_attestation_recovers_harness_from_evidence_source():
@@ -195,6 +278,16 @@ def test_legacy_codex_attestation_recovers_harness_from_evidence_source():
     assert "sourceDefaults?.[0] || _harnessLabelForModel(model)" in source
 
 
+def test_gpt6_is_recognized_as_codex_across_backend_and_frontend():
+    import server
+
+    assert server.is_codex_model("gpt-6-astra")
+    assert not server.is_codex_model("gpt-oss-120b")
+
+    from tests.js_model_registry import evaluate
+    assert evaluate("[_isCodexValue('gpt-6-astra'), _isCodexValue('gpt-oss-120b'), _agentKindForModel('gpt-6-astra', {mode:'goose'})]") == [True, False, "codex"]
+
+
 def test_streaming_draft_and_attestation_survive_live_repaints():
     source = (Path(__file__).resolve().parent.parent / "static" / "chat.js").read_text(
         encoding="utf-8"
@@ -204,8 +297,11 @@ def test_streaming_draft_and_attestation_survive_live_repaints():
     assert "_appendLiveDraftText(data.content)" in source
     assert "_appendLiveDraftThinking(data.content)" in source
     assert "_mergeLiveStreamDraftIntoState();" in source
-    assert "appendStreamingMessage(lastMsg.cc_model_used, lastMsg.model_attestation, lastMsg.id)" in source
+    assert "streamingMsg.session_continuity" in source
     assert "draft.model_attestation = JSON.stringify(attestation)" in source
+    assert "['Session continuity', continuityLabel]" in source
+    assert "continuityReason === 'provider_boundary' ? 'harness handoff'" in source
+    assert "continuityReason === 'model_boundary' ? 'model handoff'" in source
 
 
 def test_all_generation_families_persist_model_attestations():
@@ -213,6 +309,9 @@ def test_all_generation_families_persist_model_attestations():
         encoding="utf-8"
     )
 
-    # Shared Claude/Codex/Antigravity path, Goose, three Hermes-class paths,
-    # OODA sync (including repair), and direct Weave streaming.
-    assert source.count("_record_turn_model_attestation(") >= 9
+    import inspect
+    import server
+    # Check each remaining implementation, not a count inflated by retired handlers.
+    for name in ("_handle_claude_generation", "_handle_goose_generation",
+                 "_handle_ooda_generation", "_handle_weave_generation"):
+        assert "_record_turn_model_attestation(" in inspect.getsource(getattr(server, name)), name

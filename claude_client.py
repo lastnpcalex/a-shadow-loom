@@ -23,6 +23,10 @@ _AUTO_CONTINUE_PROMPT = (
     "Do not restate context, apologize, or repeat what you already wrote — "
     "just resume the next token."
 )
+# Claude Code kills its PreToolUse hook after this long and treats that as a
+# refusal. 24 h like agy: a session may wait for the user to come back.
+# server.py ends Loom's wait for claude_code approvals just before it.
+PERMISSION_HOOK_TIMEOUT_SECONDS = 24 * 60 * 60
 
 
 def _usage_int(value, default: int = 0) -> int:
@@ -105,7 +109,7 @@ class _CCHandle:
     a max_tokens stop, we swap the underlying proc and `.kill()` / `.pid`
     keep targeting whichever subprocess is currently streaming."""
 
-    __slots__ = ("_proc", "_cancelled")
+    __slots__ = ("_proc", "_cancelled", "_loom_context_guard")
 
     def __init__(self, proc):
         self._proc = proc
@@ -113,6 +117,7 @@ class _CCHandle:
         # path checks this after spawning a new proc so a cancel that lands
         # during the spawn await doesn't orphan the just-started subprocess.
         self._cancelled = False
+        self._loom_context_guard = None
 
     def _swap(self, new_proc) -> bool:
         """Adopt new_proc as the active subprocess. Returns False (and kills
@@ -627,6 +632,7 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
             "result_text": raw.get("result", ""),
             "session_id": raw.get("session_id", ""),
             "is_error": raw.get("is_error", False),
+            "error": raw.get("error") or raw.get("errors") or "",
         })
 
     elif etype == "rate_limit_event":
@@ -671,12 +677,12 @@ def _configure_permission_hook(cwd: str) -> bool:
 
     # Use PreToolUse (not PermissionRequest — that doesn't fire in -p mode)
     # Matcher ".*" catches all tools; nested hooks array is required.
-    # timeout: 900s (15 min). Without this field, CC applies its ~60s default
-    # hook-execution timeout — the hook is killed mid-wait, CC treats the
-    # killed hook as a refusal, and the agent sees "permission not granted"
-    # ~60s after a tool call if the user hasn't approved yet. agy/Codex set
-    # this explicitly (24h/15min); CC must too. Loom's server-side wait is 24h,
-    # so 15min here is the binding constraint for CC sessions.
+    # timeout: PERMISSION_HOOK_TIMEOUT_SECONDS (24 h, matching agy). Without
+    # this field, CC applies its ~60s default hook-execution timeout — the hook
+    # is killed mid-wait, CC treats the killed hook as a refusal, and the agent
+    # sees "permission not granted" ~60s after a tool call if the user hasn't
+    # approved yet. A session may stall until the user returns; that is
+    # intended. Loom's server-side wait ends just before this limit.
     new_config = {
         "hooks": {
             "PreToolUse": [
@@ -686,7 +692,7 @@ def _configure_permission_hook(cwd: str) -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
-                            "timeout": 900,
+                            "timeout": PERMISSION_HOOK_TIMEOUT_SECONDS,
                         }
                     ]
                 }
@@ -730,7 +736,7 @@ def _configure_permission_hook(cwd: str) -> bool:
 def _loom_append_system_prompt(
     append_system_prompt: str | None,
     backstage_parent_id: int | None = None,
-    nrol_operator: bool = False,
+    
     use_llama: bool = False,
     use_umans: bool = False,
     use_dream: bool = False,
@@ -742,7 +748,7 @@ def _loom_append_system_prompt(
     Injects the operating-model identity so the agent can tailor behavior to
     its backend (scoped reads on local models; caching active on API/Umans).
     """
-    if backstage_parent_id or nrol_operator:
+    if backstage_parent_id:
         return append_system_prompt
     contract = load_loom_agent_prompt()
     if cc_model:
@@ -792,12 +798,15 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      use_dream: bool = False,
                      use_openrouter: bool = False,
                      backstage_parent_id: int | None = None,
-                     nrol_operator: bool = False,
+                     
                      extra_mcp_servers: dict | None = None,
                      extra_disallowed_tools: list[str] | None = None,
                      append_system_prompt: str | None = None,
                      extra_env: dict | None = None,
-                     requested_model: str | None = None):
+                     requested_model: str | None = None,
+                     permission_scope: str = "",
+                     context_replay_history: str = "",
+                     preparation: bool = False):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
@@ -817,7 +826,12 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     """
     # Configure the permission hook in the project directory (idempotent, skips if already set)
     # Skip on resume since the original session already configured the hook
-    _configure_permission_hook(cwd) if not resume_session_id else None
+    # Preparation runs are tool-free: no project hook, no MCP, no Loom prompt.
+    # LOOM_PREPARATION is set ONLY in the preparation child's environment
+    # (see the env block below) — never in os.environ, which would contaminate
+    # every later ordinary launch in this server process.
+    if not preparation:
+        _configure_permission_hook(cwd) if not resume_session_id else None
 
     # Build the Claude Code arguments
     disallowed_list = ["AskUserQuestion"]
@@ -830,16 +844,10 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Bash", "Glob", "Grep", "Agent",
             "WebSearch", "WebFetch",
         ]
-    # NROL operator role: perception and typed proposals only. File/shell/
-    # subagent tools are stripped so the only mutation surface is the nrol-ao
     # MCP server (whose commits are fail-closed behind Loom approval).
     # Read/Glob/Grep/Web* stay — the operator reads sources, it just can't
     # write anything except through typed transitions.
-    if nrol_operator:
-        disallowed_list += [
-            "Write", "Edit", "NotebookEdit", "Bash",
-            "Agent", "Task", "KillShell", "SlashCommand",
-        ]
+    pass
     # Llama/local/umans/dream/openrouter models: block built-in WebSearch/WebFetch
     # (require Anthropic API). The MCP web-tools server provides replacement
     # search/fetch for these routed backends.
@@ -865,7 +873,19 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Inline JSON config — no temp file needed. The subprocess receives
     # LOOM_API_URL / LOOM_BACKSTAGE_PARENT_ID via the server entry's env.
     mcp_servers: dict = {}
-    if backstage_parent_id:
+    if preparation:
+        # Tool-free preparation: never attach any MCP server, never read any
+        # project/user-scope MCP configuration, and deny every builtin tool.
+        mcp_servers.clear()
+        disallowed_list = sorted(set(disallowed_list) | {
+            "Read", "Write", "Edit", "NotebookEdit", "Bash", "PowerShell",
+            "Glob", "Grep", "Agent", "Task", "KillShell", "SlashCommand",
+            "WebSearch", "WebFetch", "AskUserQuestion", "apply_patch",
+            "TodoWrite", "ExitPlanMode", "ListMcpResources", "ReadMcpResource",
+        })
+        cc_args.append("--strict-mcp-config")
+        cc_args.extend(["--mcp-config", json.dumps({"mcpServers": {}})])
+    elif backstage_parent_id:
         mcp_script = str(Path(__file__).parent / "mcp_state_cards.py")
         mcp_servers["loom-state-cards"] = {
             "type": "stdio",
@@ -893,84 +913,85 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 "command": sys.executable,
                 "args": [str(web_tools_script)],
             }
+
+    # Every ordinary Loom agent receives the same portable child-run control
+    if not backstage_parent_id:
+        from codex_client import _agent_control_mcp_config
+        task = asyncio.current_task()
+        gen_key_for_mcp = getattr(task, "_gen_key", None)
+        run_id_for_mcp = permission_scope or (
+            f"gen:{gen_key_for_mcp[2]}" if gen_key_for_mcp else None
+        )
+        parent_run_for_mcp = getattr(task, "_parent_run_id", None) or run_id_for_mcp
+        control = _agent_control_mcp_config(
+            conv_id,
+            server_port,
+            agent_run_id=run_id_for_mcp,
+            parent_run_id=parent_run_for_mcp,
+            client_instance_id=getattr(task, "_client_instance_id", None),
+            workspace_root=cwd,
+            local_search=bool(use_llama or use_dream),
+        )
+        if control:
+            mcp_servers["loom-agent-control"] = {
+                "type": "stdio",
+                **control,
+            }
         workspace_script = Path(__file__).parent / "mcp_loom_workspace.py"
         if workspace_script.is_file():
+            workspace_env = {
+                "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
+                "LOOM_PORT": str(server_port),
+                "LOOM_CONV_ID": str(conv_id),
+                "LOOM_WORKSPACE_ROOT": cwd,
+            }
+            if run_id_for_mcp:
+                workspace_env["LOOM_PERMISSION_SCOPE"] = str(run_id_for_mcp)
+                if str(run_id_for_mcp).startswith("agent:"):
+                    workspace_env["LOOM_AGENT_RUN_ID"] = str(run_id_for_mcp).split(":", 1)[1]
+            if parent_run_for_mcp:
+                workspace_env["LOOM_PARENT_RUN_ID"] = str(parent_run_for_mcp)
+            client_id_for_mcp = getattr(task, "_client_instance_id", None)
+            if client_id_for_mcp:
+                workspace_env["LOOM_CLIENT_INSTANCE_ID"] = str(client_id_for_mcp)
             mcp_servers["loom-workspace"] = {
                 "type": "stdio",
                 "command": sys.executable,
                 "args": [str(workspace_script)],
-                "env": {
-                    "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
-                    "LOOM_PORT": str(server_port),
-                    "LOOM_CONV_ID": str(conv_id),
-                    "LOOM_WORKSPACE_ROOT": cwd,
-                }
+                "env": workspace_env,
             }
 
-    # NROL-AO: make the engine MCP available to ordinary Loom-launched CC
-    # sessions, not just the admin scan worker. User-scope `claude mcp add`
-    # still works for external Claude Code sessions; this inline config keeps
-    # Loom self-contained.
-    if nrol_operator or os.environ.get("NROL_AO_AUTO_MCP", "1") not in {"0", "false", "False"}:
-        nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
-        nrol_server = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "server.py"
-        if nrol_repo.exists() and nrol_server.is_file() and "nrol-ao" not in mcp_servers:
-            nrol_env = {
-                "NROL_AO_REPO": str(nrol_repo),
-                **(
-                    {"NROL_AO_STATE_DIR": os.environ["NROL_AO_STATE_DIR"]}
-                    if os.environ.get("NROL_AO_STATE_DIR", "").strip()
-                    else {}
-                ),
-                "NROL_AO_ACTIVITY_DIR": os.environ.get(
-                    "NROL_AO_ACTIVITY_DIR",
-                    str(nrol_repo / "loom" / "mcp_activity"),
-                ),
-                "ALPHA_OMEGA_PORT": os.environ.get("ALPHA_OMEGA_PORT", "8098"),
-                "LOOM_PORT": str(server_port),
-                "LOOM_CONV_ID": str(conv_id),
-                "PYTHONPATH": str(Path(__file__).parent)
-                + os.pathsep
-                + os.environ.get("PYTHONPATH", ""),
-            }
-            try:
-                from config import config as _loom_config
-                nrol_env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
-                if getattr(_loom_config, "llama_model", ""):
-                    nrol_env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
-            except Exception:
-                pass
-            mcp_servers["nrol-ao"] = {
-                "type": "stdio",
-                "command": sys.executable,
-                "args": ["-m", "mcp_servers.nrol_ao.server"],
-                "env": nrol_env,
-            }
+    # launch, matching Codex, agy and Goose (all harnesses see the same tools).
+    pass
 
-    if extra_mcp_servers:
+    if extra_mcp_servers and not preparation:
         mcp_servers.update(extra_mcp_servers)
-    if nrol_operator:
-        # Only the inline-configured servers (nrol-ao, web-tools for llama)
-        # load — user/project-scope MCP servers are ignored so the operator
-        # can't reach unrelated tool surfaces.
-        cc_args.append("--strict-mcp-config")
-        operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
-        if operator_md.exists():
-            cc_args.extend(["--append-system-prompt", operator_md.read_text(encoding="utf-8")])
+    pass
     if mcp_servers:
         cc_args.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
-    append_system_prompt = _loom_append_system_prompt(
-        append_system_prompt,
-        backstage_parent_id=backstage_parent_id,
-        nrol_operator=nrol_operator,
-        use_llama=use_llama,
-        use_umans=use_umans,
-        use_dream=use_dream,
-        use_openrouter=use_openrouter,
-        cc_model=model,
-    )
+    if preparation:
+        append_system_prompt = None
+    else:
+        append_system_prompt = _loom_append_system_prompt(
+            append_system_prompt,
+            backstage_parent_id=backstage_parent_id,
+            
+            use_llama=use_llama,
+            use_umans=use_umans,
+            use_dream=use_dream,
+            use_openrouter=use_openrouter,
+            cc_model=model,
+        )
     if append_system_prompt:
         cc_args.extend(["--append-system-prompt", append_system_prompt])
+
+    if not preparation and (not backstage_parent_id) and (not use_llama):
+        from replay_budget import check_fresh_payload
+        await check_fresh_payload(
+            prompt, model=model, harness="claude", resume_session_id=resume_session_id,
+            instructions=append_system_prompt or "",
+            backend=("llama" if use_llama else "dream" if use_dream else "openrouter" if use_openrouter else None),
+        )
 
     # Always launch plain claude — use_llama overrides via env vars below.
     cc_args.extend(["--model", model, "--effort", effort])
@@ -989,13 +1010,27 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
     gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-    if gen_key:
+    if permission_scope:
+        env["LOOM_PERMISSION_SCOPE"] = str(permission_scope)
+    elif gen_key:
         env["LOOM_PERMISSION_SCOPE"] = f"gen:{gen_key[2]}"
-    if nrol_operator:
-        env["LOOM_NROL_OPERATOR"] = "1"
+    if preparation:
+        # Child-scoped preparation lockdown; see the top of run_claude.
+        env["LOOM_PREPARATION"] = "1"
+    else:
+        # An ordinary launch must never inherit a preparation lockdown, even
+        # if the server process environment was contaminated externally.
+        env.pop("LOOM_PREPARATION", None)
+    pass
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)
+    client_instance_id = getattr(asyncio.current_task(), "_client_instance_id", None)
+    if client_instance_id:
+        env["LOOM_CLIENT_INSTANCE_ID"] = str(client_instance_id)
+    parent_run_id = getattr(asyncio.current_task(), "_parent_run_id", None)
+    if parent_run_id:
+        env["LOOM_PARENT_RUN_ID"] = str(parent_run_id)
     env["BASH_DEFAULT_TIMEOUT_MS"] = "1200000"  # 20 minutes (default is 2m)
     env["BASH_MAX_TIMEOUT_MS"] = "3600000"      # 60 minutes (default is 10m)
     if extra_env:
@@ -1156,9 +1191,26 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 
-    proc = await _spawn_cc(cmd, prompt, use_stdin)
+    context_guard = None
+    if use_llama:
+        from local_context_guard import LocalContextGuard
+        context_guard = LocalContextGuard(env["ANTHROPIC_BASE_URL"], replay_history=context_replay_history)
+        try:
+            env["ANTHROPIC_BASE_URL"] = await context_guard.start()
+            env["ANTHROPIC_API_KEY"] = context_guard.secret
+            env["ANTHROPIC_AUTH_TOKEN"] = context_guard.secret
+        except BaseException:
+            await context_guard.close()
+            raise
+    try:
+        proc = await _spawn_cc(cmd, prompt, use_stdin)
+    except BaseException:
+        if context_guard:
+            await context_guard.close()
+        raise
     print(f"[CC] Process started, pid={proc.pid}")
     handle = _CCHandle(proc)
+    handle._loom_context_guard = context_guard
 
     async def _event_stream():
         # Per-stream state carried across _process_event calls — content_block
@@ -1223,6 +1275,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                         cum_duration_ms += int(evt.get("duration_ms") or 0)
                         cum_turns += int(evt.get("num_turns") or 0)
                         merged = dict(evt)
+                        merged["terminal_confirmed"] = True
                         merged["cost_usd"] = cum_cost_usd
                         merged["duration_ms"] = cum_duration_ms
                         merged["num_turns"] = cum_turns
@@ -1298,11 +1351,15 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if pending_result is not None:
             yield pending_result
 
-    return handle, _event_stream()
+    stream = _event_stream()
+    return handle, context_guard.wrap_stream(stream) if context_guard else stream
 
 
 async def cancel_claude(proc):
     """Kill a running Claude Code subprocess and its process tree."""
+    guard = getattr(proc, "_loom_context_guard", None)
+    if guard:
+        await guard.close()
     if proc.returncode is None:
         import sys
         if sys.platform == 'win32':

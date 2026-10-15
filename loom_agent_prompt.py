@@ -18,15 +18,25 @@ def merge_system_prompts(*parts: str | None) -> str:
     return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
 
-def prepend_loom_agent_context(prompt: str, provider: str) -> str:
-    """Inject the Loom contract into prompt-only harnesses without repo files."""
+def loom_agent_contract_block(provider: str) -> str:
+    """Render the shared contract without turning it into a user message."""
     contract = load_loom_agent_prompt()
     if not contract:
+        return ""
+    return (
+        f'<loom_agent_contract provider="{provider}">\n'
+        f"{contract}\n"
+        f"</loom_agent_contract>"
+    )
+
+
+def prepend_loom_agent_context(prompt: str, provider: str) -> str:
+    """Inject the Loom contract on a prompt-only harness's first native turn."""
+    contract_block = loom_agent_contract_block(provider)
+    if not contract_block:
         return prompt
     return (
-        f"<loom_agent_contract provider=\"{provider}\">\n"
-        f"{contract}\n"
-        f"</loom_agent_contract>\n\n"
+        f"{contract_block}\n\n"
         f"<user_task>\n"
         f"{prompt}\n"
         f"</user_task>"

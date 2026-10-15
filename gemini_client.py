@@ -15,6 +15,8 @@ import logging
 import os
 import re
 import sys
+import time
+import uuid
 from pathlib import Path
 
 from loom_agent_prompt import prepend_loom_agent_context
@@ -24,7 +26,18 @@ log = logging.getLogger(__name__)
 # Use the standard Loom blocking hook
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
-_active_queues: dict[int, asyncio.Queue] = {}
+# Queues are keyed by the exact conversation/run scope.  The old conversation
+# only key made a second Antigravity turn overwrite the first turn's tool
+# notifications, which then looked like stream hijacking in the browser.
+_active_queues: dict[str | int, asyncio.Queue] = {}
+
+
+def active_queue(conv_id: int, permission_scope: str | None = None):
+    """Return the queue for one exact run, with a legacy single-run fallback."""
+    scope = str(permission_scope or "").strip()
+    if scope:
+        return _active_queues.get(f"{int(conv_id)}:{scope}")
+    return _active_queues.get(int(conv_id))
 
 
 def _agy_home() -> Path:
@@ -111,29 +124,106 @@ def _scan_agy_log_for_error(since_ts: float) -> str | None:
     return None
 
 
-def _is_agy_alive(launch_ts: float) -> bool:
-    """Check if agy is alive by watching its CLI log mtime.
+# Liveness watchdog tuning. agy only writes a log line when a model call
+# returns or a tool hook runs, so a quiet log alone does NOT mean agy is dead:
+# a long thinking/final-answer generation is silent on both the log and
+# stream-json stdout. Only a quiet log whose tail shows agy's own teardown
+# (the planner-loop zombie: stream stopped, OS process never exits) is treated
+# as dead quickly; any other silence gets the much longer hard ceiling.
+_AGY_HEARTBEAT_POLLS = 30          # empty ~1.5s stdout polls between checks
+_AGY_LOG_FRESH_S = 45.0            # log touched this recently => working
+_AGY_ZOMBIE_QUIET_S = 60.0         # quiet after teardown markers => zombie
+_AGY_QUIET_CEILING_S = 20 * 60.0   # quiet without teardown => hung model call
+_AGY_SHUTDOWN_MARKERS = (
+    "Stopping conversation stream",
+    "Language server shutting down",
+    "CLI store manager shutting down",
+)
+_AGY_LOG_TAIL_BYTES = 64 * 1024
 
-    agy writes to its log for every API call (streamGenerateContent, etc).
-    A recent mtime means agy is actively processing, even if the transcript
-    hasn't flushed yet.
+
+def _agy_run_log(launch_ts: float) -> Path | None:
+    """Return the agy cli log belonging to the run launched at `launch_ts`.
+
+    agy names its log after its start second, so the run's own log is the one
+    whose filename timestamp is closest to launch. Picking the newest mtime
+    instead lets a concurrent sibling run's log stand in for this one.
+    """
+    log_dir = _agy_home() / "log"
+    if not log_dir.exists():
+        return None
+    try:
+        candidates = []
+        for p in log_dir.glob("cli-*.log"):
+            filename_ts = _parse_agy_log_filename_ts(p.name)
+            if filename_ts is not None and abs(filename_ts - launch_ts) <= 30.0:
+                candidates.append((abs(filename_ts - launch_ts), -p.stat().st_mtime, p))
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: (c[0], c[1]))[2]
+
+
+def _agy_log_state(launch_ts: float) -> dict:
+    """Describe the run's agy log: freshness, seconds quiet, teardown seen.
+
+    `quiet_s` is None when no log exists yet. `shutdown` is True when the log
+    tail contains agy's own stream-teardown lines.
     """
     import time as _time
 
-    log_dir = _agy_home() / "log"
-    if not log_dir.exists():
-        return False
+    state = {"fresh": False, "quiet_s": None, "shutdown": False}
+    log_path = _agy_run_log(launch_ts)
+    if log_path is None:
+        return state
     try:
-        candidates = [p for p in log_dir.glob("cli-*.log")
-                       if _parse_agy_log_filename_ts(p.name) is not None
-                       and abs(_parse_agy_log_filename_ts(p.name) - launch_ts) <= 30.0]
-        if not candidates:
-            return False
-        latest = max(candidates, key=lambda p: p.stat().st_mtime)
-        mtime = latest.stat().st_mtime
-        return (_time.time() - mtime) < 45.0  # alive if log touched within last 45s
-    except (OSError, ValueError):
-        return False
+        size = log_path.stat().st_size
+        quiet_s = max(0.0, _time.time() - log_path.stat().st_mtime)
+        with log_path.open("rb") as fh:
+            fh.seek(max(0, size - _AGY_LOG_TAIL_BYTES))
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return state
+    state["quiet_s"] = quiet_s
+    state["fresh"] = quiet_s < _AGY_LOG_FRESH_S
+    state["shutdown"] = any(marker in tail for marker in _AGY_SHUTDOWN_MARKERS)
+    return state
+
+
+async def _stop_agy_process(proc, grace: float = 0.0) -> None:
+    """Stop agy and its child tree after an optional grace period.
+
+    proc.kill() alone leaves agy's language-server children running on
+    Windows, so kill the whole tree there.
+    """
+    if grace > 0 and proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            pass
+    if proc.returncode is not None:
+        return
+    pid = getattr(proc, "pid", None)
+    if sys.platform == "win32" and isinstance(pid, int):
+        import subprocess
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            log.warning(f"[AGY] taskkill /T failed for pid {pid}: {e}")
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("[AGY] process did not report exit after kill")
 
 
 def _find_agy_exe() -> str:
@@ -164,6 +254,10 @@ def _loom_model_to_agy(model: str, effort: str) -> str:
     ml = raw.lower()
 
     # Discovered values are exact agy selectors, including their effort tier.
+    if re.fullmatch(r"(?:claude|gpt)-[a-z0-9.-]+", raw) and raw not in {
+        "claude-sonnet", "claude-opus", "gpt-oss", "gpt-oss-120b",
+    }:
+        return raw
     if re.fullmatch(r"gemini-\d+(?:\.\d+)+-(?:flash|pro)(?:-(?:low|medium|high))?", ml):
         return raw
 
@@ -172,12 +266,103 @@ def _loom_model_to_agy(model: str, effort: str) -> str:
         encoded_effort = _agy_effort_for_model(raw, effort)
         return f"gemini-{legacy_gemini.group(1)}-{legacy_gemini.group(2)}-{encoded_effort}"
     if "sonnet" in ml:
-        return "claude-sonnet"
+        if "4-6" in ml or "4.6" in ml or ml in {"claude-sonnet", "sonnet"}:
+            return "claude-sonnet-4-6"
+        return raw
     if "opus" in ml:
-        return "claude-opus"
+        if "4-6" in ml or "4.6" in ml or ml in {"claude-opus", "opus"}:
+            return "claude-opus-4-6-thinking"
+        return raw
     if "gpt-oss" in ml:
-        return "gpt-oss-120b"
+        if "120b" in ml or ml in {"gpt-oss", "gpt-oss-120b"}:
+            return "gpt-oss-120b-medium"
+        return raw
     return raw
+
+
+def agy_models_cache_path() -> Path:
+    """Loom-owned discovery cache, separate from the Gemini CLI's cache."""
+    from exo_state import state_path
+    return state_path("model-discovery", "agy.json")
+
+
+def _agy_model_rows(items) -> list[dict]:
+    """Validate discovery/cache rows and keep labels stable across reloads."""
+    models = []
+    seen = set()
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        slug, label = item.get("slug"), item.get("display_name")
+        if not isinstance(slug, str) or not isinstance(label, str):
+            continue
+        slug, label = slug.strip(), label.strip()
+        if not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)+", slug) or not label or slug in seen:
+            continue
+        seen.add(slug)
+        models.append({"value": f"gemini:{slug}", "label": label})
+    return models
+
+
+def discover_agy_models() -> list[dict]:
+    """Query `agy models` CLI and return available models as dropdown items."""
+    agy_exe = _find_agy_exe()
+    try:
+        import subprocess
+        res = subprocess.run(
+            [agy_exe, "models"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout:
+            return []
+
+        cache_items = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "\t" in line:
+                slug, display_name = line.split("\t", 1)
+            else:
+                m = re.match(r"^([a-z0-9.-]+)\s+\((.+)\)$", line) or re.match(r"^([a-z0-9.-]+)\s+(.+)$", line)
+                if m:
+                    slug, display_name = m.group(1), m.group(2)
+                else:
+                    continue
+            slug = slug.strip()
+            display_name = display_name.strip()
+            cache_items.append({
+                "slug": slug,
+                "display_name": display_name,
+            })
+
+        models = _agy_model_rows(cache_items)
+        if models:
+            try:
+                import tempfile
+                cache_path = agy_models_cache_path()
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_items = [{"slug": row["value"][7:], "display_name": row["label"]} for row in models]
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_path.parent,
+                                                     suffix=".tmp", delete=False) as output:
+                        temporary = Path(output.name)
+                        json.dump({"models": cache_items}, output, indent=2)
+                    temporary.replace(cache_path)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            except Exception as ce:
+                log.debug(f"[AGY] Failed to write models_cache.json: {ce}")
+
+        return models
+    except Exception as e:
+        log.warning(f"[AGY] Failed to discover models via agy CLI: {e}")
+        return []
 
 
 def _agy_model_provider(model: str) -> str:
@@ -239,45 +424,82 @@ def _set_agy_model(agy_model_id: str):
             log.error(f"[AGY] Failed to write model to settings.json: {e}")
 
 
-def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None, server_port: int = 8000):
+def _agy_hook_command(event: str) -> str:
+    if event not in {"PreToolUse", "PostToolUse"}:
+        raise ValueError("Unsupported Loom hook event")
+    if sys.platform == "win32":
+        import base64
+        # agy's Go cmd /c launcher escapes embedded quotes as literal \".
+        # Keep its command line quote-free; encode only our fixed hook entry
+        # point (never model input). The JSON request still travels on stdin.
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        script = f"& {quote(sys.executable)} {quote(_HOOK_SCRIPT)} --event {event}; exit $LASTEXITCODE"
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
+    return f'"{sys.executable}" "{_HOOK_SCRIPT}" --event {event}'
+
+
+def _configure_permission_hook(
+    cwd: str,
+    backstage_parent_id: int | None = None,
+    server_port: int = 8000,
+    *,
+    conv_id: int = 0,
+    agent_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    client_instance_id: str | None = None,
+    history_token: str | None = None,
+):
     """Configure hooks.json + trust entry so Antigravity CLI calls our permission hook."""
     agents_dir = Path(cwd) / ".agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
 
     python_exe = sys.executable
     hook_path = _HOOK_SCRIPT
-    if sys.platform == "win32":
-        pre_hook_command = f'& "{python_exe}" "{hook_path}" --event PreToolUse'
-        post_hook_command = f'& "{python_exe}" "{hook_path}" --event PostToolUse'
-    else:
-        pre_hook_command = f'"{python_exe}" "{hook_path}" --event PreToolUse'
-        post_hook_command = f'"{python_exe}" "{hook_path}" --event PostToolUse'
+    pre_hook_command = _agy_hook_command("PreToolUse")
+    post_hook_command = _agy_hook_command("PostToolUse")
 
     # PreToolUse: 24 hours — longer than Loom server-side _PERM_TOTAL_DEADLINE
     # so the server can send its deny/allow before the hook times out.
     # User can disconnect, come back, reattach the WS, and approve the hook.
     hooks_def = {
-        "PreToolUse": {
+        "PreToolUse": [{
             "matcher": "*",
             "hooks": [{
                 "type": "command",
                 "command": pre_hook_command,
-                "timeout": 86400000,
+                "timeout": 86400,
             }]
-        },
-        "PostToolUse": {
+        }],
+        "PostToolUse": [{
             "matcher": "*",
             "hooks": [{
                 "type": "command",
                 "command": post_hook_command,
-                "timeout": 90000,
+                "timeout": 90,
             }]
-        }
+        }]
     }
 
-    hooks_path = agents_dir / "hooks.json"
-    hooks_path.write_text(json.dumps(hooks_def, indent=2), encoding="utf-8")
-    log.info(f"[AGY] Hooks configured: {hooks_path}")
+    # Named hooks + event arrays are the current agy schema. Merge only our
+    # entry; never replace unrelated project hooks with Loom's configuration.
+    for target in {Path(cwd), _agy_workspace_root(Path(cwd))}:
+        hooks_path = target / ".agents" / "hooks.json"
+        existing = json.loads(hooks_path.read_text(encoding="utf-8")) if hooks_path.exists() else {}
+        if not isinstance(existing, dict):
+            raise ValueError("Antigravity hooks.json must be an object; refusing to overwrite it")
+        for event, command, old_timeout in (("PreToolUse", pre_hook_command, 86400000),
+                                             ("PostToolUse", post_hook_command, 90000)):
+            # Migrate only the exact obsolete entry Loom itself wrote.
+            legacy_command = f'"{python_exe}" "{hook_path}" --event {event}'
+            for old_command in (legacy_command, "& " + legacy_command):
+                if existing.get(event) == {"matcher": "*", "hooks": [
+                        {"type": "command", "command": old_command, "timeout": old_timeout}]}:
+                    del existing[event]
+        existing["loom-permissions"] = hooks_def
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        hooks_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        log.info(f"[AGY] Hooks configured: {hooks_path}")
 
     if backstage_parent_id:
         _certs_dir = Path(__file__).parent / "certs"
@@ -303,12 +525,23 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         # file breaks agy's project discovery (falls back to default-cli-project
         # with no MCP tools). Instead of deleting, write an empty config so the
         # directory stays discoverable but registers no servers.
+        from codex_client import _agent_control_mcp_config
+        control = _agent_control_mcp_config(
+            conv_id,
+            server_port,
+            agent_run_id=agent_run_id,
+            parent_run_id=parent_run_id,
+            client_instance_id=client_instance_id,
+            workspace_root=cwd,
+            history_token=history_token,
+        )
+        mcp_payload = {"mcpServers": {"loom-agent-control": control}} if control else {"mcpServers": {}}
         agy_root = _agy_workspace_root(Path(cwd))
         for target in (Path(cwd), agy_root):
-            stale = target / ".agents" / "mcp_config.json"
-            if stale.exists():
-                stale.write_text(json.dumps({"mcpServers": {}}, indent=2), encoding="utf-8")
-                log.info(f"[AGY] Cleared stale mcp_config.json: {stale}")
+            config_path = target / ".agents" / "mcp_config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(mcp_payload, indent=2), encoding="utf-8")
+            log.info(f"[AGY] Configured MCP surface: {config_path}")
 
     _ensure_hook_trusted(cwd, pre_hook_command)
     _ensure_hook_trusted(cwd, post_hook_command)
@@ -337,6 +570,52 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         trusted_path.parent.mkdir(parents=True, exist_ok=True)
         trusted_path.write_text(json.dumps(trusted, indent=2), encoding="utf-8")
         log.info(f"[AGY] Hook trusted for {norm_cwd}")
+
+
+_STALE_PROMPT_SECONDS = 24 * 60 * 60
+
+# One lock per agy workspace root. agy reads .agents/hooks.json and
+# mcp_config.json at startup, and those files carry the launching run's
+# identity; two runs in one workspace must not rewrite them in between.
+_AGY_CONFIG_LOCKS: dict[str, asyncio.Lock] = {}
+# Upper bound on how long a launch holds the lock waiting for agy's first
+# output (by then it has loaded its config).
+_AGY_CONFIG_SETTLE_SECONDS = 30.0
+
+
+async def _acquire_workspace_config_lock(cwd: str) -> asyncio.Lock:
+    key = os.path.normcase(str(_agy_workspace_root(Path(cwd)).resolve()))
+    lock = _AGY_CONFIG_LOCKS.setdefault(key, asyncio.Lock())
+    await lock.acquire()
+    return lock
+
+
+async def _release_config_lock_when_loaded(lock: asyncio.Lock, first_output: asyncio.Event,
+                                           proc) -> None:
+    """Release once agy has produced output or exited, or after the settle cap."""
+    waiters = [asyncio.create_task(first_output.wait()), asyncio.create_task(proc.wait())]
+    try:
+        await asyncio.wait(waiters, timeout=_AGY_CONFIG_SETTLE_SECONDS,
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        lock.release()
+
+
+def _sweep_stale_prompt_files(agents_dir: Path, now: float | None = None) -> None:
+    """Delete prompt files left by killed or crashed launches.
+
+    Only files older than a day go, so a long-running turn's file is never
+    removed from under it.
+    """
+    cutoff = (time.time() if now is None else now) - _STALE_PROMPT_SECONDS
+    for stale in agents_dir.glob("loom_prompt_*.md"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _agy_workspace_root(cwd: Path) -> Path:
@@ -377,57 +656,16 @@ def _get_agy_project_id(workspace: Path) -> str | None:
         return None
 
 
-def _configure_operator(cwd: str, conv_id: int, server_port: int):
-    """NROL operator lockdown for agy: role instructions + strict MCP surface.
-
-    Tool blocking itself is the permission hook's NROL deny-list, keyed on
-    LOOM_NROL_OPERATOR (set in run_gemini): the installed agy CLI exposes no
-    excludeTools/coreTools settings surface (verified 2026-06-11), so unlike
-    claude there is no true tool removal — write/shell attempts are denied by
-    the PreToolUse hook without a prompt. See ROADMAP.md "Multi-provider
-    operator parity".
-    """
-    workspace = Path(cwd)
-    agy_root = _agy_workspace_root(workspace)
-
-    # agy auto-loads GEMINI.md and `.agents/mcp_config.json` from the
-    # workspace root it discovers (walking up to `.git`), not from cwd. Write
-    # to BOTH so we don't depend on whether the operator workspace happens to
-    # be the repo root or a subdirectory under it.
-    operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
-    if operator_md.is_file():
-        operator_md_text = operator_md.read_text(encoding="utf-8")
-        (workspace / "GEMINI.md").write_text(operator_md_text, encoding="utf-8")
-        if agy_root != workspace:
-            (agy_root / "GEMINI.md").write_text(operator_md_text, encoding="utf-8")
-
-    # Strict MCP surface: exactly nrol-ao + web-tools. Reuse codex_client's
-    # builders, stripped to the keys agy's mcp_config.json understands.
-    from codex_client import _nrol_mcp_config, _web_tools_mcp_config
-
-    mcp_servers = {}
-    nrol_cfg = _nrol_mcp_config(conv_id, server_port, force=True)
-    if nrol_cfg:
-        mcp_servers["nrol-ao"] = {k: nrol_cfg[k] for k in ("command", "args", "env")}
-    web_cfg = _web_tools_mcp_config()
-    if web_cfg:
-        mcp_servers["web-tools"] = {k: web_cfg[k] for k in ("command", "args")}
-
-    mcp_json = json.dumps({"mcpServers": mcp_servers}, indent=2)
-    for target in {workspace, agy_root}:
-        agents_dir = target / ".agents"
-        agents_dir.mkdir(parents=True, exist_ok=True)
-        (agents_dir / "mcp_config.json").write_text(mcp_json, encoding="utf-8")
-        log.info(f"[AGY] NROL operator MCP surface configured: {agents_dir / 'mcp_config.json'}")
 
 
 def _prepare_agy_prompt(
     prompt: str,
     backstage_parent_id: int | None = None,
-    nrol_operator: bool = False,
+    
+    is_first_turn: bool = True,
 ) -> str:
-    """Inject the Loom contract for ordinary agy sessions."""
-    if backstage_parent_id or nrol_operator:
+    """Inject Loom only when opening a fresh native agy conversation."""
+    if backstage_parent_id or not is_first_turn:
         return prompt
     return prepend_loom_agent_context(prompt, "agy")
 
@@ -452,6 +690,9 @@ def normalize_tool_name(name: str) -> str:
         "google_web_search": "WebSearch",
         "read_url_content": "WebFetch",
         "web_fetch": "WebFetch",
+        "find_by_name": "Glob",
+        "manage_task": "Task",
+        "apply_patch": "apply_patch",
     }
     return mapping.get(name, name)
 
@@ -482,6 +723,10 @@ def normalize_tool_args(name: str, args: dict) -> dict:
         mapped["dir"] = cleaned.get("SearchPath", cleaned.get("dir", ""))
     else:
         mapped = cleaned
+    for source, target in (("Cwd", "cwd"), ("DirectoryPath", "path"),
+                           ("SearchDirectory", "path"), ("SearchPath", "path")):
+        if source in cleaned:
+            mapped.setdefault(target, cleaned[source])
     return mapped
 
 
@@ -571,8 +816,12 @@ def _agy_tool_event(payload: dict) -> tuple[str, str, dict, str] | None:
         or tool.get("displayName")
         or "Tool"
     )
+    step_idx = next((source[key] for source in (payload, tool)
+                     for key in ("step_index", "stepIndex")
+                     if source.get(key) is not None), None)
     tool_id = str(
-        tool.get("id")
+        (str(step_idx) if step_idx is not None else "")
+        or tool.get("id")
         or tool.get("tool_id")
         or tool.get("toolId")
         or payload.get("id")
@@ -606,13 +855,28 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
 
     if event == "init":
         session_id = (
-            payload.get("conversation_id")
+            raw.get("conversation_id")
+            or raw.get("conversationId")
+            or raw.get("session_id")
+            or raw.get("sessionId")
+            or payload.get("conversation_id")
             or payload.get("conversationId")
             or payload.get("session_id")
             or payload.get("sessionId")
         )
-        model = payload.get("model") or payload.get("model_id") or payload.get("modelId")
+        model = (
+            raw.get("model")
+            or raw.get("model_id")
+            or raw.get("modelId")
+            or payload.get("model")
+            or payload.get("model_id")
+            or payload.get("modelId")
+        )
         if session_id or model:
+            if session_id:
+                state["session_id"] = str(session_id)
+            if model:
+                state["model"] = str(model)
             events.append({
                 "type": "session_info",
                 "session_id": str(session_id or state.get("session_id") or ""),
@@ -641,7 +905,11 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
             "result_text": text,
             "error": error or None,
             "session_id": str(
-                result.get("conversation_id")
+                raw.get("conversation_id")
+                or raw.get("conversationId")
+                or raw.get("session_id")
+                or raw.get("sessionId")
+                or result.get("conversation_id")
                 or result.get("conversationId")
                 or result.get("session_id")
                 or result.get("sessionId")
@@ -670,18 +938,45 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
         name = normalize_tool_name(raw_name)
         if tool_id not in state.setdefault("tool_starts", set()):
             state["tool_starts"].add(tool_id)
+            normalized_input = json.dumps(
+                normalize_tool_args(raw_name, args), ensure_ascii=False
+            )
             events.append({
                 "type": "tool_start",
                 "name": name,
                 "tool_id": tool_id,
-                "input": json.dumps(normalize_tool_args(raw_name, args), ensure_ascii=False),
             })
-        if result or status in {"completed", "complete", "finished", "success", "succeeded", "failed", "error"}:
+            # Match the provider-independent event contract used by Codex,
+            # Claude, Goose, and Hermes.  The server persists and renders tool
+            # input from this event; embedding it only on tool_start silently
+            # dropped agy's command/path arguments from the user-facing turn.
+            if normalized_input and normalized_input != "{}":
+                events.append({
+                    "type": "tool_input_delta",
+                    "json": normalized_input,
+                    "tool_id": tool_id,
+                })
+        if result or status in {"completed", "complete", "finished", "success", "succeeded", "failed", "error", "done"}:
             events.append({
                 "type": "tool_result",
                 "tool_id": tool_id,
                 "content": result,
                 "is_error": status in {"failed", "error"},
+                "outcome_recorded": status in {"completed", "complete", "finished", "success", "succeeded", "failed", "error", "done"},
+            })
+        if raw_name in ("ask_question", "AskUserQuestion"):
+            questions = args.get("questions") if isinstance(args, dict) else []
+            events.append({
+                "type": "ask_user_question",
+                "questions": questions if isinstance(questions, list) else [],
+                "tool_id": tool_id,
+            })
+        elif raw_name in ("ExitPlanMode", "exit_plan_mode"):
+            events.append({
+                "type": "plan_ready",
+                "plan": args.get("plan", "") if isinstance(args, dict) else "",
+                "plan_file": args.get("planFilePath", args.get("plan_file", "")) if isinstance(args, dict) else "",
+                "tool_id": tool_id,
             })
         return events
 
@@ -699,6 +994,20 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
             "text": f"{name}: {state_text}{f' - {detail}' if detail else ''}",
         })
         return events
+
+    thought = _agy_text_from_value(
+        payload.get("thought")
+        or payload.get("thought_delta")
+        or payload.get("thoughtDelta")
+        or payload.get("thinking")
+        or payload.get("thinking_delta")
+        or payload.get("thinkingDelta")
+        or payload.get("reasoning")
+        or payload.get("reasoning_delta")
+        or payload.get("reasoningDelta")
+    )
+    if thought:
+        events.append({"type": "thinking_delta", "text": thought})
 
     text = _agy_text_from_value(
         payload.get("delta")
@@ -725,12 +1034,21 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
 
 
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
-                     model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
+                     model: str = "Gemini 3.7 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      backstage_parent_id: int | None = None,
-                     nrol_operator: bool = False):
-    if permission_mode == "plan":
+                     
+                     is_first_turn: bool = True,
+                     permission_scope: str = "",
+                     agent_run_id: str | None = None,
+                     preparation: bool = False,
+                     print_timeout: str | None = None):
+    if preparation:
+        # Tool-free preparation: no Loom agent contract, no operator surface;
+        # the PreToolUse hook (LOOM_PREPARATION=1) denies every tool call.
+        pass
+    elif permission_mode == "plan":
         plan_instruction = (
             "You are running in PLAN MODE. Your task is to analyze the codebase and write a comprehensive "
             "implementation plan to `implementation_plan.md` in the workspace. Do NOT modify any other files "
@@ -740,17 +1058,57 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         )
         prompt = f"{plan_instruction}\n\n{prompt}"
 
-    _configure_permission_hook(cwd, backstage_parent_id, server_port)
-    if nrol_operator:
-        _configure_operator(cwd, conv_id, server_port)
+    task = asyncio.current_task()
+    gen_key = getattr(task, "_gen_key", None)
+    effective_agent_run_id = agent_run_id or (f"gen:{gen_key[2]}" if gen_key else None)
+    effective_parent_run_id = getattr(task, "_parent_run_id", None) or (
+        f"gen:{gen_key[2]}" if gen_key and not agent_run_id else None
+    )
+    history_token = None
+    if conv_id and (not preparation) and (not backstage_parent_id):
+        from search_space.scopes import issue_scope
+        history_token = issue_scope(conv_id, cwd, run_id=effective_agent_run_id,
+                                    client_instance_id=getattr(task, "_client_instance_id", None))
+    def _configure_workspace():
+        # .agents/hooks.json and mcp_config.json are shared by every agy run in
+        # this workspace and carry this run's identity, so they are written
+        # under the workspace lock immediately before launch (see below).
+        _configure_permission_hook(
+            cwd,
+            backstage_parent_id,
+            server_port,
+            conv_id=conv_id,
+            agent_run_id=effective_agent_run_id,
+            parent_run_id=effective_parent_run_id,
+            client_instance_id=getattr(task, "_client_instance_id", None),
+            history_token=history_token,
+        )
+        pass
+
+    if preparation:
+        prompt = _prepare_agy_prompt(
+            prompt, backstage_parent_id=None, 
+            is_first_turn=False,
+        )
     else:
-        prompt = _prepare_agy_prompt(prompt, backstage_parent_id, nrol_operator)
+        prompt = _prepare_agy_prompt(
+            prompt,
+            backstage_parent_id,
+            
+            is_first_turn=is_first_turn,
+        )
 
     agy_model = _loom_model_to_agy(model, effort)
     agy_effort = _agy_effort_for_model(model, effort)
 
     queue = asyncio.Queue()
-    _active_queues[conv_id] = queue
+    queue_scope = str(permission_scope or effective_agent_run_id or "").strip()
+    queue_key = f"{int(conv_id)}:{queue_scope}" if queue_scope else int(conv_id)
+    _active_queues[queue_key] = queue
+    # Keep the legacy alias only while this is the sole queue for the
+    # conversation.  New server code always supplies permission_scope.
+    if int(conv_id) not in _active_queues:
+        _active_queues[int(conv_id)] = queue
 
     # stdout-driven: no transcript tailing. Loom records the conversation_id
     # agy emits on stdout. Fresh/replay turns deliberately launch without
@@ -768,15 +1126,14 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     # Operator turns are fresh-conv-by-design: each turn reads a fresh tool
     # registry from .agents/mcp_config.json. See [[agy-operator-turn2-no-response]].
-    if nrol_operator and (resume_session_id or fork_session):
-        resume_session_id = None
-        fork_session = False
-        print("[AGY] operator turn: forcing fresh-conv")
+    pass
 
     # Fork session if requested: copy brain/<src> to a new UUID folder and
     # update the conversation DB/PB so --resume points at the fork.
     if resume_session_id and fork_session:
-        import uuid, shutil, sqlite3
+        # uuid is imported at module level; importing it here would make it a
+        # function-local name and break the prompt-file path below.
+        import shutil, sqlite3
         new_session_id = str(uuid.uuid4())
         src = brain_path / resume_session_id
         dst = brain_path / new_session_id
@@ -832,6 +1189,10 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     agy_exe = _find_agy_exe()
 
+    if not backstage_parent_id:
+        from context_runtime import admit_rendered
+        prompt = await admit_rendered(prompt, model=model, harness="gemini", resume_session_id=resume_session_id)
+
     # Windows has a ~32K char limit on command lines (CreateProcess).  For
     # prompts that approach this, write the full text to a temp file and pass a
     # short redirect instruction via -p instead.
@@ -841,7 +1202,10 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if len(prompt) > _MAX_CLI_PROMPT:
         agents_dir = Path(cwd) / ".agents"
         agents_dir.mkdir(parents=True, exist_ok=True)
-        prompt_file = agents_dir / f"loom_prompt_{conv_id}.md"
+        # One file per launch: a reused per-conversation name let a retry or
+        # an overlapping turn overwrite or delete another turn's prompt.
+        _sweep_stale_prompt_files(agents_dir)
+        prompt_file = agents_dir / f"loom_prompt_{conv_id}_{uuid.uuid4().hex[:12]}.md"
         prompt_file.write_text(prompt, encoding="utf-8")
         cli_prompt = (
             f"Read the full conversation context from the file at "
@@ -857,7 +1221,6 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Operator turns: do NOT pass --conversation. Each operator turn is a
     # self-contained scan/triage request; resuming the agy conversation
     # forces agy to use the tool registry baked in at conv-creation time
-    # (so newly-registered nrol-ao MCP tools are invisible) AND lets agy's
     # own context fill up across turns until it auto-compacts on what feels
     # to the user like turn 1. Fresh conv per turn → fresh tool registry
     # read from .agents/mcp_config.json, no carry-over compaction.
@@ -865,17 +1228,20 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # That keeps full Loom replay/handoff prompts from mixing with agy's
     # persistent conversation memory.
     cc_args = []
-    if not nrol_operator and resume_session_id:
+    if resume_session_id:
         cc_args += ["--conversation", resume_session_id]
 
     # Explicitly set the agy project ID so MCP config from .agents/ loads.
     # agy's default-project cache (cache/default_project_id.txt) gets clobbered
     # by neutral runs; without --project, new operator conversations fall into
     # the "default-cli-project" which has no MCP servers configured.
-    if nrol_operator:
-        project_id = _get_agy_project_id(Path(cwd))
-        if project_id:
-            cc_args += ["--project", project_id]
+    project_id = _get_agy_project_id(_agy_workspace_root(Path(cwd)))
+    if project_id:
+        cc_args += ["--project", project_id]
+    elif not resume_session_id:
+        # A fresh workspace must not inherit default-cli-project, whose
+        # customization paths can omit this workspace's permission hooks.
+        cc_args += ["--new-project"]
 
     cc_args += [
         "-p", cli_prompt,
@@ -883,8 +1249,11 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "--model", agy_model,
         "--effort", agy_effort,
         "--dangerously-skip-permissions",
-        "--print-timeout", "60m",
     ]
+    agy_timeout = (print_timeout or os.environ.get("LOOM_AGY_PRINT_TIMEOUT", "")).strip()
+    if agy_timeout:
+        cc_args += ["--print-timeout", agy_timeout]
+
     # NOTE: --sandbox is deliberately not passed for operator convs: bare
     # headless smoke runs hang with AND without the flag outside the Loom
     # harness (2026-06-11), so it cannot be validated. The PreToolUse hook
@@ -899,15 +1268,23 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "BASH_DEFAULT_TIMEOUT_MS": "1200000",  # 20 minutes (default is 2m)
         "BASH_MAX_TIMEOUT_MS": "3600000",      # 60 minutes (default is 10m)
     }
+    if agent_run_id:
+        env["LOOM_AGENT_RUN_ID"] = str(agent_run_id)
     gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-    if gen_key:
+    if permission_scope:
+        env["LOOM_PERMISSION_SCOPE"] = str(permission_scope)
+    elif gen_key:
         env["LOOM_PERMISSION_SCOPE"] = f"gen:{gen_key[2]}"
+    client_instance_id = getattr(task, "_client_instance_id", None)
+    if client_instance_id:
+        env["LOOM_CLIENT_INSTANCE_ID"] = str(client_instance_id)
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
-    if nrol_operator:
-        # cc_permission_hook denies Write/Edit/Bash/etc. without prompting
-        # when this is set — agy's only tool-blocking surface.
-        env["LOOM_NROL_OPERATOR"] = "1"
+    pass
+    if preparation:
+        # Deny every tool through the PreToolUse hook; preparation is
+        # text-only and must never receive a permission prompt.
+        env["LOOM_PREPARATION"] = "1"
 
     # launch_ts already recorded above
 
@@ -919,13 +1296,21 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if sys.platform == "win32":
         kwargs["creationflags"] = 0x08000000 | 0x00000200
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=cwd, env=env,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024,
-        **kwargs
-    )
+    config_lock = await _acquire_workspace_config_lock(cwd)
+    try:
+        _configure_workspace()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd, env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            limit=16 * 1024 * 1024,
+            **kwargs
+        )
+    except BaseException:
+        config_lock.release()
+        raise
+    first_output = asyncio.Event()
+    asyncio.create_task(_release_config_lock_when_loaded(config_lock, first_output, proc))
 
     # stdout/stderr reading tasks. agy stream-json emits one JSON event per
     # stdout line; stderr remains noisy diagnostics only.
@@ -948,6 +1333,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             async for line in proc.stdout:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
+                    first_output.set()
                     stdout_lines.put_nowait(text)
         except Exception as e:
             log.error(f"[AGY] Error reading stdout: {e}")
@@ -986,7 +1372,6 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
         full_text = ""
         _empty_polls = 0
-        _dead_since = None
         stream_state = {"session_id": session_id, "model": agy_model}
         got_result = False
         terminal_error = None
@@ -1032,46 +1417,51 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
             # Liveness heartbeat and error detection while still running.
             _empty_polls += 1
-            if _empty_polls % 30 == 0:
-                elapsed = int(_time.time() - launch_ts)
-                agy_alive = _is_agy_alive(launch_ts)
-                if not full_text and not agy_alive:
-                    queue.put_nowait({
-                        "type": "status",
-                        "text": f"Working ({elapsed}s) - waiting for agy stdout...",
-                    })
-                if agy_alive:
-                    _dead_since = None
-                    if not full_text:
-                        queue.put_nowait({
-                            "type": "status",
-                            "text": f"Working ({elapsed}s) — agy is processing...",
-                        })
-                else:
-                    if _dead_since is None:
-                        _dead_since = _time.time()
-                    elif _time.time() - _dead_since > 60.0:
-                        msg = (f"Antigravity appears to have shut down "
-                               f"(no log activity for {int(_time.time() - _dead_since)}s) "
-                               "without producing a final result")
-                        terminal_error = msg
-                        print(f"[AGY] Sustained-dead break ({elapsed}s): {msg}")
-                        queue.put_nowait({"type": "status", "text": msg})
-                        try:
-                            await asyncio.wait_for(proc.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            proc.kill()
-                        break
-
+            if _empty_polls % _AGY_HEARTBEAT_POLLS == 0:
+                now = _time.time()
+                elapsed = int(now - launch_ts)
+                # Specific fatal signatures (quota, auth, planner stall) win
+                # over the generic liveness verdict below.
                 log_err = _scan_agy_log_for_error(launch_ts)
                 if log_err:
                     print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
                     terminal_error = log_err
                     queue.put_nowait({"type": "status", "text": log_err})
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        proc.kill()
+                    await _stop_agy_process(proc, grace=5.0)
+                    break
+
+                log_state = _agy_log_state(launch_ts)
+                quiet_s = log_state["quiet_s"]
+                if quiet_s is None:
+                    quiet_s = now - launch_ts
+                stop_reason = None
+                if log_state["fresh"]:
+                    if not full_text:
+                        queue.put_nowait({
+                            "type": "status",
+                            "text": f"Working ({elapsed}s) — agy is processing...",
+                        })
+                elif log_state["shutdown"] and quiet_s > _AGY_ZOMBIE_QUIET_S:
+                    stop_reason = (
+                        "Antigravity tore down its conversation stream but its "
+                        "process neither exited nor returned a result; Loom "
+                        f"stopped it after {int(quiet_s)}s of log silence")
+                elif quiet_s > _AGY_QUIET_CEILING_S:
+                    stop_reason = (
+                        f"Loom stopped Antigravity after {int(quiet_s)}s with no "
+                        "log or stream activity (hard limit "
+                        f"{int(_AGY_QUIET_CEILING_S)}s); the model call may have hung")
+                else:
+                    queue.put_nowait({
+                        "type": "status",
+                        "text": (f"Working ({elapsed}s) — agy log quiet for "
+                                 f"{int(quiet_s)}s; model likely generating..."),
+                    })
+                if stop_reason:
+                    terminal_error = stop_reason
+                    print(f"[AGY] Liveness stop ({elapsed}s): {stop_reason}")
+                    queue.put_nowait({"type": "status", "text": stop_reason})
+                    await _stop_agy_process(proc)
                     break
 
             await asyncio.sleep(0.05)
@@ -1133,7 +1523,8 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 elif etype == "tool_result":
                     if tool_id in yielded_results:
                         continue
-                    yielded_results.add(tool_id)
+                    if evt.get("outcome_recorded", True):
+                        yielded_results.add(tool_id)
                     
                 elif etype == "ask_user_question":
                     if tool_id in yielded_questions:
@@ -1151,7 +1542,9 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             except asyncio.CancelledError:
                 break
 
-        _active_queues.pop(conv_id, None)
+        _active_queues.pop(queue_key, None)
+        if _active_queues.get(int(conv_id)) is queue:
+            _active_queues.pop(int(conv_id), None)
         # Ensure stdout/stderr readers finish before reaping the process so we
         # capture all output and avoid a blocked-pipe deadlock on Windows.
         if not stdout_task.done():

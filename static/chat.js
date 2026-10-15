@@ -20,29 +20,252 @@ function parseImagePaths(imagePath) {
 
 let _wsReconnectDelay = 2000;
 let _wsReconnectTimer = null;
+let _disconnectedRecoveryTimer = null;
+let _disconnectedHistoryCheck = {key: null, at: 0, settled: false};
+let _transportReportWindow = {minute: -1, count: 0, pending: 0};
+
+function _reportPublicSocket(socket, stage, event = {}) {
+    if (location.hostname !== 'portal.example.invalid' || !/^[a-f0-9]{32}$/.test(socket._transportTrace || '')
+        || !['open', 'error', 'close'].includes(stage)) return;
+    socket._transportReported ||= new Set();
+    if (socket._transportReported.has(stage)) return;
+    socket._transportReported.add(stage);
+    const minute = Math.floor(Date.now() / 60000);
+    if (_transportReportWindow.minute !== minute) {
+        _transportReportWindow.minute = minute; _transportReportWindow.count = 0;
+    }
+    if (_transportReportWindow.count >= 12 || _transportReportWindow.pending >= 2) return;
+    _transportReportWindow.count++; _transportReportWindow.pending++;
+    const boundedTime = value => Math.min(86400000, Math.max(0, Math.floor(value)));
+    const report = {trace: socket._transportTrace, stage, opened: socket._openedAt != null,
+        code: Number.isInteger(event.code) && event.code >= 0 && event.code <= 4999 ? event.code : 0,
+        clean: event.wasClean === true,
+        elapsed_ms: boundedTime(Date.now() - socket._transportStartedAt),
+        idle_ms: boundedTime(Date.now() - (socket._lastActivity || socket._transportStartedAt))};
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    // The browser supplies existing cookies. Never read or export credentials,
+    // URLs, close reasons, event bodies, message contents, or exception text.
+    void fetch('/api/transport-report', {method:'POST', mode:'same-origin',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify(report),
+        signal:controller.signal, cache:'no-store'})
+        .catch(() => {}).finally(() => {clearTimeout(timeout); _transportReportWindow.pending--;});
+}
+
+function _showConnectionStatus(text = '') {
+    let status = document.getElementById('chat-connection-status');
+    if (!text) { status?.remove(); return; }
+    const input = document.getElementById('input-row');
+    if (!input) return;
+    if (!status) {
+        status = document.createElement('div');
+        status.id = 'chat-connection-status';
+        status.className = 'turn-lifecycle-status';
+        status.setAttribute('role', 'status');
+        const label = document.createElement('span');
+        label.className = 'turn-lifecycle-text';
+        status.appendChild(label);
+        input.before(status);
+    }
+    const label = status.firstChild;
+    if (label.textContent !== text) label.textContent = text;
+}
+
+async function _recoverDisconnectedMessages(signal) {
+    const convId = State.currentConvId;
+    const threadId = State.loomCursor?.thread_id;
+    const draftId = State._followingDraftMsgId;
+    const runId = State._followingGenId;
+    const owner = {convId, conversationSeq: _conversationLoadRequestSeq,
+        branchSeq: State._branchSwitchSeq || 0,
+        navigationEpoch: typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch};
+    const read = async url => {
+        const response = await fetch(url, {signal, cache: 'no-store'});
+        if (!response.ok) throw await apiError(response, 'GET', url);
+        return response.json();
+    };
+    const [cursor, active] = await Promise.all([
+        read(`/api/conversations/${convId}/cursor/${encodeURIComponent(_loomClientInstanceId)}`),
+        read('/api/generations'),
+    ]);
+    if (!_sendOwnerIsCurrent(owner) || State._followingGenId !== runId
+        || State.loomCursor?.thread_id !== threadId || State.ws?.readyState === WebSocket.OPEN) return;
+    // Active-run metadata has no transcript. Never download/re-render the
+    // history repeatedly merely to discover that a tracked turn is still running.
+    const running = active.some(run => _sameConvId(run.conv_id, convId)
+        && (draftId != null ? _sameMessageId(run.draft_msg_id, draftId)
+            : threadId != null && String(run.loom_thread_id) === String(threadId)));
+    _showConnectionStatus(running
+        ? 'Live updates disconnected. A turn is running in this thread.'
+        : 'Live updates disconnected. Checking saved replies.');
+    if (running) return;
+    const key = `${convId}/${cursor.cursor_id}/${cursor.revision}/${cursor.leaf_message_id}/${runId}`;
+    if (_disconnectedHistoryCheck.key === key
+        && (_disconnectedHistoryCheck.settled || Date.now() - _disconnectedHistoryCheck.at < 15000)) return;
+    _disconnectedHistoryCheck = {key, at: Date.now(), settled: false};
+    const recovered = await _recoverIdleMessages({requireTerminal: true, transportIndependent: true, signal});
+    if (recovered && _sendOwnerIsCurrent(owner) && !State.isStreaming && _disconnectedHistoryCheck.key === key) {
+        const settledCursor = State.loomCursor;
+        _disconnectedHistoryCheck.key = `${convId}/${settledCursor?.cursor_id}/${settledCursor?.revision}/${settledCursor?.leaf_message_id}/${State._followingGenId}`;
+        _disconnectedHistoryCheck.settled = true;
+    }
+}
+
+function _scheduleDisconnectedRecovery() {
+    if (_disconnectedRecoveryTimer != null) return;
+    _disconnectedRecoveryTimer = setTimeout(async () => {
+        // Keep this timer occupied across the request: retries must not start
+        // overlapping HTTP reads while the socket is repeatedly replaced.
+        const controller = new AbortController();
+        const deadline = setTimeout(() => controller.abort(), 5000);
+        try {
+            if (State.currentConvId != null && State.currentView !== 'home'
+                && !document.hidden && State.ws?.readyState !== WebSocket.OPEN
+                && !State.ws?._authExpired) {
+                await _recoverDisconnectedMessages(controller.signal);
+            }
+        } catch (error) {
+            _showConnectionStatus('Live updates disconnected. Server status unavailable.');
+            if (error.name !== 'AbortError') console.warn('[Recovery] Status check unavailable');
+        } finally {
+            clearTimeout(deadline);
+            _disconnectedRecoveryTimer = null;
+            if (State.currentConvId != null && State.currentView !== 'home'
+                && State.ws?.readyState !== WebSocket.OPEN && !State.ws?._authExpired) {
+                _scheduleDisconnectedRecovery();
+            }
+        }
+    }, 3000);
+}
 let _lastResumeProbeAt = 0;
+let _queuedGeneration = null;
+let _generationQueueItems = [];
+let _pendingLaunch = null;
+// Retain the exact POST body after an ambiguous network failure. Retrying the
+// same visible composer action reuses both its topology contract and
+// client_request_id, so the server can return the first durable insert rather
+// than attaching or launching a duplicate.
+let _pendingSendRequest = null;
+let _submittedSendOwner = null;
+let _launchRecoveryNotice = null;
+
+function _showLaunchRecoveryNotice() {
+    if (!_launchRecoveryNotice || !_sendOwnerIsCurrent(_launchRecoveryNotice.owner)) return;
+    const notice = _launchRecoveryNotice;
+    showRetryBar(notice.text);
+    _launchRecoveryNotice = notice;
+    document.getElementById('btn-retry')?.remove();
+}
+
+function _sendOwnerIsCurrent(owner) {
+    return !!owner && _sameConvId(State.currentConvId, owner.convId)
+        && owner.conversationSeq === _conversationLoadRequestSeq
+        && owner.branchSeq === (State._branchSwitchSeq || 0)
+        && owner.navigationEpoch === (typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch);
+}
+// A completed WS turn can beat its HTTP send acknowledgement. Keep bounded,
+// exact-run terminal evidence so the late acknowledgement cannot revive it.
+const _recentTerminalRuns = new Map();
+function _terminalRunKey(convId, runId) { return `${convId}/${runId}`; }
+// Per-page identity: unlike sessionStorage, this is never cloned into a newly
+// opened/duplicated Loom window. The server echoes it on generation events so
+// two windows on the same parent do not both attach to the first agent stream.
+const _loomClientInstanceId = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `loom-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const _subscribedRunIds = new Set();
+const _receivedSocketEventIds = new Set();
+
+function _handleSocketMessage(data) {
+    // Launch and viewport sockets can briefly share an exact subscription.
+    // Deduplicate at transport receipt, before reconstruction queues events:
+    // queue draining must still process the already-received envelope once.
+    if (data.event_id) {
+        if (_receivedSocketEventIds.has(data.event_id)) return;
+        _receivedSocketEventIds.add(data.event_id);
+        if (_receivedSocketEventIds.size > 2048) _receivedSocketEventIds.delete(_receivedSocketEventIds.values().next().value);
+    }
+    handleWSMessage(data);
+}
+
+function _canonicalClientRunId(data) {
+    if (!data) return null;
+    if (data.run_id != null) return String(data.run_id);
+    if (data.gen_id != null) return `gen:${data.gen_id}`;
+    return null;
+}
+
+function _followedGenerationProbe() {
+    return State._followingGenId != null && State._followingDraftMsgId != null
+        ? {run_id: `gen:${State._followingGenId}`, draft_msg_id: State._followingDraftMsgId}
+        : {};
+}
 
 function connectWebSocket(convId, _attempt) {
-    if (!_attempt) {
-        _queuedGeneration = null;
-    }
     // Cancel any pending reconnect timer
     if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+
+    const followedThreadId = State._liveStreamDraft?.loom_thread_id ?? _pendingLaunch?.threadId;
+    const followedConvId = State._liveStreamDraft?.conversation_id ?? State.ws?._loomConvId;
+    if (State._followingGenId != null && (
+        (followedThreadId != null && String(followedThreadId) !== String(State.loomCursor?.thread_id))
+        || (followedConvId != null && !_sameConvId(convId, followedConvId)))) {
+        _resetStreamState();
+        removeStreamingMessage();
+        hideGenStatus();
+        setBrowserTabState('idle');
+    }
 
     // Close previous WS without triggering its onclose reconnect
     if (State.ws) {
         State.ws._replaced = true;  // flag so onclose skips reconnect
+        clearTimeout(State.ws._handshakeTimer);
+        if (State.ws._pingWorker) { State.ws._pingWorker.terminate(); State.ws._pingWorker = null; }
         State.ws.close();
         State.ws = null;
     }
 
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${protocol}://${location.host}/ws/chat/${convId}`);
+    const wsParams = new URLSearchParams({ client_instance_id: _loomClientInstanceId });
+    const transportTrace = location.hostname === 'portal.example.invalid'
+        ? crypto.randomUUID().replace(/-/g, '') : null;
+    if (transportTrace) wsParams.set('transport_trace', transportTrace);
+    wsParams.set('child_event_batches', '1');
+    // Reconnect ownership is explicit. Branch visibility is deliberately not
+    // sent as stream authority; the server reads this page's durable cursor.
+    if (State._followingGenId != null) {
+        wsParams.set('run_id', `gen:${State._followingGenId}`);
+    }
+    const wsUrl = `${protocol}://${location.host}/ws/chat/${convId}?${wsParams}`;
+    const ws = new WebSocket(wsUrl);
+    ws._transportTrace = transportTrace;
+    ws._transportStartedAt = Date.now();
     ws._reconnectAttempt = _attempt || 0;
+    ws._handshakeTimer = setTimeout(() => {
+        if (ws._replaced || State.ws !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+        _reportPublicSocket(ws, 'error');
+        _showConnectionStatus('Live connection did not open. Reconnecting…');
+        // A native CONNECTING socket can take minutes to report failure.
+        // Retire it explicitly; its eventual close must not start a second retry.
+        ws._replaced = true;
+        try { ws.close(); } catch {}
+        const attempt = (ws._reconnectAttempt || 0) + 1;
+        _wsReconnectTimer = setTimeout(() => {
+            _wsReconnectTimer = null;
+            if (State.ws === ws && _sameConvId(State.currentConvId, convId)
+                && State.currentView !== 'home') connectWebSocket(convId, attempt);
+        }, Math.min(500 * Math.pow(2, Math.min(attempt - 1, 4)), 8000));
+    }, 10000);
+    _showConnectionStatus('Connecting live updates…');
+    _scheduleDisconnectedRecovery();
 
     ws.onopen = () => {
+        clearTimeout(ws._handshakeTimer);
+        if (ws._replaced || State.ws !== ws || !_sameConvId(convId, State.currentConvId)) return;
         console.log('WebSocket connected');
-        ws._reconnectAttempt = 0;
+        _showConnectionStatus();
+        ws._openedAt = Date.now();
+        _reportPublicSocket(ws, 'open');
         _wsReconnectDelay = 2000; // reset backoff on success
         ws._lastActivity = Date.now();
         // Web Worker keepalive — runs at full speed even in background tabs
@@ -52,7 +275,9 @@ function connectWebSocket(convId, _attempt) {
         // Safari / NAT timeouts typically present this way — readyState stays
         // OPEN forever but no traffic flows).
         const workerBlob = new Blob([`setInterval(() => postMessage('tick'), 15000)`], {type: 'text/javascript'});
-        ws._pingWorker = new Worker(URL.createObjectURL(workerBlob));
+        const workerUrl = URL.createObjectURL(workerBlob);
+        try { ws._pingWorker = new Worker(workerUrl); }
+        finally { URL.revokeObjectURL(workerUrl); }
         ws._pingWorker.onmessage = () => {
             if (ws.readyState !== WebSocket.OPEN) return;
             // Staleness check BEFORE sending — if the socket's already silent
@@ -64,35 +289,66 @@ function connectWebSocket(convId, _attempt) {
                 try { ws.close(); } catch {}
                 return;
             }
-            ws.send(JSON.stringify({ action: 'ping' }));
+            ws.send(JSON.stringify({ action: 'ping', ..._followedGenerationProbe() }));
         };
         // Server immediately sends generation_active (with snapshot) or generation_idle.
         // We let those handlers trigger loadMessages — no more racy setTimeout.
         ws._needsSync = true;
+        if (State._followingGenId != null) {
+            ws.send(JSON.stringify({ action: 'subscribe_run', run_id: `gen:${State._followingGenId}` }));
+        }
+        for (const run of (State.agentRuns || [])) {
+            if (run && !['completed', 'failed', 'cancelled'].includes(run.status)) {
+                ws.send(JSON.stringify({ action: 'subscribe_run', run_id: `agent:${run.run_id}` }));
+            }
+        }
+        // A hard reload starts with no in-memory child state. Rehydrate the
+        // durable Agents badge and replay active run events as soon as this
+        // conversation's socket is ready; opening the panel is not required.
+        void refreshAgentRuns();
         // If the user hit Send while the old socket was stale, replay now.
         _flushPendingGenerate();
     };
 
     ws.onmessage = (event) => {
+        // A replaced socket can still have deliveries queued in the browser.
+        if (ws._replaced || State.ws !== ws || !_sameMessageId(convId, State.currentConvId)) return;
         ws._lastActivity = Date.now();
+        // An upgrade followed immediately by a drop must retain backoff.
+        if (Date.now() - ws._openedAt >= 10000) ws._reconnectAttempt = 0;
         const data = JSON.parse(event.data);
-        handleWSMessage(data);
+        _handleSocketMessage(data);
     };
 
     ws.onerror = (err) => {
+        _reportPublicSocket(ws, 'error');
         console.error('WebSocket error:', err);
+        void _checkPublicTransport();
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+        clearTimeout(ws._handshakeTimer);
+        _reportPublicSocket(ws, 'close', event);
         console.log('WebSocket closed');
         if (ws._pingWorker) { ws._pingWorker.terminate(); ws._pingWorker = null; }
         // If this WS was intentionally replaced, don't reconnect
         if (ws._replaced || State.ws !== ws) return;
-        // Reset streaming UI — server will keep generating and save the result.
-        if (State.isStreaming) {
+        _showConnectionStatus('Live updates disconnected. Reconnecting…');
+        if (event?.code === 4401) {
+            _showConnectionStatus('Sign-in expired. Reload to sign in; your draft is saved.');
+            ws._authExpired = true;
+            if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+            if (typeof saveComposerDraft === 'function') saveComposerDraft();
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             removeStreamingMessage();
+            showGenStatus('Sign-in expired. Reload this page to sign in; your draft is saved.', true);
+            showToast('Sign-in expired. Reload this page to continue.', 'warning');
+            return;
+        }
+        // Keep partial content mounted until the replacement socket reconciles it.
+        _scheduleDisconnectedRecovery();
+        if (State.isStreaming) {
             showGenStatus('Reconnecting... generation continues on server', true);
         }
         // Reconnect: instant first try, then back off (cap at 8s)
@@ -110,6 +366,7 @@ function connectWebSocket(convId, _attempt) {
     };
 
     State.ws = ws;
+    ws._loomConvId = convId;
 }
 
 // ── Generation Status ──
@@ -117,6 +374,104 @@ let _streamTokenCount = 0;
 let _streamStartTime = 0;
 let _lastChunkAt = 0;
 let _droppedChunkCount = 0;
+
+// Browser-tab identity is part of the turn lifecycle: each Loom window names
+// its conversation and advertises whether that exact window is looming,
+// awaiting permission, or has landed a result. The favicon is generated
+// locally so background tabs remain distinguishable without a network asset.
+const _TAB_ACTIVITY_FRAMES = [
+    '\u280b', '\u2819', '\u2839', '\u2838', '\u283c',
+    '\u2834', '\u2826', '\u2827', '\u2807', '\u280f',
+];
+const _tabFaviconCache = new Map();
+let _browserTabState = 'idle';
+let _browserTabFrame = 0;
+let _browserTabTicker = null;
+let _browserTabDoneTimer = null;
+
+function _browserTabBaseTitle() {
+    const conversationTitle = String(State.currentConv?.title || '').trim();
+    return conversationTitle ? `EXO: ${conversationTitle}` : 'EX umbra Omnia';
+}
+
+function _browserTabFavicon(glyph, color) {
+    const key = `${glyph}:${color}`;
+    if (_tabFaviconCache.has(key)) return _tabFaviconCache.get(key);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">`
+        + `<rect width="32" height="32" rx="8" fill="#080816"/>`
+        + `<text x="16" y="22" text-anchor="middle" font-family="Segoe UI Symbol,monospace" font-size="21" font-weight="700" fill="${color}">${glyph}</text>`
+        + `</svg>`;
+    const value = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    _tabFaviconCache.set(key, value);
+    return value;
+}
+
+function _renderBrowserTabState() {
+    const favicon = document.getElementById('loom-favicon')
+        || document.querySelector('link[rel~="icon"]');
+    if (favicon && !favicon.dataset.defaultHref) {
+        favicon.dataset.defaultHref = favicon.getAttribute('href') || '/static/exoloom/icon.png';
+    }
+    const base = _browserTabBaseTitle();
+    // Keep the tab label stable and reserve transient activity state for the
+    // favicon. Duplicating the same glyph in both places makes background tabs
+    // visually noisy and causes their labels to shift while Loom is working.
+    document.title = base;
+    let glyph = '';
+    let color = '#00ffff';
+    if (_browserTabState === 'looming') {
+        glyph = _TAB_ACTIVITY_FRAMES[_browserTabFrame % _TAB_ACTIVITY_FRAMES.length];
+    } else if (_browserTabState === 'permission') {
+        glyph = '!';
+        color = '#fbbf24';
+    } else if (_browserTabState === 'done') {
+        glyph = '\u2713';
+        color = '#4ade80';
+    } else if (_browserTabState === 'error') {
+        glyph = '\u00d7';
+        color = '#fb7185';
+    }
+    if (favicon) {
+        favicon.type = glyph || /\.svg(?:[?#]|$)/i.test(favicon.dataset.defaultHref || '')
+            ? 'image/svg+xml' : 'image/png';
+        favicon.href = glyph
+            ? _browserTabFavicon(glyph, color)
+            : favicon.dataset.defaultHref;
+    }
+}
+
+function setBrowserTabState(state = 'idle') {
+    _browserTabState = state;
+    if (_browserTabDoneTimer) {
+        clearTimeout(_browserTabDoneTimer);
+        _browserTabDoneTimer = null;
+    }
+    if (_browserTabTicker) {
+        clearInterval(_browserTabTicker);
+        _browserTabTicker = null;
+    }
+    if (state === 'looming') {
+        _browserTabFrame = 0;
+        _browserTabTicker = setInterval(() => {
+            _browserTabFrame = (_browserTabFrame + 1) % _TAB_ACTIVITY_FRAMES.length;
+            _renderBrowserTabState();
+        }, 160);
+    } else if (state === 'done' && !document.hidden) {
+        _browserTabDoneTimer = setTimeout(() => setBrowserTabState('idle'), 6000);
+    }
+    _renderBrowserTabState();
+}
+
+function syncBrowserTabIdentity() {
+    _renderBrowserTabState();
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && ['done', 'error'].includes(_browserTabState)) {
+        _browserTabDoneTimer = setTimeout(() => setBrowserTabState('idle'), 1800);
+    }
+});
+syncBrowserTabIdentity();
 
 // ── Stream Debug Overlay ──
 // A tiny overlay that surfaces streaming diagnostics. It has two modes:
@@ -185,6 +540,8 @@ function _isActuallyStreaming() {
 // Force-clear streaming state. Called before starting a new turn, to recover
 // from any leaked flags / stale streamingDiv references.
 function _resetStreamState() {
+    _stopGenTimer();
+    _streamStartTime = 0;
     if (typeof _streamFlushTimer !== 'undefined' && _streamFlushTimer) {
         clearTimeout(_streamFlushTimer);
         _streamFlushTimer = null;
@@ -192,10 +549,12 @@ function _resetStreamState() {
     if (typeof _streamBuffer !== 'undefined') _streamBuffer = '';
     State.isStreaming = false;
     State._streamIsOurBranch = undefined;
+    if (State._followingGenId != null) _subscribedRunIds.delete(`gen:${State._followingGenId}`);
     State._followingGenId = null;
     State._followingDraftMsgId = null;
     State._parallelCount = 0;
     State._liveStreamDraft = null;
+    _pendingLaunch = null;
     _queuedStreamEventsDuringReconstruct = [];
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;  // detached; drop the stale ref
@@ -203,6 +562,8 @@ function _resetStreamState() {
 }
 
 function _clearTerminalStreamState({ clearParallel = false } = {}) {
+    _stopGenTimer();
+    _streamStartTime = 0;
     if (typeof _streamFlushTimer !== 'undefined' && _streamFlushTimer) {
         clearTimeout(_streamFlushTimer);
         _streamFlushTimer = null;
@@ -215,15 +576,121 @@ function _clearTerminalStreamState({ clearParallel = false } = {}) {
     State.isStreaming = false;
     State._reconstructing = false;
     State._streamIsOurBranch = undefined;
+    if (State._followingGenId != null) _subscribedRunIds.delete(`gen:${State._followingGenId}`);
     State._followingGenId = null;
     State._followingDraftMsgId = null;
     State._compactedThisGen = false;
     State._compactData = null;
     State._liveStreamDraft = null;
+    _pendingLaunch = null;
     if (clearParallel) State._parallelCount = 0;
     _queuedStreamEventsDuringReconstruct = [];
+    hideThinkingIndicator();
+    // One window follows at most one run. Duplicate preparing/start delivery
+    // can leave an older shell detached from `streamingDiv`; after the owning
+    // terminal settles it is never a legitimate active generation surface.
+    document.querySelectorAll('.message.assistant.streaming').forEach(element => {
+        if (element !== streamingDiv) element.remove();
+    });
     const sendBtn = document.getElementById('btn-send');
     if (sendBtn) sendBtn.disabled = false;
+}
+
+function _syncTerminalLoomCursor(data) {
+    const messageId = data?.message?.id ?? data?.draft_msg_id ?? null;
+    const convId = data?.conv_id ?? State.currentConvId;
+    if (messageId == null || !_sameConvId(convId, State.currentConvId)) {
+        return Promise.resolve(null);
+    }
+    const messageParent = data?.message?.parent_id ?? data?.parent_id ?? null;
+    const terminalThreadId = data?.message?.loom_thread_id ?? data?.loom_thread_id ?? null;
+    const terminalStillOwnsCursor = () => {
+        const currentThreadId = State.loomCursor?.thread_id ?? null;
+        const currentLeaf = State.loomCursor?.leaf_message_id ?? null;
+        return (!terminalThreadId || !currentThreadId
+            || String(terminalThreadId) === String(currentThreadId))
+            && (currentLeaf == null || _sameMessageId(currentLeaf, messageId)
+                || _sameMessageId(currentLeaf, messageParent));
+    };
+    // A terminal event belongs to the thread that launched it. In particular,
+    // finishing an old branch must not move an empty standalone-thread cursor
+    // that the user created while the terminal event was settling.
+    if (!terminalStillOwnsCursor()) return Promise.resolve(State.loomCursor);
+    // A queued continuation is a descendant already selected by this page.
+    // Completion/cancellation of its ancestor must never move that cursor
+    // backwards. Only settle a terminal that directly extends the selected
+    // leaf or is already the selected leaf.
+    const prior = State._cursorSyncPromise;
+    const sync = (async () => {
+        try { if (prior) await prior; } catch {}
+        if (!_sameConvId(convId, State.currentConvId)) return null;
+        // Re-check after serialized cursor work: the user may have switched or
+        // created a thread while this terminal settlement was waiting.
+        if (!terminalStillOwnsCursor()) return State.loomCursor;
+        rememberConversationLeaf(convId, messageId);
+        try {
+            return await selectServerLoomCursor(convId, messageId);
+        } catch (error) {
+            // The server may already have advanced the exact page cursor. Read
+            // that authority once; never infer a revision in the browser.
+            const current = await API.get(
+                `/api/conversations/${convId}/cursor/${encodeURIComponent(_loomClientInstanceId)}`
+            );
+            return _storeLoomCursor(current);
+        }
+    })();
+    State._cursorSyncPromise = sync;
+    return sync;
+}
+
+function _settleTerminalStream(data, { clearParallel = false, reload = false } = {}) {
+    const followedGen = State._followingGenId;
+    const settlement = _syncTerminalLoomCursor(data)
+        .catch(error => {
+            console.warn('[Loom] Terminal cursor synchronization failed:', error);
+            showToast('The reply landed, but this page could not confirm its branch cursor. Reconnect before sending.', 'error');
+            return null;
+        })
+        .finally(() => {
+            // A queued/new stream may have started while the cursor request was
+            // in flight. Never let the old terminal clear the newer owner.
+            if (State._followingGenId === followedGen) {
+                _clearTerminalStreamState({ clearParallel });
+                // A reconnect snapshot rebuild can recreate a live streaming
+                // placeholder for the settled run after its terminal already
+                // processed. Once this terminal still owns the following
+                // pointer, that shell is never a legitimate active surface.
+                removeStreamingMessage();
+                if (reload) loadMessages(State.currentConvId);
+            }
+            if (State._terminalSettlementPromise === settlement) {
+                State._terminalSettlementPromise = null;
+            }
+        });
+    State._terminalSettlementPromise = settlement;
+    return settlement;
+}
+
+let _publicTransportCheckAt = 0;
+async function _checkPublicTransport() {
+    if (location.hostname !== 'portal.example.invalid' || document.hidden
+        || Date.now() - _publicTransportCheckAt < 60000) return;
+    _publicTransportCheckAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+        const response = await fetch('/api/transport-health', {cache:'no-store',signal:controller.signal});
+        if (!response.ok) {
+            console.warn('[Transport check]', {http_status:response.status});
+            return;
+        }
+        const result = await response.json();
+        // Explicit projection: never log response text or credential values.
+        console.info('[Transport check]', {authenticated:result.authenticated===true,
+            origin_status:Number.isInteger(result.origin_status)?result.origin_status:null,
+            socket_open:result.socket_open===true,pong:result.pong===true});
+    } catch { console.warn('[Transport check] HTTP check unavailable'); }
+    finally {clearTimeout(timer);}
 }
 
 // Probe the WS when the tab returns to foreground. readyState alone is not
@@ -232,10 +699,14 @@ function _clearTerminalStreamState({ clearParallel = false } = {}) {
 // normal reconnect path can replace it.
 function _probeWSOnResume(source) {
     if (!State.currentConvId) return;
+    if (State.ws?._authExpired) return;
     const now = Date.now();
     if (source !== 'online' && now - _lastResumeProbeAt < 300) return;
     _lastResumeProbeAt = now;
     const ws = State.ws;
+    // No inbound activity exists during the handshake. Focus must not cancel
+    // that handshake or mistake its unset timestamp for a dead open socket.
+    if (ws?.readyState === WebSocket.CONNECTING) return;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
         console.log(`[WS] ${source} — no live socket, reconnecting`);
         connectWebSocket(State.currentConvId);
@@ -274,23 +745,194 @@ window.addEventListener('pageshow', (e) => {
     _probeWSOnResume(e.persisted ? 'pageshow(bfcache)' : 'pageshow');
 });
 
-async function _fetchActiveBranchMessages(convId) {
-    const treeData = await API.get(`/api/conversations/${convId}/tree`);
+async function _fetchCursorBranchMessages(convId, {signal, includeTree = true} = {}) {
+    const read = signal ? async url => {
+        const response = await fetch(url, {signal, cache: 'no-store'});
+        if (!response.ok) throw await apiError(response, 'GET', url);
+        return response.json();
+    } : url => API.get(url);
+    const owner = {
+        convId, conversationSeq: _conversationLoadRequestSeq,
+        branchSeq: State._branchSwitchSeq || 0,
+        navigationEpoch: typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch,
+    };
+    const previousCursor = JSON.stringify(State.loomCursor);
+    const [treeData, cursor] = await Promise.all([
+        includeTree ? read(`/api/conversations/${convId}/tree`) : Promise.resolve(State.treeData),
+        read(`/api/conversations/${convId}/cursor/${encodeURIComponent(_loomClientInstanceId)}`),
+    ]);
+    if (!_sendOwnerIsCurrent(owner) || JSON.stringify(State.loomCursor) !== previousCursor) {
+        return false;
+    }
+    _storeLoomCursor(cursor);
+    const cursorAtStart = `${cursor.cursor_id}:${cursor.revision}:${cursor.leaf_message_id ?? ''}`;
     State.treeData = treeData;  // keep branch indicators in sync
     if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
     hideRetryBar();
-    const leaf = findLoadableConversationLeaf(treeData, convId);
-    if (leaf) {
-        State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
-        rememberConversationLeaf(convId, leaf.id);
-    } else if (!State.messages.length) {
+    if (cursor.leaf_message_id == null) {
         State.messages = [];
+        return true;
     }
+    const leaf = includeTree ? treeData.find(item => _sameMessageId(item.id, cursor.leaf_message_id))
+        : {id: cursor.leaf_message_id};
+    if (leaf) {
+        const branchMessages = await read(`/api/conversations/${convId}/branch/${leaf.id}`);
+        if (!_sendOwnerIsCurrent(owner)
+            || `${State.loomCursor?.cursor_id}:${State.loomCursor?.revision}:${State.loomCursor?.leaf_message_id ?? ''}` !== cursorAtStart) {
+            return false;
+        }
+        State.messages = branchMessages;
+        rememberConversationLeaf(convId, leaf.id);
+    } else {
+        throw new Error('The server cursor points to a message missing from this conversation tree');
+    }
+    await _refreshQueuedGeneration(convId, cursorAtStart, read);
+    if (!_sendOwnerIsCurrent(owner)
+        || `${State.loomCursor?.cursor_id}:${State.loomCursor?.revision}:${State.loomCursor?.leaf_message_id ?? ''}` !== cursorAtStart) return false;
     _mergeLiveStreamDraftIntoState();
+    return true;
+}
+
+function _queuedMessageFromItem(item) {
+    return {
+        id: item.user_msg_id,
+        conversation_id: item.conv_id,
+        parent_id: item.parent_id,
+        role: item.role || 'user',
+        content: item.content || '',
+        image_path: item.image_path || null,
+        describe_context: item.describe_context || null,
+        created_at: item.message_created_at || item.created_at,
+        origin_client_id: item.origin_client_id || item.client_instance_id || null,
+        target_anchor_id: item.target_anchor_id ?? null,
+        send_intent: item.send_intent || 'continue',
+        queued: true,
+        queue_status: item.status || 'queued',
+        queue_after_draft_id: item.wait_for_draft_id,
+    };
+}
+
+function _applyGenerationQueueState(items) {
+    _generationQueueItems = Array.isArray(items) ? items : [];
+    const queuedIds = new Set(
+        _generationQueueItems.map(item => String(item.user_msg_id))
+    );
+    let presentationChanged = false;
+    for (const message of State.messages || []) {
+        if (!message?.queued || queuedIds.has(String(message.id))) continue;
+        message.queued = false;
+        delete message.queue_status;
+        delete message.queue_after_draft_id;
+        presentationChanged = true;
+        const queuedEl = document.querySelector(`.message[data-msg-id="${message.id}"]`);
+        if (queuedEl) {
+            _syncQueuedMessagePresentation(queuedEl, message);
+        }
+    }
+    const visibleIds = new Set((State.messages || []).map(msg => String(msg.id)));
+    const visibleLeafId = _currentVisibleLeafId();
+    const selected = _generationQueueItems.find(item =>
+        visibleIds.has(String(item.user_msg_id))
+        || (_sameMessageId(visibleLeafId, item.wait_for_draft_id)
+            && visibleIds.has(String(item.wait_for_draft_id)))
+    );
+    const previousId = _queuedGeneration?.id;
+    const previousStatus = _queuedGeneration?.queue_status;
+    _queuedGeneration = selected ? _queuedMessageFromItem(selected) : null;
+    if (_queuedGeneration) {
+        _placeQueuedMessageAfterDraft(_queuedGeneration);
+        _placeQueuedMessageAfterDraftInDom(_queuedGeneration);
+    }
+    return presentationChanged
+        || String(previousId ?? '') !== String(_queuedGeneration?.id ?? '')
+        || String(previousStatus ?? '') !== String(_queuedGeneration?.queue_status ?? '');
+}
+
+function _placeQueuedMessageAfterDraft(message) {
+    if (!message?.id) return;
+    const messages = State.messages || (State.messages = []);
+    const existingIndex = messages.findIndex(item => _sameMessageId(item.id, message.id));
+    const queued = existingIndex >= 0
+        ? Object.assign(messages[existingIndex], message)
+        : message;
+    if (existingIndex >= 0) messages.splice(existingIndex, 1);
+
+    const waitForDraftId = queued.queue_after_draft_id;
+    if (waitForDraftId != null
+        && State._liveStreamDraft
+        && _sameMessageId(State._liveStreamDraft.id, waitForDraftId)
+        && !messages.some(item => _sameMessageId(item.id, waitForDraftId))) {
+        const firstDependentQueue = messages.findIndex(item =>
+            item?.queued && _sameMessageId(item.queue_after_draft_id, waitForDraftId)
+        );
+        if (firstDependentQueue >= 0) {
+            messages.splice(firstDependentQueue, 0, State._liveStreamDraft);
+        } else {
+            messages.push(State._liveStreamDraft);
+        }
+    }
+
+    const draftIndex = waitForDraftId == null
+        ? -1
+        : messages.findIndex(item => _sameMessageId(item.id, waitForDraftId));
+    if (draftIndex >= 0) messages.splice(draftIndex + 1, 0, queued);
+    else messages.push(queued);
+}
+
+function _placeQueuedMessageAfterDraftInDom(message) {
+    if (!message?.id) return;
+    const container = document.getElementById('messages');
+    if (!container) return;
+    let queuedEl = container.querySelector(`.message[data-msg-id="${message.id}"]`);
+    // A status change needs to update an existing row even when its parent is
+    // outside the rendered window. Never replace the row's content or editor.
+    if (queuedEl) _syncQueuedMessagePresentation(queuedEl, message);
+    if (message.queue_after_draft_id == null) return;
+    const draftEl = container.querySelector(
+        `.message[data-msg-id="${message.queue_after_draft_id}"]`
+    );
+    if (!draftEl) return;
+    if (!queuedEl) queuedEl = createMessageElement(message);
+    if (draftEl.nextElementSibling !== queuedEl) draftEl.after(queuedEl);
+}
+
+function _syncQueuedMessagePresentation(row, message) {
+    const queued = !!message.queued;
+    row.classList.toggle('queued-message', queued);
+    row.classList.toggle('paused-queued-message', queued && message.queue_status === 'paused');
+    const bar = row.querySelector('.queue-actions');
+    if (!queued) {
+        bar?.remove();
+        return;
+    }
+    // Save/Cancel edit own the action slot until the edit is finished.
+    if (row.querySelector('.edit-message-input')) return;
+    if (bar) _updateQueueActions(bar, message);
+    else row.appendChild(createQueueActions(message));
+}
+
+async function _refreshQueuedGeneration(convId = State.currentConvId, expectedCursor = undefined, read = url => API.get(url)) {
+    if (!convId) {
+        _applyGenerationQueueState([]);
+        return false;
+    }
+    try {
+        const threadParam = State.loomCursor?.thread_id
+            ? `?loom_thread_id=${encodeURIComponent(State.loomCursor.thread_id)}`
+            : '';
+        const items = await read(`/api/conversations/${convId}/generation-queue${threadParam}`);
+        if (!_sameMessageId(convId, State.currentConvId)) return false;
+        if (expectedCursor !== undefined
+            && `${State.loomCursor?.cursor_id}:${State.loomCursor?.revision}:${State.loomCursor?.leaf_message_id ?? ''}` !== expectedCursor) return false;
+        return _applyGenerationQueueState(items);
+    } catch (err) {
+        console.warn('[QUEUE] Failed to restore durable queue state:', err);
+        return false;
+    }
 }
 
 async function _syncMessagesForStreaming(convId) {
-    await _fetchActiveBranchMessages(convId);
+    if (await _fetchCursorBranchMessages(convId) === false || State.currentView !== 'tree') return;
     if (typeof renderTree === 'function') {
         if (typeof TREE !== 'undefined') TREE._skipCenter = true;
         renderTree();
@@ -299,28 +941,79 @@ async function _syncMessagesForStreaming(convId) {
     }
 }
 
-async function loadMessages(convId) {
+// Reconnects preserve editors, expanded tool output, the composer, and scroll.
+function _reconcileMessageRows(previous) {
+    const container = document.getElementById('messages');
+    const scroller = document.getElementById('messages-container');
+    const top = scroller.scrollTop;
+    const atBottom = scroller.scrollHeight - top - scroller.clientHeight < 60;
+    const old = new Map(previous.map(message => [String(message.id), JSON.stringify(message)]));
+    const visible = State.messages.slice(Math.min(VIRTUAL_SCROLL.renderedStart || 0, State.messages.length));
+    if (State.isStreaming && streamingDiv?.isConnected && _pendingLaunch
+        && State._followingDraftMsgId == null && !streamingDiv.dataset.msgId) {
+        const candidates = visible.filter(message => message.role === 'assistant'
+            && _sameMessageId(message.parent_id, _pendingLaunch.parentId)
+            && message.loom_thread_id === _pendingLaunch.threadId
+            && message.loom_thread_id === State.loomCursor?.thread_id);
+        // The cursor chain supplies one exact child for this pending launch.
+        // Bind the existing shell before row reconciliation can insert it twice.
+        if (candidates.length === 1) {
+            State._followingDraftMsgId = candidates[0].id;
+            streamingDiv.dataset.msgId = candidates[0].id;
+        }
+    }
+    const ids = new Set(visible.map(message => String(message.id)));
+    for (const row of container.querySelectorAll('.message[data-msg-id]')) {
+        if (!ids.has(row.dataset.msgId) && row !== streamingDiv
+            && !row.querySelector('.edit-message-input')) row.remove();
+    }
+    for (const message of visible) {
+        const row = container.querySelector(`.message[data-msg-id="${message.id}"]`);
+        if ((row && row === streamingDiv) || row?.querySelector('.edit-message-input')) continue;
+        if (!row || old.get(String(message.id)) !== JSON.stringify(message)) {
+            const replacement = createMessageElement(message);
+            if (row) row.replaceWith(replacement);
+            else container.insertBefore(replacement, streamingDiv?.isConnected ? streamingDiv : null);
+        }
+    }
+    if (State.messages.length) container.querySelector('.empty-loom-hint')?.remove();
+    scroller.scrollTop = atBottom ? scroller.scrollHeight : top;
+}
+
+async function loadMessages(convId, { preserveView = false, signal, refreshTreeAfter = true } = {}) {
     try {
         // NOTE: compactify banner is NOT cleared here — it's cleared in
         // loadConversation() when switching conversations, not on message reload
 
         const prevCount = State.messages.length;
+        const previous = State.messages.slice();
+        const prevQueuedId = _queuedGeneration?.id;
         // Signature includes empty/non-empty content state so an empty draft
         // filling in (same id, "" → real text) forces a re-render instead of
         // being skipped by the cheap-diff bail below.
-        const _msgSig = m => `${m.id}:${(m.content || '').length > 0 ? 1 : 0}`;
+        const _msgSig = m => JSON.stringify(m);
         const prevIdSig = State.messages.map(_msgSig).join(',');
-        await _fetchActiveBranchMessages(convId);
+        if (await _fetchCursorBranchMessages(convId, {signal, includeTree: refreshTreeAfter}) === false) return false;
         // Cheap change detection: if the message id list is identical to what
         // we already rendered, skip the container.innerHTML='' + full rebuild.
         // Heartbeat-driven WS reconnects used to call loadMessages on every
         // generation_idle and wipe the DOM even when nothing actually changed
         // — that's what the user was seeing as flicker.
         const newIdSig = State.messages.map(_msgSig).join(',');
-        if (newIdSig === prevIdSig && prevIdSig !== '' && !State.isStreaming) {
-            // Same chain. Refresh tree decorations only and bail.
-            if (typeof refreshTree === 'function') refreshTree();
-            return;
+        if (newIdSig === prevIdSig && prevIdSig !== ''
+            && String(prevQueuedId ?? '') === String(_queuedGeneration?.id ?? '')) {
+            // Same chain: queue controls were reconciled in place above. A
+            // streaming flag alone is not permission to detach focused rows.
+            // Recover a missing stream independently of the surrounding DOM.
+            if (State.isStreaming && !_isActuallyStreaming()
+                && State._streamIsOurBranch !== false) _requestSnapshotIfStreaming();
+            if (refreshTreeAfter && typeof refreshTree === 'function') refreshTree();
+            return true;
+        }
+        if (preserveView) {
+            _reconcileMessageRows(previous);
+            if (refreshTreeAfter && typeof refreshTree === 'function') refreshTree();
+            return true;
         }
         renderMessages();
         // If still streaming, renderMessages just destroyed the streaming div.
@@ -337,53 +1030,111 @@ async function loadMessages(convId) {
         if (State.messages.length > prevCount && prevCount > 0 && !State.isStreaming) {
             showToast('Response loaded');
         }
+        return true;
     } catch (err) {
         console.error('loadMessages failed:', err);
+        return false;
     }
 }
 
-let _genStatusSpinnerTicker = null;
-let _genStatusSpinnerFrame = 0;
-const _GEN_STATUS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let _pendingTurnStatus = null;
 
-function _startGenStatusSpinner() {
-    const spinner = document.getElementById('gen-status-spinner');
-    const dot = document.querySelector('#generation-status .gen-status-dot');
-    if (!spinner) return;
-    spinner.classList.remove('hidden');
-    if (dot) dot.classList.add('hidden');
-    if (_genStatusSpinnerTicker) clearInterval(_genStatusSpinnerTicker);
-    _genStatusSpinnerFrame = 0;
-    _genStatusSpinnerTicker = setInterval(() => {
-        spinner.textContent = _GEN_STATUS_SPINNER_FRAMES[_genStatusSpinnerFrame];
-        _genStatusSpinnerFrame = (_genStatusSpinnerFrame + 1) % _GEN_STATUS_SPINNER_FRAMES.length;
-    }, 80);
-}
-
-function _stopGenStatusSpinner() {
-    const spinner = document.getElementById('gen-status-spinner');
-    const dot = document.querySelector('#generation-status .gen-status-dot');
-    if (_genStatusSpinnerTicker) { clearInterval(_genStatusSpinnerTicker); _genStatusSpinnerTicker = null; }
-    if (spinner) { spinner.classList.add('hidden'); spinner.textContent = ''; }
-    if (dot) dot.classList.remove('hidden');
+async function _recoverIdleMessages({ requireTerminal = false, transportIndependent = false, signal } = {}) {
+    const convId = State.currentConvId;
+    const socket = State.ws;
+    const runId = State._followingGenId;
+    const owner = {
+        convId, conversationSeq: _conversationLoadRequestSeq,
+        branchSeq: State._branchSwitchSeq || 0,
+        navigationEpoch: typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch,
+    };
+    if (!await loadMessages(convId, { preserveView: true, signal, refreshTreeAfter: !transportIndependent })
+        || !_sendOwnerIsCurrent(owner) || (!transportIndependent && State.ws !== socket)
+        || State._followingGenId !== runId) return;
+    const draftId = State._followingDraftMsgId;
+    const saved = State.messages.find(message => draftId != null
+        ? _sameMessageId(message.id, draftId)
+        : message.role === 'assistant' && (_pendingLaunch
+            ? _sameMessageId(message.parent_id, _pendingLaunch.parentId)
+                && (!message.loom_thread_id || message.loom_thread_id === _pendingLaunch.threadId)
+            : transportIndependent && runId == null
+                && _sameMessageId(message.id, State.loomCursor?.leaf_message_id)));
+    if (requireTerminal && (!saved || (!['completed', 'cancelled', 'interrupted', 'failed', 'partial_failed'].includes(saved.turn_lifecycle_state)
+        && saved.generation_ms == null))) return;
+    if (saved && streamingDiv?.isConnected) {
+        const savedRow = document.querySelector(`.message[data-msg-id="${saved.id}"]`);
+        // Before stream_start the shell has no draft ID. HTTP reconciliation
+        // already inserted the saved row; replacing the shell would duplicate it.
+        if (savedRow && savedRow !== streamingDiv) removeStreamingMessage();
+        else streamingDiv.replaceWith(createMessageElement(saved));
+    }
+    else removeStreamingMessage();
+    _clearTerminalStreamState({ clearParallel: true });
+    hideGenStatus();
+    _showLaunchRecoveryNotice();
+    return true;
 }
 
 function showGenStatus(text, reconnecting = false) {
-    const el = document.getElementById('generation-status');
-    document.getElementById('gen-status-text').textContent = text;
-    el.classList.toggle('reconnecting', reconnecting);
-    el.classList.remove('hidden');
-    // Use the braille spinner for vision-describe status; the dot for everything else.
-    if (/^describing\b/i.test(text)) _startGenStatusSpinner();
-    else _stopGenStatusSpinner();
+    const waiting = streamingDiv?.isConnected
+        ? streamingDiv.querySelector('.stream-waiting')
+        : null;
+    const waitingText = waiting?.querySelector('.stream-waiting-text');
+    const inline = streamingDiv?.isConnected
+        ? streamingDiv.querySelector('.turn-lifecycle-status')
+        : null;
+    const inlineText = inline?.querySelector('.turn-lifecycle-text');
+    if (waiting && waitingText) {
+        // Before provider output, Clotho is the single turn-status surface.
+        // MCP/configuration/launch updates replace the generic waiting copy
+        // here instead of creating a second spinner in the footer.
+        waitingText.dataset.statusText = text;
+        waitingText.textContent = text;
+        inline?.classList.add('hidden');
+        _pendingTurnStatus = null;
+    } else if (inline && inlineText) {
+        inlineText.textContent = text;
+        inline.classList.remove('hidden');
+        _pendingTurnStatus = null;
+    } else {
+        // Status can beat creation/reconstruction of the in-turn shell. Keep
+        // it in memory and apply it when appendStreamingMessage mounts that
+        // shell; never resurrect the obsolete below-turn status row.
+        _pendingTurnStatus = { text, reconnecting };
+    }
+    const pending = !!_pendingLaunch || /prepar|launch|saving/i.test(String(text || ''));
+    document.querySelectorAll('.cancel-draft-btn').forEach(button => {
+        button.textContent = '⊘';
+        button.title = pending
+            ? 'Cancel launch; keep the user message'
+            : 'Cancel and discard partial context';
+        button.setAttribute('aria-label', button.title);
+        button.disabled = false;
+    });
+    document.querySelectorAll('.stream-thinking-footer').forEach(footer => {
+        let interrupt = footer.querySelector('.interrupt-draft-btn');
+        if (pending) {
+            interrupt?.remove();
+        } else if (!interrupt) {
+            interrupt = document.createElement('button');
+            interrupt.className = 'interrupt-draft-btn';
+            interrupt.textContent = '⏸';
+            interrupt.title = 'Interrupt and preserve partial context';
+            interrupt.setAttribute('aria-label', interrupt.title);
+            interrupt.addEventListener('click', interruptGeneration);
+            const cancel = footer.querySelector('.cancel-draft-btn');
+            if (cancel) cancel.insertAdjacentElement('afterend', interrupt);
+            else footer.prepend(interrupt);
+        }
+        if (interrupt) interrupt.disabled = false;
+    });
+    setBrowserTabState('looming');
     scrollToBottom();
 }
 
 function hideGenStatus() {
-    const el = document.getElementById('generation-status');
-    el.classList.add('hidden');
-    el.classList.remove('reconnecting');
-    _stopGenStatusSpinner();
+    _pendingTurnStatus = null;
+    streamingDiv?.querySelector('.turn-lifecycle-status')?.classList.add('hidden');
 }
 
 function showRetryBar(errorMsg) {
@@ -397,14 +1148,25 @@ function showRetryBar(errorMsg) {
         <button class="btn-small retry-btn" id="btn-retry">Retry</button>
         <button class="retry-dismiss" title="Dismiss">✕</button>
     `;
-    bar.querySelector('#btn-retry').addEventListener('click', () => {
+    bar.querySelector('#btn-retry').addEventListener('click', async () => {
         hideRetryBar();
         // Retry: send generate for the current active leaf
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-            showGenStatus('Retrying...');
-            const retryMsg = { action: 'generate', parent_id: _currentVisibleLeafId() || null };
-            _attachCCSettings(retryMsg);
-            State.ws.send(JSON.stringify(retryMsg));
+            try {
+                const parentId = _currentVisibleLeafId();
+                await selectServerLoomCursor(State.currentConvId, parentId);
+                showGenStatus('Retrying...');
+                const retryMsg = {
+                    action: 'generate',
+                    parent_id: parentId,
+                    client_instance_id: _loomClientInstanceId,
+                    loom_thread_id: State.loomCursor?.thread_id || null,
+                };
+                _attachCCSettings(retryMsg);
+                State.ws.send(JSON.stringify(retryMsg));
+            } catch (err) {
+                showToast(err.detail || err.message || 'Retry target changed', 'error');
+            }
         }
     });
     bar.querySelector('.retry-dismiss').addEventListener('click', () => {
@@ -415,6 +1177,7 @@ function showRetryBar(errorMsg) {
 }
 
 function hideRetryBar() {
+    _launchRecoveryNotice = null;
     const existing = document.getElementById('retry-bar');
     if (existing) existing.remove();
 }
@@ -429,12 +1192,113 @@ function _currentVisibleLeafId() {
     return visible.length ? visible[visible.length - 1].id : null;
 }
 
+async function _messageTopologyContract(parentId, topologyIntent, convId = State.currentConvId, capturedCursor = null, treeData = State.treeData) {
+    let cursor = capturedCursor || State.loomCursors?.[String(convId)] || null;
+    if (topologyIntent === 'new_thread') {
+        if (!cursor || cursor.leaf_message_id != null) {
+            throw new Error('This tab no longer points to an empty Loom thread');
+        }
+        if (parentId != null) {
+            throw new Error('A standalone Loom thread cannot have a parent');
+        }
+    } else {
+        if (parentId == null) {
+            throw new Error('Choose an exact message before continuing this thread');
+        }
+        // Ordinary Send already has the exact selected leaf. Do not re-read
+        // the mutable viewport after an asynchronous slash-command lookup.
+        if (!_sameMessageId(cursor?.leaf_message_id, parentId)) {
+            cursor = await selectServerLoomCursor(convId, parentId, treeData);
+        }
+    }
+    return {
+        parent_id: parentId,
+        loom_thread_id: cursor.thread_id,
+        cursor_id: cursor.cursor_id,
+        cursor_revision: cursor.revision,
+        expected_leaf_id: cursor.leaf_message_id,
+        topology_intent: topologyIntent,
+        client_instance_id: _loomClientInstanceId,
+    };
+}
+
+function _acceptMessageCursor(message, convId = State.currentConvId) {
+    if (message?.loom_cursor) _storeLoomCursor(message.loom_cursor);
+    if (message?.id != null) rememberConversationLeaf(convId, message.id);
+}
+
+function _activeQueueParentId() {
+    if (!_isActuallyStreaming()) return null;
+    const draftId = State._followingDraftMsgId
+        ?? State._liveStreamDraft?.id
+        ?? streamingDiv?.dataset?.msgId;
+    if (draftId === undefined || draftId === null || draftId === '') return null;
+    const numericId = Number(draftId);
+    return Number.isFinite(numericId) ? numericId : draftId;
+}
+
 function _streamParentMatchesVisibleBranch(parentId, draftMsgId) {
+    // The server may already have advanced this page's durable cursor while
+    // its old answer is still painted during launch/reconnect reconciliation.
+    const cursorLeaf = State.loomCursor?.leaf_message_id;
+    if (cursorLeaf != null && (_sameMessageId(cursorLeaf, parentId)
+        || (draftMsgId != null && _sameMessageId(cursorLeaf, draftMsgId)))) return true;
     if (draftMsgId != null && (State.messages || []).some(m => _sameMessageId(m.id, draftMsgId))) {
         return true;
     }
     if (parentId == null) return _currentVisibleLeafId() == null;
     return _sameMessageId(parentId, _currentVisibleLeafId());
+}
+
+function _submittedReplyLeaf(nodes, anchor) {
+    if (!anchor || anchor.role !== 'user') return anchor;
+    const replies = nodes.filter(node => node.role === 'assistant'
+        && _sameMessageId(node.parent_id, anchor.id)
+        && String(node.loom_thread_id) === String(anchor.loom_thread_id));
+    return replies.length === 1 ? replies[0] : anchor;
+}
+
+function _generationWindowOwnership(data) {
+    if (!data) return false;
+    const runId = _canonicalClientRunId(data);
+    // Run identity is authoritative whenever present. The first stream_start
+    // is the subscription handshake for a server-launched turn: the server has
+    // already routed it to the exact launch socket, while the browser could not
+    // know the newly allocated run id before receiving this event. Bootstrap
+    // only from immutable launch provenance, never from focus or branch
+    // visibility. Every later run event requires the recorded subscription.
+    if (runId) {
+        const eventConvId = data.conversation_id ?? data.conv_id;
+        if (eventConvId != null && !_sameConvId(eventConvId, State.currentConvId)) return false;
+        if (data.loom_thread_id != null && State.loomCursor?.thread_id != null
+            && String(data.loom_thread_id) !== String(State.loomCursor.thread_id)) return false;
+        const alreadyOwned = _subscribedRunIds.has(runId)
+            || (State._followingGenId != null
+                && runId === `gen:${State._followingGenId}`);
+        if (alreadyOwned) return true;
+        const sameClient = data.client_instance_id
+            && String(data.client_instance_id) === String(_loomClientInstanceId);
+        const sameConversation = eventConvId == null
+            || _sameConvId(eventConvId, State.currentConvId);
+        const currentThreadId = State.loomCursor?.thread_id ?? null;
+        const sameThread = (data.loom_thread_id == null && currentThreadId == null)
+            || (currentThreadId != null
+                && data.loom_thread_id != null
+                && String(data.loom_thread_id) === String(currentThreadId));
+        const sameAnchor = _sendOwnerIsCurrent(_submittedSendOwner)
+            || _sameMessageId(data.parent_id, State.loomCursor?.leaf_message_id)
+            || _sameMessageId(data.draft_msg_id, State.loomCursor?.leaf_message_id)
+            || (_pendingLaunch && _sameMessageId(_pendingLaunch.parentId, data.parent_id));
+        if ((data.type === 'stream_start' || data.type === 'generation_preparing')
+            && sameClient && sameConversation && sameThread && sameAnchor) {
+            _subscribedRunIds.add(runId);
+            return true;
+        }
+        return false;
+    }
+    if (data.client_instance_id
+        && String(data.client_instance_id) === String(_loomClientInstanceId)) return true;
+    return data.client_instance_id == null ? null : false;
 }
 
 function _draftBlocks(value) {
@@ -461,10 +1325,16 @@ function _mergeLiveStreamDraftIntoState() {
     if (!live || live.id == null) return null;
     const idx = (State.messages || []).findIndex(m => _sameMessageId(m.id, live.id));
     if (idx < 0) {
-        State.messages.push(live);
+        const queuedIndex = (State.messages || []).findIndex(message =>
+            message?.queued && _sameMessageId(message.queue_after_draft_id, live.id)
+        );
+        if (queuedIndex >= 0) State.messages.splice(queuedIndex, 0, live);
+        else State.messages.push(live);
         return live;
     }
     const fetched = State.messages[idx];
+    if (['completed', 'cancelled', 'interrupted', 'failed', 'partial_failed'].includes(fetched.turn_lifecycle_state)
+        || fetched.generation_ms != null) return fetched;
     if (String(fetched.content || '').length > String(live.content || '').length) {
         live.content = fetched.content;
     }
@@ -474,6 +1344,9 @@ function _mergeLiveStreamDraftIntoState() {
     if (!live.model_attestation && fetched.model_attestation) {
         live.model_attestation = fetched.model_attestation;
     }
+    const selections = new Map(parseChatItems(fetched.chat_items).map(item => [item.id, item]));
+    for (const item of parseChatItems(live.chat_items)) selections.set(item.id, item);
+    if (fetched.chat_items != null || live.chat_items != null) live.chat_items = JSON.stringify([...selections.values()]);
     State._liveStreamDraft = { ...fetched, ...live };
     State.messages[idx] = State._liveStreamDraft;
     return State._liveStreamDraft;
@@ -492,9 +1365,17 @@ function _ensureLiveStreamDraft(data = {}) {
         conversation_id: State.currentConvId,
         role: 'assistant',
         parent_id: data.parent_id ?? existing?.parent_id ?? null,
+        loom_thread_id: data.loom_thread_id
+            ?? existing?.loom_thread_id
+            ?? State.loomCursor?.thread_id
+            ?? null,
         content: existing?.content || '',
         content_blocks: _draftBlocks(existing?.content_blocks),
+        chat_items: existing?.chat_items ?? '[]',
         cc_model_used: data.cc_model || data.local_model || existing?.cc_model_used || '',
+        session_continuity: data.session_continuity
+            ?? existing?.session_continuity
+            ?? null,
     };
     return _mergeLiveStreamDraftIntoState();
 }
@@ -559,16 +1440,25 @@ function _syncLiveDraftFromSnapshot(snap) {
     if (snap.model_attestation) {
         draft.model_attestation = JSON.stringify(_parseModelAttestation(snap.model_attestation));
     }
+    if (snap.time_to_first_token_ms != null) draft.time_to_first_token_ms = snap.time_to_first_token_ms;
     return draft;
 }
 
 const _OWNED_STREAM_EVENT_TYPES = new Set([
+    'generation_preparing',
     'thinking_start', 'thinking_end', 'thinking_chunk', 'stream_chunk',
-    'tool_start', 'tool_input_chunk', 'tool_result', 'usage',
-    'model_attestation', 'stream_end', 'cancelled', 'error', 'permission_request',
+    'tool_start', 'tool_input_chunk', 'tool_result', 'usage', 'chat_item',
+    'model_attestation', 'stream_end', 'cancelled', 'interrupted', 'error', 'permission_request',
 ]);
 
 function _isOurBranch(data) {
+    if (_generationWindowOwnership(data) === false) return false;
+    // Every run-scoped event must match the exact subscribed run.  This gate
+    // intentionally runs before legacy branch checks below.
+    const eventRunId = _canonicalClientRunId(data);
+    if (eventRunId && !_subscribedRunIds.has(eventRunId)
+        && !(State._followingGenId != null
+            && eventRunId === `gen:${State._followingGenId}`)) return false;
     // If we're following a specific gen_id, only match that one
     if (State._followingGenId != null && data.gen_id != null) {
         return data.gen_id === State._followingGenId;
@@ -597,23 +1487,19 @@ function _isOurBranch(data) {
 // "still working" indicator so it never lingers when activity is visible.
 const _ACTIVITY_EVENT_TYPES = new Set([
     'stream_chunk',
-    // NOTE: 'thinking_chunk' is intentionally NOT here. The inline
-    // "waiting for first token…" indicator means "no *text* token yet",
-    // so thinking activity must not strip it — otherwise the indicator
-    // (and its 10s "still working… large context can take 30–90s"
-    // escalation) dies the instant thinking begins, which is exactly
-    // the long-pre-first-token case it exists to narrate. The indicator
-    // is removed separately on real stream_chunk / tool_* / usage>0.
+    // thinking_chunk is handled in its switch case so an empty provider
+    // heartbeat cannot falsely clear the waiting indicator.
     'tool_start', 'tool_input_chunk', 'tool_result', 'tool_use',
     'ask_user_question',
     'state_update', 'compact_boundary', 'compact_summary_ready', 'compact_done',
-    'plan_ready', 'plan_landed', 'canvas_updated', 'image_describe',
+    'plan_ready', 'plan_landed', 'canvas_updated', 'image_describe', 'chat_item',
 ]);
 
 const _RECONSTRUCT_QUEUE_EVENT_TYPES = new Set([
+    'generation_preparing',
     'thinking_start', 'thinking_end', 'thinking_chunk',
-    'stream_chunk', 'tool_start', 'tool_input_chunk', 'tool_result',
-    'usage', 'model_attestation', 'stream_end', 'cancelled', 'error', 'permission_request', 'generation_idle',
+    'stream_chunk', 'tool_start', 'tool_input_chunk', 'tool_result', 'chat_item',
+    'usage', 'first_token', 'model_attestation', 'stream_end', 'generation_terminal', 'cancelled', 'interrupted', 'error', 'permission_request', 'generation_idle',
 ]);
 let _queuedStreamEventsDuringReconstruct = [];
 
@@ -643,10 +1529,757 @@ function _permissionBelongsToVisibleBranch(data) {
     return _isOurBranch(data);
 }
 
+function _agentRunForEvent(runId) {
+    if (!runId) return null;
+    const id = String(runId).replace(/^agent:/, '');
+    let run = (State.agentRuns || []).find(item => String(item.run_id) === id);
+    if (!run) {
+        run = { run_id: id, conversation_id: State.currentConvId };
+        State.agentRuns = [...(State.agentRuns || []), run];
+    }
+    return run;
+}
+
+const _ACTIVE_AGENT_RUN_STATUSES = new Set([
+    'queued', 'needs_relaunch', 'launching', 'running', 'cancel_requested',
+]);
+
+function _agentManagerTarget() {
+    const mode = String(State.currentConv?.mode || '').toLowerCase();
+    if (mode === 'hermes' || mode === 'weave') return document.getElementById('weave-inline-controls');
+    if (mode === 'dream') return document.getElementById('dream-inline-controls');
+    if (['claude', 'local', 'codex', 'gemini', 'goose', 'umans', 'openrouter'].includes(mode)) {
+        return document.getElementById('cc-inline-controls');
+    }
+    return null;
+}
+
+let _agentViewEpoch = 0;
+let _agentRefreshJob = null;
+let _agentRenderTimer = null;
+let _agentRenderDirty = false;
+
+function resetAgentActivity() {
+    _agentViewEpoch++;
+    _agentRefreshJob = null;
+    clearTimeout(_agentRenderTimer);
+    _agentRenderTimer = null;
+    _agentRenderDirty = true;
+}
+
+function _scheduleAgentRender(immediate = false) {
+    _agentRenderDirty = true;
+    if (document.hidden) return;
+    if (immediate) {
+        clearTimeout(_agentRenderTimer);
+        _agentRenderTimer = null;
+        renderAgentActivity();
+    } else if (_agentRenderTimer == null) {
+        _agentRenderTimer = setTimeout(() => {
+            _agentRenderTimer = null;
+            if (!document.hidden) renderAgentActivity();
+        }, 100);
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && _agentRenderDirty) _scheduleAgentRender(true);
+});
+
+function _agentRunIsCurrent(run, epoch) {
+    return epoch === _agentViewEpoch && _sameConvId(run.conversation_id, State.currentConvId)
+        && (State.agentRuns || []).includes(run);
+}
+
+async function _replayAgentRun(run) {
+    if (run._replayJob) return run._replayJob;
+    const epoch = _agentViewEpoch;
+    const replay = async () => {
+        try {
+            while (_agentRunIsCurrent(run, epoch)) {
+                const after = Number(run._lastSequence || 0);
+                if (after >= Number(run._replayTarget || 0)) break;
+                const events = await API.get(
+                    `/api/agent-runs/${encodeURIComponent(run.run_id)}/events?after_sequence=${after}&limit=500`
+                );
+                if (!_agentRunIsCurrent(run, epoch)) return;
+                if (!Array.isArray(events) || !events.length) break;
+                for (const event of events) {
+                    _applyAgentEventToRun(run, {
+                        ...(event.payload || {}), type: event.event_kind,
+                        event_kind: event.event_kind, sequence: event.sequence,
+                        run_id: `agent:${run.run_id}`, _historical: true,
+                    });
+                }
+                _scheduleAgentRender();
+                if (Number(run._lastSequence || 0) <= after) break;
+            }
+        } catch (err) {
+            console.warn(`[Agent manager] event replay failed for ${run.run_id}`, err);
+        }
+    };
+    run._replayJob = replay();
+    try { await run._replayJob; }
+    finally { run._replayJob = null; }
+}
+
+async function refreshAgentRuns() {
+    if (!State.currentConvId) return;
+    if (_agentRefreshJob) return _agentRefreshJob;
+    const job = _refreshAgentRuns();
+    _agentRefreshJob = job;
+    try { await job; }
+    finally { if (_agentRefreshJob === job) _agentRefreshJob = null; }
+}
+
+async function _refreshAgentRuns() {
+    const requestedConv = State.currentConvId;
+    const epoch = _agentViewEpoch;
+    try {
+        const [rows, dismissals] = await Promise.all([
+            API.get(`/api/conversations/${requestedConv}/agent-runs`),
+            API.get('/api/agent-notification-dismissals'),
+        ]);
+        for (const key of dismissals) _agentDismissals.add(key);
+        if (epoch !== _agentViewEpoch || String(State.currentConvId) !== String(requestedConv)) return;
+        const previous = new Map((State.agentRuns || []).map(run => [run.run_id, run]));
+        if (!Array.isArray(rows)) return;
+        const merged = rows.map(row => {
+            const run = previous.get(row.run_id) || {};
+            const newerState = Number(run._statusSequence || 0) > Number(row.event_sequence || 0)
+                ? { status: run.status, result: run.result, error: run.error,
+                    pid: run.pid, cancel_requested: run.cancel_requested } : {};
+            Object.assign(run, row, newerState);
+            run._statusSequence = Math.max(Number(run._statusSequence || 0), Number(row.event_sequence || 0));
+            run._replayTarget = Math.max(Number(run._replayTarget || 0), Number(row.event_sequence || 0));
+            // A completed result is already a full snapshot; don't replay its
+            // entire token/tool history just to show a preview on a fresh page.
+            if (!run._lastSequence && run.result?.text && !_ACTIVE_AGENT_RUN_STATUSES.has(run.status)) {
+                run._lastSequence = Number(row.event_sequence || 0);
+            }
+            previous.delete(row.run_id);
+            return run;
+        });
+        // A child may be announced while this HTTP snapshot is in flight.
+        State.agentRuns = [...merged, ...previous.values()];
+        const activeRuns = State.agentRuns.filter(run => (
+            _ACTIVE_AGENT_RUN_STATUSES.has(run.status || 'queued')
+        ));
+        if (State.ws?.readyState === WebSocket.OPEN) {
+            for (const run of activeRuns) {
+                State.ws.send(JSON.stringify({
+                    action: 'subscribe_run',
+                    run_id: `agent:${run.run_id}`,
+                }));
+            }
+        }
+        _scheduleAgentRender(true);
+        // Replay terminal runs too: a child may have finished while the tab was
+        // disconnected. Limit simultaneous history requests to two per page.
+        const pending = State.agentRuns.filter(run => Number(run._lastSequence || 0) < Number(run._replayTarget || 0));
+        for (let i = 0; i < pending.length; i += 2) {
+            if (epoch !== _agentViewEpoch) return;
+            await Promise.all(pending.slice(i, i + 2).map(_replayAgentRun));
+        }
+        if (epoch === _agentViewEpoch) _scheduleAgentRender(true);
+    } catch (err) {
+        console.warn('[Agent manager] refresh failed', err);
+    }
+}
+
+function _agentRunOutput(run) {
+    if (!_ACTIVE_AGENT_RUN_STATUSES.has(run.status) && run.result?.text) return String(run.result.text);
+    if (run.last_output) return String(run.last_output);
+    if (typeof run.error === 'string' && run.error) return run.error;
+    if (run.error?.message) return String(run.error.message);
+    if (typeof run.result === 'string') return run.result;
+    for (const key of ['text', 'output', 'message']) {
+        if (run.result?.[key]) return String(run.result[key]);
+    }
+    return '';
+}
+
+function _closeAgentManager() {
+    const panel = document.getElementById('agent-manager-panel');
+    const toggle = document.getElementById('btn-agent-manager');
+    panel?.classList.add('hidden');
+    toggle?.setAttribute('aria-expanded', 'false');
+    document.getElementById('workspace-agents')?.setAttribute('aria-expanded', 'false');
+    if (typeof syncWorkspaceLayout === 'function') syncWorkspaceLayout();
+}
+
+const _agentDismissalsKey = 'exo-agent-notification-dismissals-v1';
+function _readAgentDismissals() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(_agentDismissalsKey) || '[]');
+        return Array.isArray(saved) ? saved.filter(item => typeof item === 'string').slice(-2048).map(item => {
+            // Previous keys included completed_at, which arrives after live terminal events.
+            try { const key = JSON.parse(item); return JSON.stringify(key.slice(0, 3)); }
+            catch { return item; }
+        }) : [];
+    } catch { return []; }
+}
+const _agentDismissals = new Set(_readAgentDismissals());
+function _agentNotificationKey(run) {
+    return JSON.stringify([run.run_id, run.status, run.started_at || null]);
+}
+function _agentHasNotification(run) {
+    return ['completed', 'failed'].includes(run.status) && !_agentDismissals.has(_agentNotificationKey(run));
+}
+async function clearAgentNotifications() {
+    const keys = (State.agentRuns || []).filter(_agentHasNotification).map(_agentNotificationKey);
+    try {
+        const saved = await API.post('/api/agent-notification-dismissals', {keys});
+        for (const key of saved) _agentDismissals.add(key);
+    } catch (error) {
+        showToast(error.detail || 'Could not save notification dismissals', 'error');
+        return;
+    }
+    for (const key of _readAgentDismissals()) _agentDismissals.add(key);
+    while (_agentDismissals.size > 2048) _agentDismissals.delete(_agentDismissals.values().next().value);
+    try { localStorage.setItem(_agentDismissalsKey, JSON.stringify([..._agentDismissals])); } catch {}
+    renderAgentActivity();
+}
+window.addEventListener('storage', event => {
+    if (event.key !== _agentDismissalsKey) return;
+    for (const key of _readAgentDismissals()) _agentDismissals.add(key);
+    renderAgentActivity();
+});
+
+function _bindAgentManager() {
+    const anchor = document.getElementById('agent-manager-anchor');
+    const toggle = document.getElementById('btn-agent-manager');
+    const panel = document.getElementById('agent-manager-panel');
+    const close = document.getElementById('agent-manager-close');
+    const refresh = document.getElementById('agent-activity-refresh');
+    const list = document.getElementById('agent-activity-list');
+    if (!anchor || !toggle || !panel || !list || anchor.dataset.bound) return;
+    anchor.dataset.bound = '1';
+    const clear = document.createElement('button');
+    clear.id = 'agent-clear-notifications';
+    clear.type = 'button';
+    clear.textContent = 'Clear notifications';
+    clear.title = 'Dismiss completed and failed counts; keep all agent history';
+    clear.addEventListener('click', clearAgentNotifications);
+    panel.querySelector('.agent-manager-header-actions').prepend(clear);
+
+    toggle.addEventListener('click', async () => {
+        const opening = panel.classList.contains('hidden');
+        panel.classList.toggle('hidden', !opening);
+        toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        document.getElementById('workspace-agents')?.setAttribute('aria-expanded', String(opening));
+        if (opening) {
+            if (State.currentView === 'chat') {
+                workspaceSetOpen('right', false, false);
+                if (isMobileDevice()) {
+                    workspaceSetOpen('left', false, false);
+                    setWorkspaceCanvasOpen(false);
+                }
+            }
+            renderAgentActivity();
+            if (typeof syncWorkspaceLayout === 'function') syncWorkspaceLayout();
+            await refreshAgentRuns();
+        } else if (typeof syncWorkspaceLayout === 'function') syncWorkspaceLayout();
+    });
+    close?.addEventListener('click', _closeAgentManager);
+    refresh?.addEventListener('click', refreshAgentRuns);
+    document.getElementById('agent-dock-attention')?.addEventListener('click', async () => {
+        if (panel.classList.contains('hidden')) toggle.click();
+        renderAgentActivity();
+        const waiting = list.querySelector('[data-status="permission"]');
+        if (waiting) { waiting.open = true; waiting.scrollIntoView({block: 'nearest'}); }
+    });
+    list.addEventListener('click', async event => {
+        const release = event.target.closest('[data-agent-release]');
+        if (release) {
+            event.preventDefault();
+            event.stopPropagation();
+            const card = release.closest('.agent-run-card');
+            const text = card.querySelector('.agent-release-text').value.trim();
+            if (!text) { showToast('Enter the handoff to release.', 'error'); return; }
+            release.disabled = true;
+            try {
+                await API.post(`/api/agent-runs/${encodeURIComponent(card.dataset.runId)}/release`, {text});
+                release.textContent = 'Handoff released';
+            } catch (error) {
+                showToast(error.detail || error.message || 'Could not release handoff', 'error');
+                release.disabled = false;
+            }
+            return;
+        }
+        const review = event.target.closest('[data-agent-permission]');
+        if (review) {
+            event.preventDefault();
+            event.stopPropagation();
+            const card = review.closest('.agent-run-card');
+            card.open = true;
+            card.querySelector('.agent-permissions')?.scrollIntoView({block: 'nearest'});
+            return;
+        }
+        const cancel = event.target.closest('[data-agent-cancel]');
+        const resume = event.target.closest('[data-agent-resume]');
+        if (!cancel && !resume) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const action = cancel || resume;
+        const runId = cancel?.dataset.agentCancel || resume?.dataset.agentResume;
+        if (!runId || action.disabled) return;
+        const run = _agentRunForEvent(runId);
+        const epoch = _agentViewEpoch;
+        const statusSequence = Number(run._statusSequence || 0);
+        run._actionPending = cancel ? 'cancel' : 'resume';
+        action.disabled = true;
+        action.textContent = cancel ? 'Stopping…' : 'Resuming…';
+        try {
+            const verb = cancel ? 'cancel' : 'resume';
+            const updated = await API.post(`/api/agent-runs/${encodeURIComponent(runId)}/${verb}`);
+            if (_agentRunIsCurrent(run, epoch)) {
+                const newerState = Number(run._statusSequence || 0) > statusSequence
+                    ? {status: run.status, result: run.result, error: run.error,
+                        pid: run.pid, cancel_requested: run.cancel_requested} : {};
+                Object.assign(run, updated, newerState);
+            }
+        } catch (err) {
+            if (_agentRunIsCurrent(run, epoch)) {
+                showToast(err.detail || err.message || `Could not ${cancel ? 'cancel' : 'resume'} subagent`, 'error');
+            }
+        } finally {
+            run._actionPending = null;
+            if (_agentRunIsCurrent(run, epoch)) _scheduleAgentRender(true);
+        }
+    });
+    document.addEventListener('click', event => {
+        if (State.currentView !== 'chat' && !panel.classList.contains('hidden') && !anchor.contains(event.target)) {
+            _closeAgentManager();
+        }
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && !panel.classList.contains('hidden')) _closeAgentManager();
+    });
+}
+
+function renderAgentActivity() {
+    if (document.hidden) { _agentRenderDirty = true; return; }
+    _agentRenderDirty = false;
+    const anchor = document.getElementById('agent-manager-anchor');
+    const panel = document.getElementById('agent-manager-panel');
+    const list = document.getElementById('agent-activity-list');
+    const count = document.getElementById('agent-manager-count');
+    if (!anchor || !panel || !list || !count) return;
+    _bindAgentManager();
+
+    const target = _agentManagerTarget();
+    anchor.classList.toggle('hidden', !target);
+    if (!target) {
+        _closeAgentManager();
+        return;
+    }
+    const placement = target;
+    if (State.currentView === 'chat') {
+        const canvas = placement.querySelector('#btn-canvas-toggle');
+        if (anchor.parentElement !== placement || (canvas && anchor.nextElementSibling !== canvas)) placement.insertBefore(anchor, canvas);
+    } else if (anchor.parentElement !== placement) placement.appendChild(anchor);
+
+    const allRuns = State.agentRuns || [];
+    const activeCount = allRuns.filter(run => _ACTIVE_AGENT_RUN_STATUSES.has(run.status || 'queued')).length;
+    _agentSetText(count, String(activeCount));
+    count.classList.toggle('hidden', activeCount === 0);
+    count.title = `${activeCount} running or queued`;
+    count.setAttribute('aria-label', count.title);
+    const workspaceCount = document.getElementById('workspace-agent-count');
+    if (workspaceCount) {
+        _agentSetText(workspaceCount, String(activeCount));
+        workspaceCount.classList.toggle('hidden', activeCount === 0);
+    }
+    anchor.classList.toggle('has-active-agents', activeCount > 0);
+    const pendingCount = allRuns.reduce((sum, run) => sum + Object.keys(run._permissions || {}).length, 0);
+    const finished = allRuns.filter(run => run.status === 'completed' && _agentHasNotification(run)).length;
+    const failures = allRuns.filter(run => run.status === 'failed' && _agentHasNotification(run)).length;
+    document.getElementById('agent-clear-notifications').disabled = finished + failures === 0;
+    const status = document.getElementById('agent-dock-status');
+    for (const [kind, total, label] of [['completed', finished, 'completed'], ['failed', failures, 'failed']]) {
+        let badge = status.querySelector(`.agent-dock-${kind}`);
+        if (!badge) {
+            if (!status.querySelector('.agent-dock-badge')) status.replaceChildren();
+            badge = document.createElement('span');
+            badge.className = `agent-dock-badge agent-dock-${kind}`;
+            status.appendChild(badge);
+        }
+        _agentSetText(badge, String(total));
+        badge.classList.toggle('hidden', total === 0);
+        badge.title = `${total} ${label}`;
+        badge.setAttribute('aria-label', badge.title);
+    }
+    const attention = document.getElementById('agent-dock-attention');
+    const attentionCount = allRuns.filter(run => Object.keys(run._permissions || {}).length || run._permissionPending
+        || ['needs_relaunch', 'paused', 'blocked'].includes(run.status)).length;
+    _agentSetText(attention, `! ${attentionCount}`);
+    attention.title = `${attentionCount} agents need attention (${pendingCount} pending approvals)`;
+    attention.setAttribute('aria-label', attention.title);
+    attention.classList.toggle('hidden', !attentionCount);
+    // A closed panel needs only the badge. Do not allocate/rebuild its cards.
+    if (panel.classList.contains('hidden')) return;
+    const runs = [...allRuns].sort((a, b) =>
+        Number(_ACTIVE_AGENT_RUN_STATUSES.has(b.status)) - Number(_ACTIVE_AGENT_RUN_STATUSES.has(a.status))
+    ).slice(0, 20);
+    const runMap = new Map(runs.map(run => [String(run.run_id), run]));
+    const depthFor = (run, seen = new Set()) => {
+        const runId = String(run.run_id || '');
+        const parentId = String(run.parent_run_id || '').replace(/^agent:/, '');
+        if (!parentId || parentId.startsWith('gen:') || seen.has(runId)) return 0;
+        const parent = runMap.get(parentId);
+        if (!parent) return 0;
+        return Math.min(4, 1 + depthFor(parent, new Set([...seen, runId])));
+    };
+    for (const run of runs) run._depth = depthFor(run);
+    if (list.dataset.conversationId !== String(State.currentConvId)) {
+        list.replaceChildren();
+        list.dataset.conversationId = String(State.currentConvId);
+    }
+    const oldCards = new Map([...list.querySelectorAll('.agent-run-card')].map(el => [el.dataset.runId, el]));
+    const scrollTop = list.scrollTop;
+    const top = list.getBoundingClientRect().top;
+    const visibleCard = [...oldCards.values()].find(el => el.getBoundingClientRect().bottom > top);
+    const visibleOffset = visibleCard ? visibleCard.getBoundingClientRect().top - top : 0;
+
+    if (!runs.length) {
+        if (!list.querySelector('.agent-manager-empty')) {
+            const empty = document.createElement('div');
+            empty.className = 'agent-manager-empty';
+            empty.textContent = 'No Loom-managed subagents in this conversation.';
+            list.replaceChildren(empty);
+        }
+        return;
+    }
+    list.querySelector('.agent-manager-empty')?.remove();
+
+    for (const [index, run] of runs.entries()) {
+        const statusName = run.status || 'queued';
+        const displayStatus = run._permissionPending ? 'permission' : statusName;
+        const details = oldCards.get(String(run.run_id)) || _createAgentCard(run.run_id);
+        oldCards.delete(String(run.run_id));
+        details.dataset.status = displayStatus;
+        details.style.setProperty('--agent-indent', `${Number(run._depth || 0) * 12}px`);
+        _agentSetText(details.querySelector('.agent-status'), displayStatus === 'permission' ? 'Needs approval' : displayStatus.replaceAll('_', ' '));
+        _agentSetText(details.querySelector('.agent-task'), (run.task || '(untitled task)').split('\n')[0].slice(0, 140));
+        _agentSetText(details.querySelector('.agent-elapsed'), _activityElapsed(run.started_at || run.created_at));
+        const waitLabel = {workspace_conflict: 'Waiting for workspace access', inference_capacity: 'Waiting for inference capacity', worker_capacity: 'Waiting for worker capacity'}[run.queue_reason];
+        _agentSetText(details.querySelector('.agent-meta'), `${run.effective_harness || run.requested_harness || 'agent'} · ${run.effective_model || run.requested_model || run.model_profile || 'default'}${run.access?.sensitive || run.sensitive ? ' · Sensitive local task' : ''}${statusName === 'queued' && waitLabel ? ' · ' + waitLabel : ''}`);
+        _agentSetText(details.querySelector('.agent-full-task'), run.task || '');
+        _agentSetText(details.querySelector('.agent-full-result'), typeof run.result?.text === 'string' ? run.result.text : '');
+        details.querySelector('.agent-result-details').classList.toggle('hidden', !run.result?.text);
+        details.querySelector('.agent-release').classList.toggle('hidden', !run.access?.sensitive || statusName !== 'completed');
+        const error = details.querySelector('.agent-error');
+        _agentSetText(error, String(run.error?.message || run.error || ''));
+        error.classList.toggle('hidden', !run.error);
+        const output = details.querySelector('.agent-output');
+        const outputText = _agentRunOutput(run).slice(-1600);
+        const wasAtBottom = output.scrollHeight - output.clientHeight - output.scrollTop < 4;
+        const outputScroll = output.scrollTop;
+        _agentSetText(output, outputText);
+        output.classList.toggle('hidden', !outputText);
+        output.scrollTop = wasAtBottom ? output.scrollHeight : outputScroll;
+        const active = _ACTIVE_AGENT_RUN_STATUSES.has(statusName);
+        const recoverable = run.pid == null && !run.cancel_requested &&
+            (statusName === 'paused' || (statusName === 'failed' && !run.image_request));
+        const cancel = details.querySelector('[data-agent-cancel]');
+        const resume = details.querySelector('[data-agent-resume]');
+        const review = details.querySelector('[data-agent-permission]');
+        cancel.classList.toggle('hidden', !active);
+        resume.classList.toggle('hidden', !recoverable);
+        resume.title = 'Continue from retained evidence; reconcile uncertain tool outcomes before repeating actions';
+        review.classList.toggle('hidden', !active || !run._permissionPending);
+        _renderAgentPermissions(details, run);
+        cancel.disabled = statusName === 'cancel_requested' || !!run._actionPending;
+        resume.disabled = !!run._actionPending;
+        _agentSetText(cancel, statusName === 'cancel_requested' || run._actionPending === 'cancel' ? 'Stopping…' : 'Cancel');
+        _agentSetText(resume, run._actionPending === 'resume' ? 'Resuming…' : 'Resume');
+        details.querySelector('.agent-run-actions').classList.toggle('hidden', !active && !recoverable);
+        if (list.children[index] !== details) list.insertBefore(details, list.children[index] || null);
+    }
+    for (const old of oldCards.values()) old.remove();
+    list.scrollTop = scrollTop;
+    if (visibleCard?.isConnected) list.scrollTop += visibleCard.getBoundingClientRect().top - top - visibleOffset;
+}
+
+function _agentSetText(node, text) {
+    if (node.textContent !== text) node.textContent = text;
+}
+
+function _renderAgentPermissions(card, run) {
+    const container = card.querySelector('.agent-permissions');
+    const pending = new Set(Object.keys(run._permissions || {}));
+    for (const node of [...container.children]) if (!pending.has(node.dataset.requestId)) node.remove();
+    for (const requestId of pending) {
+        if ([...container.children].some(node => node.dataset.requestId === requestId)) continue;
+        const notification = _notifications.find(n => n.type === 'permission' && n.requestId === requestId);
+        if (!notification) continue;
+        const node = _renderPermissionNotifItem(notification);
+        node.dataset.requestId = requestId;
+        container.appendChild(node);
+    }
+}
+
+function _createAgentCard(runId) {
+    const details = document.createElement('details');
+    details.className = 'agent-run-card';
+    details.dataset.runId = runId;
+    // Static skeleton only; all provider/task content is assigned as text.
+    details.innerHTML = `<summary><span class="agent-status"></span><span class="agent-task"></span><span class="agent-elapsed"></span></summary>
+        <div class="agent-run-details"><div class="agent-meta"></div><details class="agent-task-details"><summary>Full task and inputs</summary><pre class="agent-full-task"></pre></details>
+        <div class="agent-permissions"></div>
+        <details class="agent-result-details hidden"><summary>Full result</summary><pre class="agent-full-result"></pre></details>
+        <details class="agent-release hidden"><summary>Release a handoff to the parent</summary><p>Only this text will be shared. Raw logs stay private.</p><textarea class="agent-release-text" rows="4" maxlength="32000" aria-label="Handoff to release"></textarea><button type="button" data-agent-release>Release handoff</button></details>
+        <div class="agent-error hidden"></div><pre class="agent-output hidden"></pre>
+        <div class="agent-run-actions"><button type="button" data-agent-cancel>Cancel</button>
+        <button type="button" data-agent-resume>Resume</button><button type="button" data-agent-permission>Review request</button></div></div>`;
+    details.querySelector('[data-agent-cancel]').dataset.agentCancel = runId;
+    details.querySelector('[data-agent-resume]').dataset.agentResume = runId;
+    details.querySelector('[data-agent-permission]').dataset.agentPermission = runId;
+    return details;
+}
+
+function _applyAgentEventToRun(run, data) {
+    if (!run) return;
+    const kind = data.event_kind || data.type || '';
+    // Approval UUIDs, not stream sequence numbers, identify permission state.
+    // Bridge events and persisted child output have independent sequencers.
+    if (!data._historical && (kind === 'permission_request' || kind === 'permission_resolved')) {
+        if (!data.request_id) return;
+        run._permissions = run._permissions || {};
+        run._resolvedPermissions = run._resolvedPermissions || new Set();
+        if (kind === 'permission_resolved') {
+            run._resolvedPermissions.add(data.request_id);
+            delete run._permissions[data.request_id];
+        } else if (!run._resolvedPermissions.has(data.request_id)) {
+            run._permissions[data.request_id] = data;
+        }
+        run._permissionPending = Object.keys(run._permissions).length > 0;
+        return;
+    }
+    const sequence = Number(data.sequence || 0);
+    if (sequence && sequence <= Number(run._lastSequence || 0)) return;
+    run._replayTarget = Math.max(Number(run._replayTarget || 0), sequence);
+    if (sequence > Number(run._lastSequence || 0) + 1) {
+        run._pendingEvents = run._pendingEvents || new Map();
+        // Bound memory while reconnect catches up; overflow is still in SQLite.
+        if (run._pendingEvents.size < 512) run._pendingEvents.set(sequence, data);
+        if (kind.startsWith('agent_')) _applyAgentPayload(run, data, false);
+        return;
+    }
+    if (sequence) run._lastSequence = sequence;
+    run._pendingEvents?.delete(sequence);
+    _applyAgentPayload(run, data);
+    while (run._pendingEvents?.has(Number(run._lastSequence || 0) + 1)) {
+        const next = Number(run._lastSequence || 0) + 1;
+        const pending = run._pendingEvents.get(next);
+        run._pendingEvents.delete(next);
+        run._lastSequence = next;
+        _applyAgentPayload(run, pending);
+    }
+}
+
+function _applyAgentPayload(run, data, includeOutput = true) {
+    const kind = data.event_kind || data.type || '';
+    const sequence = Number(data.sequence || 0);
+    if (kind.startsWith('agent_')) {
+        if (sequence && sequence <= Number(run._statusSequence || 0)) return;
+        if (sequence) run._statusSequence = sequence;
+        // Explicit teardown evidence, never infer process exit merely from a
+        // failure label. Older events without this field retain their PID.
+        if (Object.prototype.hasOwnProperty.call(data, 'pid')) run.pid = data.pid;
+        if (Object.prototype.hasOwnProperty.call(data, 'cancel_requested')) run.cancel_requested = data.cancel_requested;
+    }
+    if (kind === 'agent_queued') {
+        run.status = 'queued';
+        if (data.task) run.task = data.task;
+    } else if (kind === 'agent_waiting') {
+        run.queue_reason = data.queue_reason;
+    } else if (kind === 'agent_started') {
+        run.status = 'running';
+        if (data.started_at != null) run.started_at = data.started_at;
+        run.queue_reason = null;
+        if (data.task) run.task = data.task;
+    } else if (kind === 'agent_completed') {
+        run.status = data.status || 'completed';
+        if (data.result) run.result = data.result;
+    }
+    else if (kind === 'agent_cancelled') run.status = 'cancelled';
+    else if (kind === 'agent_paused') run.status = 'paused';
+    else if (kind === 'agent_failed') { run.status = 'failed'; run.error = data.error || ''; }
+    else if (kind === 'agent_stop_failed') { run.status = 'cancel_requested'; run.error = data.error || ''; }
+    else if (kind === 'agent_launch_info') {
+        for (const key of ['effective_harness', 'effective_model', 'requested_harness', 'requested_model', 'profile']) {
+            if (data[key] != null) run[key] = data[key];
+        }
+    } else if (includeOutput && (kind === 'stream_chunk' || kind === 'text_delta')) {
+        run.last_output = `${run.last_output || ''}${data.content || data.text || ''}`.slice(-1600);
+    }
+}
+
+function _handleAgentEvent(data) {
+    if (data.conv_id && !_sameConvId(data.conv_id, State.currentConvId)) return;
+    if ((data.event_kind || data.type) === 'agent_event_batch') {
+        for (const item of (data.events || [])) {
+            if (item.run_id === data.run_id && item.conv_id === data.conv_id) _handleAgentEvent(item);
+        }
+        return;
+    }
+    const run = _agentRunForEvent(data.run_id);
+    if (!run) return;
+    _applyAgentEventToRun(run, data);
+    const kind = data.event_kind || data.type;
+    if (kind === 'permission_request' && run._permissions?.[data.request_id]) {
+        addPermissionNotification({ ...data, agent_run_id: run.run_id });
+    } else if (kind === 'permission_resolved') {
+        resolvePermissionNotification(data.request_id, data.allowed, data.feedback || '', data.decision_source);
+    } else if (['agent_completed', 'agent_failed', 'agent_cancelled', 'agent_paused', 'agent_stop_failed'].includes(kind)
+        && (!data.sequence || Number(data.sequence) >= Number(run._statusSequence || 0))
+        && ['completed', 'failed', 'cancelled', 'paused', 'cancel_requested'].includes(run.status)) {
+        for (const requestId of Object.keys(run._permissions || {})) {
+            _applyAgentEventToRun(run, { type: 'permission_resolved', request_id: requestId });
+            resolvePermissionNotification(requestId, false, 'Child run ended before a decision.', 'loom_lifecycle');
+        }
+    }
+    if (Number(run._lastSequence || 0) < Number(run._replayTarget || 0)) void _replayAgentRun(run);
+    _scheduleAgentRender(kind === 'permission_request' || kind === 'permission_resolved' || kind.startsWith('agent_'));
+}
+
+const _resolvedPermissionNoticeIds = new Set();
+const _dismissedPermissionNoticeIds = new Set((() => {
+    try {const value=JSON.parse(localStorage.getItem('exo-dismissed-permission-notices') || '[]');
+        return Array.isArray(value)?value.filter(id=>typeof id==='string').slice(-512):[];
+    } catch {return [];}
+})());
+function _dismissPermissionNotice(requestId, render = true) {
+    _dismissedPermissionNoticeIds.add(String(requestId));
+    while (_dismissedPermissionNoticeIds.size > 512) _dismissedPermissionNoticeIds.delete(_dismissedPermissionNoticeIds.values().next().value);
+    try {localStorage.setItem('exo-dismissed-permission-notices',JSON.stringify([..._dismissedPermissionNoticeIds]));} catch {}
+    for (let i=_notifications.length-1;i>=0;i--) {
+        if (_notifications[i].type==='permission-notice' && _notifications[i].requestId===requestId) _notifications.splice(i,1);
+    }
+    if(render){_renderNotifBell();_renderNotifDropdown();}
+}
 function handleWSMessage(data) {
+    // Child runs are durable supervisor activity, not conversation messages.
+    // Consume them before any legacy chat switch can append or navigate.
+    if (data?.scope === 'run' && String(data.run_id || '').startsWith('agent:')) {
+        _handleAgentEvent(data);
+        return;
+    }
+    if (['stream_end', 'generation_terminal', 'cancelled', 'interrupted', 'error'].includes(data.type)
+        && data.conv_id != null && _canonicalClientRunId(data)) {
+        _recentTerminalRuns.set(_terminalRunKey(data.conv_id, _canonicalClientRunId(data)),
+            data.message?.id ?? data.draft_msg_id ?? null);
+        if (_recentTerminalRuns.size > 128) {
+            _recentTerminalRuns.delete(_recentTerminalRuns.keys().next().value);
+        }
+    }
     if (_queueStreamEventDuringReconstruct(data)) return;
-    if (_ACTIVITY_EVENT_TYPES.has(data.type)) _removeStreamWaiting();
+    if (_ACTIVITY_EVENT_TYPES.has(data.type) && _isOurBranch(data)) _removeStreamWaiting();
     switch (data.type) {
+        case 'chat_item': {
+            if (!_isOurBranch(data)) break;
+            const message = State.messages.find(m => _sameMessageId(m.id, data.draft_msg_id));
+            if (message) {
+                let items = parseChatItems(message.chat_items);
+                if (!items.some(item => item.id === data.item.id)) items.push(data.item);
+                message.chat_items = JSON.stringify(items);
+                if (_sameMessageId(State._liveStreamDraft?.id, message.id)) State._liveStreamDraft.chat_items = message.chat_items;
+            }
+            const element = document.querySelector(`.message[data-msg-id="${data.draft_msg_id}"]`);
+            if (element) {
+                let container = element.querySelector('.chat-presentations');
+                if (!container) {
+                    container = document.createElement('div');
+                    container.className = 'chat-presentations';
+                    element.appendChild(container);
+                }
+                if (!container.querySelector(`[data-chat-item-id="${CSS.escape(data.item.id)}"]`)) {
+                    container.insertAdjacentHTML('beforeend', renderChatItem(data.item));
+                }
+                scrollToBottom();
+            }
+            break;
+        }
+        case 'permission_notice': {
+            const index = _notifications.findIndex(n => n.requestId === data.request_id
+                && (n.type === 'permission' || n.type === 'permission-notice'));
+            if (data.status === 'resolved') {
+                _resolvedPermissionNoticeIds.add(data.request_id);
+                if (_resolvedPermissionNoticeIds.size > 512) _resolvedPermissionNoticeIds.delete(_resolvedPermissionNoticeIds.values().next().value);
+                if (index !== -1 && _notifications[index].type === 'permission-notice') _notifications.splice(index, 1);
+            } else if (data.status === 'pending' && index === -1 && !_resolvedPermissionNoticeIds.has(data.request_id)
+                && !_dismissedPermissionNoticeIds.has(String(data.request_id))) {
+                _notifications.unshift({type: 'permission-notice', requestId: data.request_id,
+                    convId: data.conv_id, messageId: data.message_id, time: new Date()});
+            }
+            _renderNotifBell();
+            if (!document.getElementById('notif-dropdown')?.classList.contains('hidden')) _renderNotifDropdown();
+            break;
+        }
+        case 'generation_terminal': {
+            // Heartbeat recovery of a dropped terminal event. A stale reply
+            // cannot finish a newer stream, even after gen IDs are reused.
+            if (!_sameMessageId(data.conv_id, State.currentConvId)
+                || _canonicalClientRunId(data) !== `gen:${State._followingGenId}`
+                || !_sameMessageId(data.message?.id, State._followingDraftMsgId)) break;
+            const visible = streamingDiv?.isConnected ? streamingDiv
+                : document.querySelector(`.message[data-msg-id="${data.message.id}"]`);
+            if (visible && !visible.querySelector('.edit-message-input')) {
+                streamingDiv = visible;
+                finalizeStreamingMessage(data.message, null, {preserveViewport: true});
+            } else {
+                _stopGenTimer();
+                _stopStreamWaitingTicker();
+                const index = State.messages.findIndex(m => _sameMessageId(m.id, data.message.id));
+                if (index >= 0) State.messages[index] = data.message;
+                streamingDiv = null;
+            }
+            _clearTerminalStreamState();
+            hideGenStatus();
+            const lifecycle = data.message.turn_lifecycle_state;
+            setBrowserTabState(['failed', 'partial_failed'].includes(lifecycle) ? 'error'
+                : ['cancelled', 'interrupted'].includes(lifecycle) ? 'idle' : 'done');
+            // Do not navigate, dispatch queues, replace editors, or announce
+            // completion again. This only repairs the exact message card.
+            refreshTree();
+            break;
+        }
+        case 'run_subscription':
+            if (data.subscribed && data.run_id) _subscribedRunIds.add(String(data.run_id));
+            if (data.removed && data.run_id) _subscribedRunIds.delete(String(data.run_id));
+            break;
+
+        case 'agent_event':
+            _handleAgentEvent(data);
+            break;
+
+        case 'generation_preparing': {
+            if (_generationWindowOwnership(data) !== true) break;
+            const runId = _canonicalClientRunId(data);
+            const sameTurn = runId && (runId === _pendingLaunch?.runId
+                || runId === `gen:${State._followingGenId}`);
+            if (!sameTurn || !_streamStartTime) _streamStartTime = Date.now();
+            if (runId) _subscribedRunIds.add(runId);
+            State._streamIsOurBranch = true;
+            State._followingGenId = data.gen_id ?? State._followingGenId ?? null;
+            State._followingDraftMsgId = data.draft_msg_id ?? null;
+            State.isStreaming = true;
+            _pendingLaunch = {
+                genId: data.gen_id ?? null,
+                runId,
+                parentId: data.parent_id ?? null,
+                threadId: data.loom_thread_id ?? null,
+            };
+            if (!_streamStartTime) _streamStartTime = Date.now();
+            if (!streamingDiv || !streamingDiv.isConnected) {
+                appendStreamingMessage(data.cc_model || data.local_model);
+            }
+            showGenStatus(data.text || 'Preparing turn…');
+            break;
+        }
+
         case 'context_info':
             if (!_isOurBranch(data)) break;
             updateContextInfo(data);
@@ -660,6 +2293,7 @@ function handleWSMessage(data) {
             break;
 
         case 'compact_boundary':
+            if (!_isOurBranch(data)) break;
             // Claude Code compactified its context — forked into a new branch.
             // When streaming, we CAN'T call switchToBranch — it rebuilds the
             // DOM and detaches the streamingDiv, so the incoming stream chunks
@@ -713,12 +2347,19 @@ function handleWSMessage(data) {
             break;
 
         case 'compact_done':
+            if (!_isOurBranch(data)) break;
+            if (data.checkpoint_only) {
+                hideGenStatus();
+                if (data.success) showToast('Checkpoint saved. Your next turn will start from it; original history is preserved.', 6000);
+                break; // No message/cursor changed; never rebuild the viewport.
+            }
             // Compaction finished — clear status and reload to show the new branch
             hideGenStatus();
             loadMessages(State.currentConvId);
             break;
 
         case 'compact_summary_ready':
+            if (!_isOurBranch(data)) break;
             // Background task patched the marker row with the narrative summary.
             // Update the marker element in place (if it's visible) so the user
             // can expand "Previously" without a reload.
@@ -744,6 +2385,14 @@ function handleWSMessage(data) {
             showGenStatus(data.text || 'Looming...');
             break;
 
+        case 'first_token': {
+            if (!_isOurBranch(data)) break;
+            _removeStreamWaiting();
+            const draft = _ensureLiveStreamDraft(data);
+            if (draft) draft.time_to_first_token_ms = data.elapsed_ms;
+            break;
+        }
+
         case 'model_attestation': {
             if (!_isOurBranch(data)) break;
             const attestation = _parseModelAttestation(data.attestation);
@@ -754,14 +2403,6 @@ function handleWSMessage(data) {
             if (draft) draft.model_attestation = JSON.stringify(attestation);
             break;
         }
-
-        case 'hermes_commands':
-            // Hermes advertised its own slash commands — use them in the "/"
-            // autocomplete for this conv (in place of Loom's meta commands).
-            if (Array.isArray(data.commands) && data.commands.length) {
-                State.hermesCommands = data.commands;
-            }
-            break;
 
         case 'conv_field_update':
             // Server resolved a field after the fact (e.g. the model Hermes
@@ -906,9 +2547,12 @@ function handleWSMessage(data) {
         }
 
         case 'stream_start': {
-            // Check if this generation is for our current branch
             const parentId = data.parent_id;
-            const isOnOurBranch = _streamParentMatchesVisibleBranch(parentId, data.draft_msg_id);
+            const windowOwnership = _generationWindowOwnership(data);
+            const exactRunOwned = windowOwnership === true;
+            const eventRunId = _canonicalClientRunId(data);
+            const pendingMatch = !!(_pendingLaunch && eventRunId
+                && _pendingLaunch.runId === eventRunId);
             // If the isStreaming flag leaked from a previous turn (no live
             // streamingDiv attached) clear it now so we actually create a
             // fresh div for this stream. Without this, stream chunks fall
@@ -918,32 +2562,62 @@ function handleWSMessage(data) {
                 _resetStreamState();
             }
             // Only follow the FIRST stream on our branch — parallel siblings stream silently
-            const shouldFollow = isOnOurBranch && !State.isStreaming;
+            // The exact run subscription decides ownership. The visible leaf
+            // is deliberately irrelevant: rendering may lag the atomic
+            // message+launch response, and browser focus must never decide
+            // which in-flight turn belongs here.
+            const shouldFollow = exactRunOwned && (!State.isStreaming || pendingMatch);
             console.log('[WS] stream_start parent_id=', parentId, 'gen_id=', data.gen_id, 'follow=', shouldFollow);
 
             if (shouldFollow) {
                 State._streamIsOurBranch = true;
                 State._followingGenId = data.gen_id ?? null;
+                if (data.run_id != null) _subscribedRunIds.add(String(data.run_id));
+                else if (data.gen_id != null) _subscribedRunIds.add(`gen:${data.gen_id}`);
                 State._followingDraftMsgId = data.draft_msg_id ?? null;
-                if (data.draft_msg_id != null) rememberConversationLeaf(State.currentConvId, data.draft_msg_id);
+                const currentLeaf = State.loomCursor?.leaf_message_id;
+                // The atomic message+launch endpoint starts the provider before
+                // returning its user row. An exact subscribed stream_start can
+                // therefore beat the POST response that advances this page
+                // from the empty/root cursor to `parentId`. `pendingMatch` is
+                // run ownership evidence for this window, so it is safe to
+                // follow that draft; visible focus or conversation-global state
+                // is never used as authority.
+                const matchesCurrentBranch = pendingMatch
+                    || parentId == null
+                    || _sameMessageId(currentLeaf, parentId);
+                if (data.draft_msg_id != null && matchesCurrentBranch) {
+                    rememberConversationLeaf(State.currentConvId, data.draft_msg_id);
+                    State._cursorSyncPromise = selectServerLoomCursor(
+                        State.currentConvId, data.draft_msg_id
+                    ).catch(err => {
+                        console.warn('[Loom] Could not follow the durable draft cursor:', err);
+                        return null;
+                    });
+                }
                 State.isStreaming = true;
                 State._parallelCount = (State._parallelCount || 0) + 1;
-                if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-                    Notification.requestPermission();
-                }
                 _streamTokenCount = 0;
-                _streamStartTime = Date.now();
+                if (!pendingMatch || !_streamStartTime) _streamStartTime = Date.now();
                 _streamBuffer = '';
                 _streamFlushTimer = null;
                 hideRetryBar();
                 hidePlanBar();
                 const draft = _ensureLiveStreamDraft(data);
-                appendStreamingMessage(
-                    data.cc_model || data.local_model,
-                    draft?.model_attestation,
-                    data.draft_msg_id,
-                );
-            } else if (isOnOurBranch) {
+                if (pendingMatch && streamingDiv?.isConnected) {
+                    if (data.draft_msg_id != null) streamingDiv.dataset.msgId = data.draft_msg_id;
+                    _updateStreamingModelAttestation(draft?.model_attestation);
+                } else {
+                    appendStreamingMessage(
+                        data.cc_model || data.local_model,
+                        draft?.model_attestation,
+                        data.draft_msg_id,
+                        draft?.session_continuity,
+                    );
+                }
+                _pendingLaunch = null;
+                showGenStatus(data.status_text || 'Waiting for first token…');
+            } else if (exactRunOwned) {
                 // Parallel sibling — count it but don't render
                 State._parallelCount = (State._parallelCount || 0) + 1;
             } else if (!State.isStreaming) {
@@ -955,6 +2629,7 @@ function handleWSMessage(data) {
         }
 
         case 'thinking_start':
+            if (!_isOurBranch(data)) break;
             // Only show for CC/Local modes (Weave already has "Looming..." footer)
             if (State.currentConv && State.currentConv.mode !== 'weave') {
                 showThinkingIndicator();
@@ -962,8 +2637,8 @@ function handleWSMessage(data) {
             break;
 
         case 'thinking_end':
+            if (!_isOurBranch(data)) break;
             hideThinkingIndicator();
-            _streamStartTime = Date.now();
             _streamTokenCount = 0;
             break;
 
@@ -1008,6 +2683,10 @@ function handleWSMessage(data) {
 
         case 'thinking_chunk':
             if (!State._streamIsOurBranch) break;
+            if (!data.content) break;
+            // Non-empty thinking is provider output: the model has connected,
+            // even when ordinary response text has not started yet.
+            _removeStreamWaiting();
             _appendLiveDraftThinking(data.content);
             appendThinkingChunk(data.content);
             break;
@@ -1019,6 +2698,7 @@ function handleWSMessage(data) {
                 draft.turn_input_tokens = data.input_tokens || draft.turn_input_tokens || 0;
                 draft.turn_output_tokens = data.output_tokens || draft.turn_output_tokens || 0;
             }
+            if (typeof scheduleWorkspaceRender === 'function') scheduleWorkspaceRender();
             if (!streamingDiv) break;
             const tokEl = streamingDiv.querySelector('.gen-token-info');
             if (tokEl) {
@@ -1055,17 +2735,18 @@ function handleWSMessage(data) {
             break;
 
         case 'plan_ready':
-            // Plan display is handled by the ExitPlanMode permission prompt.
-            // Just fire a browser push if tab is hidden.
+            // This is informational. The scoped permission_request owns plan
+            // approval; sending a new chat turn cannot resolve that request.
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification('A Shadow Loom — Plan Ready', {
+                new Notification('EXO — Plan Ready', {
                     body: 'Plan awaiting review' + (data.plan_file ? ': ' + data.plan_file : ''),
-                    icon: '/static/img/loom-ico-transparent.png',
+                    icon: '/static/exoloom/icon.png',
                 });
             }
             break;
 
         case 'permission_request': {
+            if (_resolvedPermissionNoticeIds.has(data.request_id)) break;
             const permissionIsVisible = _permissionBelongsToVisibleBranch(data);
             // Permission request landing means tool work is happening — drop the
             // "still waiting for first token" indicator.
@@ -1077,6 +2758,7 @@ function handleWSMessage(data) {
             // rendering it now would attach it to a streamingDiv that's about
             // to be destroyed by _reconstructFromSnapshot's remove+re-append.
             if (permissionIsVisible && (!data.conv_id || _sameConvId(data.conv_id, State.currentConvId))) {
+                setBrowserTabState('permission');
                 if (State._reconstructing) {
                     (State._pendingPermPrompts = State._pendingPermPrompts || []).push(data);
                 } else {
@@ -1085,9 +2767,9 @@ function handleWSMessage(data) {
             }
             // Push notification if tab is hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                const n = new Notification('A Shadow Loom — Permission Request', {
+                const n = new Notification('EXO — Permission Request', {
                     body: `${data.tool_name}: ${(data.input_summary || '').substring(0, 100)}`,
-                    icon: '/static/img/loom-ico-transparent.png',
+                    icon: '/static/exoloom/icon.png',
                     tag: 'perm-' + data.request_id,
                     requireInteraction: true,
                 });
@@ -1096,9 +2778,18 @@ function handleWSMessage(data) {
             break;
         }
 
+        case 'branch_content_changed':
+            // Metadata-only notification. Refetch only when this page already
+            // renders the changed message; never navigate to another branch.
+            if ((State.messages || []).some(m => _sameMessageId(m.id, data.message_id))) {
+                loadMessages(State.currentConvId);
+            }
+            break;
+
         case 'permission_resolved':
-            resolvePermissionPrompt(data.request_id, data.allowed);
-            resolvePermissionNotification(data.request_id, data.allowed);
+            resolvePermissionPrompt(data.request_id, data.allowed, data.feedback || '', data.decision_source);
+            resolvePermissionNotification(data.request_id, data.allowed, data.feedback || '', data.decision_source);
+            if (State.isStreaming) setBrowserTabState('looming');
             break;
 
         case 'cc_debug_event':
@@ -1108,24 +2799,47 @@ function handleWSMessage(data) {
         case 'branch_landed': {
             // Global notification — a generation completed somewhere (maybe another conversation)
             const isCurrentConv = _sameConvId(data.conv_id, State.currentConvId);
-            const isWatching = isCurrentConv && State.currentView === 'chat' && !document.hidden;
-            if (!isWatching) {
-                _notifications.push({
+            const landedMessageIsVisible = isCurrentConv
+                && State.currentView === 'chat'
+                && !document.hidden
+                && (State.messages || []).some(message =>
+                    _sameMessageId(message.id, data.message_id)
+                );
+            if (!landedMessageIsVisible) {
+                _addBranchActivityNotification({
                     type: 'branch',
+                    branchActivity: true,
                     id: data.message_id,
                     convId: data.conv_id,
                     convTitle: data.conv_title || 'Conversation',
                     parentId: null,
-                    preview: (data.preview || '').slice(0, 120),
+                    preview: (data.preview || 'Response complete').slice(0, 120),
                     time: new Date(),
                 });
-                _renderNotifBell();
+            } else {
+                markBranchActivitySeen(data.conv_id, [data.message_id]);
             }
+            // Other windows do not receive this generation's private token
+            // stream. Refresh their tree from this content-free completion
+            // notice without changing the branch each window is viewing.
+            if (isCurrentConv) {
+                refreshTree();
+                // Reconcile this page's cursor, never navigate to the notice's leaf.
+                if (!State.isStreaming && !State._terminalSettlementPromise) {
+                    loadMessages(State.currentConvId, { preserveView: true });
+                }
+            }
+            if (isCurrentConv && (State.messages || []).some(message =>
+                _sameMessageId(message.id, data.message_id)
+            )) {
+                setBrowserTabState('done');
+            }
+            refreshParallelBranchActivity();
             // Browser push if tab hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification('A Shadow Loom', {
+                new Notification('EX umbra Omnia', {
                     body: `${data.conv_title || 'Conversation'} — response complete`,
-                    icon: '/static/img/loom-ico-transparent.png',
+                    icon: '/static/exoloom/icon.png',
                 });
             }
             break;
@@ -1141,7 +2855,7 @@ function handleWSMessage(data) {
                 + (removed ? `, ${removed} lines removed` : '');
             _notifications.unshift({
                 type: 'workspace',
-                convId: State.currentConvId,
+                convId: data.conv_id ?? State.currentConvId,
                 summary,
                 warningText,
                 manifestPath: data.manifest_path || '',
@@ -1169,9 +2883,9 @@ function handleWSMessage(data) {
                 _renderNotifBell();
             }
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification('A Shadow Loom — Plan Ready', {
+                new Notification('EXO — Plan Ready', {
                     body: `${data.conv_title || 'Conversation'} — plan awaiting review`,
-                    icon: '/static/img/loom-ico-transparent.png',
+                    icon: '/static/exoloom/icon.png',
                 });
             }
             break;
@@ -1195,6 +2909,53 @@ function handleWSMessage(data) {
             }
             break;
 
+        case 'queue_state': {
+            const changed = _applyGenerationQueueState(data.items || []);
+            if (changed && !State.isStreaming && !State._reconstructing) {
+                renderMessages();
+            }
+            break;
+        }
+
+        case 'queue_changed':
+            _refreshQueuedGeneration(State.currentConvId).then(changed => {
+                if (changed && !State.isStreaming && !State._reconstructing) {
+                    loadMessages(State.currentConvId);
+                }
+            });
+            break;
+
+        case 'queue_started': {
+            // Queue lifecycle is durable shared state. Every tab viewing this
+            // exact thread may clear the queued styling, but only the authoring
+            // tab follows the run or changes its status text.
+            const isOrigin = !data.client_instance_id
+                || String(data.client_instance_id) === String(_loomClientInstanceId);
+            _generationQueueItems = _generationQueueItems.filter(
+                item => !_sameMessageId(item.user_msg_id, data.user_msg_id)
+            );
+            const queuedId = data.user_msg_id;
+            const queuedMessage = (State.messages || []).find(
+                message => _sameMessageId(message.id, queuedId)
+            );
+            if (queuedMessage) {
+                queuedMessage.queued = false;
+                delete queuedMessage.queue_status;
+                delete queuedMessage.queue_after_draft_id;
+            }
+            if (_queuedGeneration && _sameMessageId(_queuedGeneration.id, queuedId)) {
+                _queuedGeneration = null;
+            }
+            const queuedEl = document.querySelector(`.message[data-msg-id="${queuedId}"]`);
+            if (queuedEl) {
+                _syncQueuedMessagePresentation(queuedEl, { queued: false });
+            }
+            if (isOrigin) {
+                showGenStatus('Sending queued message...');
+            }
+            break;
+        }
+
         case 'stream_end': {
             // Is this the stream we're following, or a parallel sibling?
             const isFollowed = State._followingGenId != null
@@ -1217,65 +2978,66 @@ function handleWSMessage(data) {
                 }
                 if (allDone) {
                     State._streamIsOurBranch = undefined;
+                    if (State._followingGenId != null) _subscribedRunIds.delete(`gen:${State._followingGenId}`);
                     State._followingGenId = null;
                 }
                 break;
             }
             // Our followed stream ended
-            if (data.message && data.message.id) rememberConversationLeaf(State.currentConvId, data.message.id);
-            _clearTerminalStreamState({ clearParallel: allDone });
+            const queuedAfterThisDraft = _queuedGeneration
+                && (_sameMessageId(_queuedGeneration.parent_id, data.message?.id)
+                    || _sameMessageId(_queuedGeneration.queue_after_draft_id, data.draft_msg_id));
+            if (data.message && data.message.id && !queuedAfterThisDraft
+                && (_sameMessageId(State.loomCursor?.leaf_message_id, data.message.id)
+                    || _sameMessageId(State.loomCursor?.leaf_message_id, data.message.parent_id))
+                && (!data.message.loom_thread_id || !State.loomCursor?.thread_id
+                    || String(data.message.loom_thread_id) === String(State.loomCursor.thread_id))) {
+                rememberConversationLeaf(State.currentConvId, data.message.id);
+            }
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
             // Tree refreshes on stream_end/cancel/error to replace draft with final node
             // Bell + browser push now handled by branch_landed (global broadcast)
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
-                // Images are detected client-side in createMessageElement
-                // No need to also render data.images (causes duplicates)
-                if (false && data.images && data.images.length > 0) {
-                    const imgContainer = document.createElement('div');
-                    imgContainer.className = 'detected-images';
-                    for (const url of data.images) {
-                        const filename = decodeURIComponent(url.split('path=').pop() || '').split(/[/\\]/).pop() || 'image';
-                        const figure = document.createElement('figure');
-                        figure.className = 'detected-image-figure';
-                        const img = document.createElement('img');
-                        img.src = url;
-                        img.alt = filename;
-                        img.className = 'generated-image';
-                        img.addEventListener('click', () => {
-                            const body = document.getElementById('preview-modal-body');
-                            body.innerHTML = '<img src="' + url + '" style="max-width:100%;max-height:80vh;">';
-                            document.getElementById('modal-preview').classList.remove('hidden');
-                        });
-                        const caption = document.createElement('figcaption');
-                        caption.textContent = filename;
-                        figure.appendChild(img);
-                        figure.appendChild(caption);
-                        imgContainer.appendChild(figure);
-                    }
-                    const msgDiv = document.querySelector(`.message[data-msg-id="${data.message.id}"]`);
-                    if (msgDiv) msgDiv.appendChild(imgContainer);
-                }
             } else {
                 loadMessages(State.currentConvId);
             }
+            setBrowserTabState('done');
             refreshTree();
-            _flushQueuedGeneration();
+            if (queuedAfterThisDraft) {
+                _clearTerminalStreamState({ clearParallel: allDone });
+            } else {
+                _settleTerminalStream(data, { clearParallel: allDone });
+            }
             break;
         }
 
         case 'cancelled':
             if (!_isOurBranch(data)) break;
-            rememberConversationLeaf(State.currentConvId, data.parent_id || data.draft_msg_id);
             removeStreamingMessage();
-            _clearTerminalStreamState({ clearParallel: true });
             hideGenStatus();
+            setBrowserTabState('idle');
             showRetryBar('Generation cancelled');
             refreshTree();
-            // Reload messages to pick up any partial draft saved on cancel
-            loadMessages(State.currentConvId);
-            _flushQueuedGeneration();
+            // Cursor authority must settle before isStreaming becomes false;
+            // otherwise a follow-up can attach to the prior user row.
+            _settleTerminalStream(data, { clearParallel: true, reload: true });
+            break;
+
+        case 'interrupted':
+            if (!_isOurBranch(data)) break;
+            if (streamingDiv && data.message) {
+                finalizeStreamingMessage(data.message);
+            } else {
+                removeStreamingMessage();
+                loadMessages(State.currentConvId);
+            }
+            hideGenStatus();
+            setBrowserTabState('idle');
+            showToast('Turn interrupted; partial context was preserved');
+            refreshTree();
+            _settleTerminalStream(data, { clearParallel: true });
             break;
 
         case 'warning':
@@ -1294,15 +3056,24 @@ function handleWSMessage(data) {
                 }
                 break;
             }
-            const preservedPartial = markStreamingMessageInterrupted(data.error || 'Generation error');
-            if (!preservedPartial) removeStreamingMessage();
+            // Provider adapters may persist a structured failed turn with its
+            // partial text/tool transcript. Render that authoritative row
+            // instead of appending another transient interruption string.
+            if (data.message) {
+                if (streamingDiv) finalizeStreamingMessage(data.message);
+                else loadMessages(State.currentConvId);
+            } else {
+                const preservedPartial = markStreamingMessageInterrupted(data.error || 'Generation error');
+                if (!preservedPartial) removeStreamingMessage();
+            }
             _clearTerminalStreamState({ clearParallel: true });
             hideGenStatus();
+            setBrowserTabState('error');
             if (data.error && data.error.includes('another branch')) {
                 showToast(data.error, 'error');
             } else {
-                showRetryBar(data.error || 'Generation error');
-                _flushQueuedGeneration();
+                const retryPrefix = data.retryable ? 'Retryable provider failure: ' : '';
+                showRetryBar(retryPrefix + (data.error || 'Generation error'));
             }
             break;
 
@@ -1310,17 +3081,72 @@ function handleWSMessage(data) {
             // Reconnected while a generation is still running — use snapshot to rebuild UI
             hideRetryBar();
             hidePlanBar();
-            const snapshots = data.snapshots || [];
-            const snap = snapshots.find(s => _streamParentMatchesVisibleBranch(s.parent_id, s.draft_msg_id));
-            if (snap) {
+            const snapshots = (data.snapshots || []).filter(s => {
+                const runId = s.run_id || (s.gen_id != null ? `gen:${s.gen_id}` : null);
+                const key = _terminalRunKey(State.currentConvId, runId);
+                const landed = _recentTerminalRuns.has(key)
+                    && _sameMessageId(_recentTerminalRuns.get(key), s.draft_msg_id);
+                return LoomCoordination.viewStep(landed, true, false)[1];
+            });
+            if (data.snapshots?.length && !snapshots.length) {
+                if (State.ws) State.ws._needsSync = false;
+                break; // All supplied snapshots were superseded by terminal evidence.
+            }
+            const followedRun = State._followingGenId != null
+                ? `gen:${State._followingGenId}` : null;
+            // Reconnect ownership comes from the server's exact run
+            // subscription; branch visibility is not an ownership signal.
+            const rememberedSnap = snapshots.find(s => {
+                const runId = s.run_id || (s.gen_id != null ? `gen:${s.gen_id}` : null);
+                return followedRun && runId === followedRun;
+            });
+            // Progressive content appears only on snapshots the server routed
+            // to this page's exact durable thread cursor. It is therefore a
+            // safe reconnect authority even after a full JS reload lost the
+            // in-memory followed run id.
+            const snap = followedRun ? rememberedSnap : snapshots.find(s => (
+                Object.prototype.hasOwnProperty.call(s, 'full_text')
+                || Object.prototype.hasOwnProperty.call(s, 'content_blocks')
+            ));
+            const snapVisible = snap && _streamParentMatchesVisibleBranch(snap.parent_id, snap.draft_msg_id);
+            if (snap && snapVisible && snap.draft_msg_id == null && snap.status_text) {
+                const runId = snap.run_id || (snap.gen_id != null ? `gen:${snap.gen_id}` : null);
+                if (runId) {
+                    _subscribedRunIds.add(String(runId));
+                    if (State.ws?.readyState === WebSocket.OPEN) {
+                        State.ws.send(JSON.stringify({ action: 'subscribe_run', run_id: runId }));
+                    }
+                }
+                State.isStreaming = true;
+                State._streamIsOurBranch = true;
+                State._followingGenId = snap.gen_id ?? null;
+                State._followingDraftMsgId = null;
+                _pendingLaunch = {
+                    genId: snap.gen_id ?? null,
+                    runId,
+                    parentId: snap.parent_id ?? null,
+                    threadId: snap.loom_thread_id ?? null,
+                };
+                _streamStartTime = (snap.started_at || 0) * 1000 || Date.now();
+                if (!streamingDiv?.isConnected) appendStreamingMessage(snap.cc_model);
+                showGenStatus(snap.status_text);
+                if (State.ws) State.ws._needsSync = false;
+                break;
+            }
+            if (snap && snapVisible) {
+                if (snap.run_id) {
+                    _subscribedRunIds.add(String(snap.run_id));
+                    if (State.ws?.readyState === WebSocket.OPEN) {
+                        State.ws.send(JSON.stringify({ action: 'subscribe_run', run_id: snap.run_id }));
+                    }
+                }
                 State.isStreaming = true;
                 const visibleDraft = State.messages.some(m => _sameMessageId(m.id, snap.draft_msg_id));
                 State._streamIsOurBranch = visibleDraft || _streamParentMatchesVisibleBranch(snap.parent_id, snap.draft_msg_id);
                 State._followingGenId = snap.gen_id ?? null;
                 State._followingDraftMsgId = snap.draft_msg_id ?? null;
-                if (snap.draft_msg_id != null) rememberConversationLeaf(State.currentConvId, snap.draft_msg_id);
                 _syncLiveDraftFromSnapshot(snap);
-                _streamStartTime = (snap.started_at || 0) * 1000;
+                _streamStartTime = (snap.started_at || 0) * 1000 || _streamStartTime || Date.now();
                 _streamTokenCount = 0;
                 if (!State._reconstructing) {
                     State._reconstructing = true;
@@ -1370,6 +3196,27 @@ function handleWSMessage(data) {
                         const visibleDraft = State.messages.some(m => _sameMessageId(m.id, snap.draft_msg_id));
                         const stillOurs = visibleDraft || _streamParentMatchesVisibleBranch(snap.parent_id, snap.draft_msg_id);
                         State._streamIsOurBranch = stillOurs;
+                        if (stillOurs && _recentTerminalRuns.has(_terminalRunKey(
+                                State.currentConvId,
+                                snap.run_id || (snap.gen_id != null ? `gen:${snap.gen_id}` : null)))) {
+                            const snapshotRunId = snap.run_id || (snap.gen_id != null ? `gen:${snap.gen_id}` : null);
+                            const terminalQueued = _queuedStreamEventsDuringReconstruct.some(event =>
+                                _canonicalClientRunId(event) === snapshotRunId
+                                && ['stream_end', 'generation_terminal', 'cancelled', 'interrupted', 'error'].includes(event.type)
+                            );
+                            // Receipt records terminal evidence before it is
+                            // painted. Retain the owner and queued terminal so
+                            // finally can finalize its message/tab state once;
+                            // clearing here would silently discard completion.
+                            if (terminalQueued) return;
+                            // This page already processed the run's terminal
+                            // evidence while the message sync was in flight.
+                            // Its snapshot must not resurrect a live streaming
+                            // placeholder for a finished turn.
+                            _clearTerminalStreamState({ clearParallel: true });
+                            removeStreamingMessage();
+                            return;
+                        }
                         if (stillOurs && _snapshotShouldReplaceLiveStream(snap)) {
                             _reconstructFromSnapshot(snap);
                         }
@@ -1389,10 +3236,21 @@ function handleWSMessage(data) {
                         _drainPendingPermPrompts();
                     });
                 }
+            } else if (followedRun && State._followingDraftMsgId != null) {
+                // An absent snapshot is not authority to attach a sibling or
+                // clear the current card. Ask for its persisted terminal row.
+                if (State.ws?.readyState === WebSocket.OPEN) {
+                    State.ws.send(JSON.stringify({action: 'ping', ..._followedGenerationProbe()}));
+                }
             } else if (snapshots.length > 0) {
                 // Other branches are active, but this tab is not following
                 // them. Keep the tree live without stealing the chat stream.
-                _clearTerminalStreamState();
+                // The server's complete active-run list supersedes a stale
+                // followed run even when it failed before creating a draft.
+                // Requiring a saved terminal assistant strands that launch
+                // shell forever while an unrelated branch remains active.
+                if (followedRun) _recoverIdleMessages();
+                else _clearTerminalStreamState();
                 refreshTree();
             } else {
                 // No usable snapshot. Some providers may not maintain live
@@ -1439,97 +3297,28 @@ function handleWSMessage(data) {
             // an in-flight renderMessages() races with the upcoming stream_start
             // and wipes the streamingDiv mid-stream. The new stream will paint
             // the response itself; no reload needed.
-            if (_pendingGenerate) {
+            if (_pendingGenerate && [..._pendingGenerates.values()].some(_launchOperationIsVisible)) {
+                if (State.ws) State.ws._needsSync = false;
+                break;
+            }
+            // A terminal event has rendered, but its exact page cursor is
+            // still settling. It owns isStreaming until that authority lands.
+            if (State._terminalSettlementPromise) {
                 if (State.ws) State.ws._needsSync = false;
                 break;
             }
             if (State.isStreaming || (State.ws && State.ws._needsSync) || wasReconstructing) {
-                removeStreamingMessage();
-                _clearTerminalStreamState({ clearParallel: true });
-                hideGenStatus();
-                // Don't clobber an in-progress edit or typed draft on reconnect.
-                const editing = !!document.querySelector('.edit-message-input');
-                const ta = document.getElementById('user-input');
-                const typing = !!(ta && ta.value && ta.value.trim().length > 0);
-                if (!editing && !typing) {
-                    loadMessages(State.currentConvId);
-                }
+                _recoverIdleMessages();
             }
             if (State.ws) State.ws._needsSync = false;
-            break;
-
-        case 'hermes_model_state':
-            // Liveness broadcast for the Hermes chat-space header indicator.
-            // `up` reflects the local model server (llama/dream) state, which
-            // transitively reflects attendant availability. Prometheus is
-            // implicitly always-up (cloud fallback) — no indicator for it.
-            // Cache the latest state per backend so a conv switch can render
-            // immediately without waiting for the next broadcast.
-            _HERMES_MODEL_STATE[data.backend] = !!data.up;
-            updateHermesModelIndicator(data.backend, data.up);
+            if (_browserTabState === 'looming' || _browserTabState === 'permission') {
+                setBrowserTabState('idle');
+            }
             break;
 
         case 'pong':
             // Heartbeat ack — no UI action needed; onmessage already updated _lastActivity.
             break;
-    }
-}
-
-// Latest known liveness per Hermes backend, fed by hermes_model_state WS
-// broadcasts. Lets updateHermesModelIndicator render immediately on a conv
-// switch (in loadConversation) without waiting for the next broadcast.
-const _HERMES_MODEL_STATE = { llama: null, dream: null };
-
-/**
- * Render the Hermes "local model up/down" indicator on the chat-space header.
- * Green = attendant functional; amber = local model down (attendant unavailable,
- * Prometheus still functional via cloud). Only shown for Hermes-class convs
- * (hermes/dream) that are NOT incognito — incognito convs route through
- * Prometheus (always-functional) and don't need a model-liveness indicator.
- *
- * The label + liveness are derived from the CURRENT conversation's mode, not
- * from whichever backend broadcast arrived last. The server broadcasts both
- * llama and dream state; a Hermes conv must show llama's state (never "Dream
- * down"), and a Dream conv must show dream's state. `backend` (the broadcast
- * that triggered this call) is ignored unless it matches the conv's mode —
- * non-matching broadcasts still cache their state but don't re-render.
- */
-function updateHermesModelIndicator(backend, up) {
-    const badge = document.getElementById('hermes-model-indicator');
-    if (!badge) return;
-    const mode = State.currentConv && State.currentConv.mode;
-    const incognito = State.currentConv && State.currentConv.incognito;
-    // Only Hermes-class, non-incognito convs show the model-liveness indicator.
-    if (mode !== 'hermes' && mode !== 'dream') {
-        badge.classList.add('hidden');
-        return;
-    }
-    if (incognito) {
-        badge.classList.add('hidden');
-        return;
-    }
-    // If this broadcast is for the OTHER backend, don't re-render — the conv
-    // cares only about its own model's liveness. The state is still cached above.
-    if (backend && mode === 'hermes' && backend !== 'llama') return;
-    if (backend && mode === 'dream' && backend !== 'dream') return;
-    // Read the cached state for THIS conv's backend (may be null before the
-    // first matching broadcast lands — hide until then).
-    const myBackend = mode === 'dream' ? 'dream' : 'llama';
-    const myUp = _HERMES_MODEL_STATE[myBackend];
-    if (myUp === null || myUp === undefined) {
-        badge.classList.add('hidden');
-        return;
-    }
-    badge.classList.remove('hidden');
-    const label = myBackend === 'dream' ? 'Dream' : 'llama';
-    if (myUp) {
-        badge.className = 'hermes-model-indicator up';
-        badge.textContent = `● ${label} up`;
-        badge.title = `Local ${label} model is up — attendant functional.`;
-    } else {
-        badge.className = 'hermes-model-indicator down';
-        badge.textContent = `● ${label} down`;
-        badge.title = `Local ${label} model is down — attendant unavailable. Toggle Incognito to route through Prometheus (cloud, always-functional).`;
     }
 }
 
@@ -1601,7 +3390,8 @@ function _currentStreamingContentStats() {
     const contentEl = streamingDiv.querySelector('.message-content');
     if (!contentEl) return { textLength: 0, blockCount: 0 };
     const clone = contentEl.cloneNode(true);
-    clone.querySelectorAll('.stream-waiting, .typing-cursor').forEach(el => el.remove());
+    clone.querySelectorAll('.stream-waiting, .stream-waiting-anim, .typing-cursor')
+        .forEach(el => el.remove());
     return {
         textLength: clone.textContent.length,
         blockCount: clone.querySelectorAll('.tool-block, .cc-thinking, .ask-question-block').length,
@@ -1653,17 +3443,20 @@ function _reconstructFromSnapshot(snap) {
             if (block.type === 'tool_use') {
                 if (block.result) {
                     const toolDiv = document.createElement('div');
-                    toolDiv.className = 'tool-block';
+                    const imageHtml = toolImageFigureHtml(block.image_url);
+                    const open = imageHtml && block.name !== 'Read';
+                    toolDiv.className = 'tool-block' + (open ? ' expanded' : '');
                     const inputPreview = (block.input || '').substring(0, 3000);
                     const resultPreview = (block.result || '').substring(0, 2000);
                     toolDiv.innerHTML =
                         '<div class="tool-block-header" data-tool-toggle>' +
-                        '<span class="tool-toggle">&#9656;</span> ' +
+                        '<span class="tool-toggle">' + (open ? '&#9662;' : '&#9656;') + '</span> ' +
                         '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
                         '</div>' +
                         '<div class="tool-block-body">' +
                         (inputPreview ? '<pre class="tool-block-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
                         '<div class="tool-block-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
+                        imageHtml +
                         '</div>';
                     contentEl.appendChild(toolDiv);
                 } else {
@@ -1715,6 +3508,7 @@ function _reconstructFromSnapshot(snap) {
             risk_level: n.riskLevel,
             risk_reason: n.riskReason,
             supports_allow_all: n.supportsAllowAll,
+            rule_preview: n.rulePreview,
         });
     }
 
@@ -1743,21 +3537,6 @@ async function _loadSkills() {
     return _cachedSkills;
 }
 
-// Hermes' own ACP slash commands. Used as the "/" autocomplete list for Hermes
-// convs (instead of Loom's meta commands). Self-corrects if Hermes advertises a
-// different set via the `hermes_commands` WS event (stored in State.hermesCommands).
-const _HERMES_SLASH_COMMANDS = [
-    { name: 'help', description: 'List Hermes commands' },
-    { name: 'model', description: "Show or switch this turn's model" },
-    { name: 'tools', description: 'List Hermes tools' },
-    { name: 'context', description: 'Show context usage' },
-    { name: 'reset', description: 'Clear conversation history (this ACP session)' },
-    { name: 'compact', description: 'Compress context' },
-    { name: 'steer', description: 'Inject guidance into the running turn' },
-    { name: 'queue', description: 'Queue a prompt for after this turn' },
-    { name: 'version', description: 'Show Hermes version' },
-];
-
 function _getModeLabel(conv) {
     if (!conv) return 'system';
     const mode = conv.mode || 'weave';
@@ -1768,19 +3547,9 @@ function _getModeLabel(conv) {
 }
 
 
-/** Candidates for the "/" autocomplete — Hermes commands for Hermes convs, else Loom skills. */
+/** Candidates for the "/" autocomplete. Retired sessions do not advertise tools. */
 async function _slashCandidates() {
-    if (State.currentConv && State.currentConv.mode === 'hermes') {
-        const raw = (Array.isArray(State.hermesCommands) && State.hermesCommands.length)
-            ? State.hermesCommands : _HERMES_SLASH_COMMANDS;
-        return raw.map(c => ({
-            name: c.name,
-            command: '/' + c.name,
-            description: c.description || '',
-            source: 'system',
-            mode: 'hermes',
-        }));
-    }
+    if (_retiredHarnessMode(State.currentConv)) return [];
     return _loadSkills();
 }
 
@@ -2000,7 +3769,8 @@ function renderCodexGoalRow() {
     const clearBtn = document.getElementById('btn-codex-goal-clear');
     const isCodex = _isCodexConversation();
     if (!isCodex) return;
-    row.classList.toggle('hidden', State.currentView === 'home');
+    row.classList.toggle('hidden', State.currentView !== 'chat' || !_codexGoalFromState());
+    if (typeof syncWorkspaceLayout === 'function') syncWorkspaceLayout();
 
     const goal = _codexGoalFromState();
     const status = goal ? (goal.status || 'active') : 'none';
@@ -2111,16 +3881,37 @@ function initCodexGoalControls() {
 
 async function _startCodexGoalTurn(objective) {
     if (!objective) return;
-    const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
+    const convId = State.currentConvId;
+    const parentId = _currentVisibleLeafId();
+    const payload = {
         role: 'user',
         content: objective,
-    });
-    State.messages.push(msg);
+        send_intent: 'continue',
+        generation_count: State.branchCount || 1,
+        launch_generation: true,
+    };
+    Object.assign(payload, await _messageTopologyContract(parentId, 'continue', convId));
+    _attachCCSettings(payload);
+    const msg = await API.post(`/api/conversations/${convId}/messages`, payload);
+    _acceptMessageCursor(msg, convId);
+    if (!_sameConvId(State.currentConvId, convId)) return;
+    if (msg.queued) _queuedGeneration = msg;
+    if (!State.messages.some(existing => _sameMessageId(existing.id, msg.id))) {
+        State.messages.push(msg);
+    }
     renderMessages();
     scrollToBottom(true);
-    const count = State.branchCount || 1;
-    showGenStatus(count > 1 ? `Starting goal with ${count} branches...` : 'Starting goal...');
-    _triggerParallelGenerate(count, msg.id);
+    if (msg.queued) {
+        showToast('Goal queued behind the running turn');
+        return;
+    }
+    showGenStatus('Starting goal...');
+    if (!Array.isArray(msg.generation_ids)) {
+        _triggerParallelGenerate(1, msg.id, {
+            convId,
+            threadId: msg.loom_thread_id,
+        });
+    }
 }
 
 /**
@@ -2355,8 +4146,23 @@ function _handleMetaCommand(name, args) {
             }).catch(() => showToast('Failed to read hooks config'));
             break;
         case 'compact': {
-            // CC compacts automatically — manual /compact just informs the user
-            showToast('Context compacts automatically when needed. Use /clear to start a fresh branch.', 5000);
+            const cursor = State.loomCursor;
+            const parentId = _currentVisibleLeafId();
+            if (!State.ws || State.ws.readyState !== WebSocket.OPEN) {
+                showToast('Reconnect before preparing a checkpoint', 'error');
+                break;
+            }
+            if (!cursor || cursor.leaf_message_id !== parentId || parentId == null) {
+                showToast('Select the exact branch to compact first', 'error');
+                break;
+            }
+            State.ws.send(JSON.stringify({
+                action: 'compact', parent_id: parentId,
+                client_instance_id: _loomClientInstanceId,
+                loom_thread_id: cursor.thread_id, cursor_revision: cursor.revision,
+                focus: args || '',
+            }));
+            showToast('Preparing checkpoint on the configured local model...', 5000);
             break;
         }
         case 'clear': {
@@ -2545,132 +4351,425 @@ function _initSlashAutocomplete() {
 
 // ── Send Message ──
 
-let _queuedGeneration = null;  // queued message to generate after current stream ends
+let _sendInFlight = false;
 
-function _getTreePromptParentId() {
-    const remembered = findLoadableConversationLeaf(State.treeData || [], State.currentConvId);
-    return remembered ? remembered.id : _currentVisibleLeafId();
+function _integrateSentMessageDuringLiveStart(message) {
+    const liveDraft = State._liveStreamDraft;
+    const pendingParentMatches = !!(
+        _pendingLaunch
+        && State.isStreaming
+        && streamingDiv?.isConnected
+        && _sameMessageId(_pendingLaunch.parentId, message?.id)
+    );
+    const liveStartedForMessage = !!(
+        State.isStreaming
+        && streamingDiv
+        && streamingDiv.isConnected
+        && ((liveDraft && _sameMessageId(liveDraft.parent_id, message?.id))
+            || pendingParentMatches)
+    );
+    if (!liveStartedForMessage) return false;
+
+    // stream_start can arrive before the message POST response. Re-rendering
+    // here destroys the new streaming element and makes the next send appear
+    // idle. Merge the user row before its assistant draft without repainting.
+    const existingIndex = (State.messages || []).findIndex(existing =>
+        _sameMessageId(existing.id, message.id)
+    );
+    if (existingIndex >= 0) {
+        Object.assign(State.messages[existingIndex], message);
+    } else {
+        const draftIndex = liveDraft ? (State.messages || []).findIndex(existing =>
+            _sameMessageId(existing.id, liveDraft.id)
+        ) : -1;
+        if (draftIndex >= 0) State.messages.splice(draftIndex, 0, message);
+        else State.messages.push(message);
+    }
+
+    const container = document.getElementById('messages');
+    const existingEl = container?.querySelector(
+        `.message[data-msg-id="${message.id}"]`
+    );
+    container?.querySelector('.empty-loom-hint')?.remove();
+    if (!existingEl && streamingDiv?.isConnected) {
+        streamingDiv.parentNode.insertBefore(
+            createMessageElement(message),
+            streamingDiv,
+        );
+    }
+    return true;
 }
 
-let _sendInFlight = false;
+function _isolateTreeRootLiveStart(message) {
+    const liveDraft = State._liveStreamDraft;
+    const matchingDraft = liveDraft
+        && _sameMessageId(liveDraft.parent_id, message?.id)
+        ? liveDraft
+        : null;
+
+    // The POST and stream events may race, but a tree-composer root is already
+    // authoritative. Replace the old visible branch locally without tearing
+    // down the live stream shell that arrived first.
+    State.messages = matchingDraft ? [message, matchingDraft] : [message];
+    for (const node of [message, matchingDraft]) {
+        if (!node?.id || (State.treeData || []).some(existing =>
+            _sameMessageId(existing.id, node.id)
+        )) continue;
+        State.treeData.push(node);
+    }
+
+    const container = document.getElementById('messages');
+    if (!container) return;
+    let userEl = container.querySelector(`.message[data-msg-id="${message.id}"]`);
+    if (!userEl) userEl = createMessageElement(message);
+    for (const child of [...container.children]) {
+        if (child === userEl || child === streamingDiv) continue;
+        child.remove();
+    }
+    if (streamingDiv?.isConnected) {
+        container.insertBefore(userEl, streamingDiv);
+    } else if (!userEl.isConnected) {
+        container.appendChild(userEl);
+    }
+
+    if (VIRTUAL_SCROLL.observer) {
+        VIRTUAL_SCROLL.observer.disconnect();
+        VIRTUAL_SCROLL.observer = null;
+    }
+    VIRTUAL_SCROLL.renderedStart = 0;
+    hideRetryBar();
+    if (typeof updateBranchNavigation === 'function') updateBranchNavigation();
+}
+
 async function sendMessage() {
+    if (State.ws?._authExpired) {
+        showToast('Sign-in expired. Reload this page to continue; your draft is saved.', 'warning');
+        return;
+    }
+    if (typeof pendingAttachmentUploads === 'function' && pendingAttachmentUploads() > 0) {
+        showToast('Wait for the attachment upload to finish before sending.', 'warning');
+        return;
+    }
     if (_sendInFlight) return;
     if (!State.currentConvId) {
+        if (typeof sendFirstCasualMessage === 'function' && State.currentView === 'chat') {
+            await sendFirstCasualMessage();
+            return;
+        }
         showToast('Create or select a conversation first', 'error');
         return;
     }
 
+    const sendConvId = State.currentConvId;
+    const sendCursorAtStart = State.loomCursor;
+    const sendComposerKey = _composerDraftStorageKey(sendConvId, sendCursorAtStart);
     const input = document.getElementById('user-input');
-    let content = input.value.trim();
+    const originalInputValue = input.value;
+    let content = originalInputValue.trim();
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
     const hasImages = State.pendingImages.length > 0;
     if (!content && !State.pendingReply && !(hasImages && !isClaudeMode)) return;
 
-    // Handle slash commands — meta commands work in all modes
-    if (content.startsWith('/')) {
-        const skills = await _loadSkills();
-        const translated = _translateSlashCommand(content, skills);
-        if (translated && translated.meta) {
-            _handleMetaCommand(translated.skillName, translated.args);
-            input.value = '';
-            return;
-        }
-        // Headless commands: substitute the NL prompt template for the raw /slash text
-        if (translated) {
-            content = translated.prompt;
-            showToast(`Running: /${translated.skillName}`);
-        }
-    }
-
-    // Fold any highlight-to-reply excerpt into the outgoing text — after slash
-    // translation so the quote never masks a /command
-    content = _composeReplyContent(content);
-
-    // Add user message via REST — send image paths as JSON array
-    const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
-    const describeInput = document.getElementById('describe-context');
-    const describeContext = describeInput ? describeInput.value.trim() : '';
-    const isFromTree = State.currentView === 'tree';
-    const treePromptParentId = isFromTree ? _getTreePromptParentId() : null;
-    const msgData = {
-        role: 'user',
-        content: content,
-        image_path: imagePaths,
+    // Capture every part of the submitted action before the first await. The
+    // shared composer and branch may belong to a different window by then.
+    const sendOwner = {
+        convId: sendConvId,
+        conversationSeq: _conversationLoadRequestSeq,
+        branchSeq: State._branchSwitchSeq || 0,
+        navigationEpoch: typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch,
     };
-    if (describeContext) msgData.describe_context = describeContext;
-    // A tree prompt is anchored to the focused node. Chat prompts are anchored
-    // to the leaf this tab actually renders; another agent may update the
-    // database-wide active flag while this user is typing.
-    if (isFromTree) {
-        msgData.parent_id = treePromptParentId || null;
-    } else {
-        msgData.parent_id = _currentVisibleLeafId() || null;
-    }
-
+    const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
+    const pendingReply = State.pendingReply ? { ...State.pendingReply } : null;
+    const describeContext = document.getElementById('describe-context')?.value.trim() || '';
+    const isFromTree = State.currentView === 'tree';
+    const generationCount = State.branchCount || 1;
+    const sendMode = State.currentConv?.mode;
+    const generationSettings = {};
+    _attachCCSettings(generationSettings);
+    const sendTreeData = [...(State.treeData || []), ...(State.messages || [])];
+    const visibleLeafAtStart = _currentVisibleLeafId();
+    const streamingAtStart = _isActuallyStreaming();
+    const queueParentAtStart = streamingAtStart ? _activeQueueParentId() : null;
+    const queueAtStart = _queuedGeneration;
+    let sendCursor = sendCursorAtStart;
+    let isNewRootThread = isNewConversationThread(sendConvId);
     _sendInFlight = true;
+    _submittedSendOwner = sendOwner;
     try {
-        const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, msgData);
 
-        // Clear input immediately so user can keep typing
-        input.value = '';
+        // Handle slash commands — meta commands work in all modes
+        if (content.startsWith('/')) {
+            const skills = await _loadSkills();
+            const translated = _translateSlashCommand(content, skills);
+            if (translated && translated.meta) {
+                if (_sendOwnerIsCurrent(sendOwner)) {
+                    _handleMetaCommand(translated.skillName, translated.args);
+                    if (input.value === originalInputValue) input.value = '';
+                }
+                return;
+            }
+            // Headless commands: substitute the NL prompt template for the raw /slash text
+            if (translated) {
+                content = translated.prompt;
+                showToast(`Running: /${translated.skillName}`);
+            }
+        }
+
+        // Fold any highlight-to-reply excerpt into the outgoing text — after slash
+        // translation so the quote never masks a /command
+        content = _composeReplyContent(content, pendingReply);
+
+        // Add user message via REST — send image paths as JSON array
+        const sendFingerprint = JSON.stringify({
+            convId: sendConvId,
+            content,
+            imagePaths,
+            describeContext,
+        });
+        const retrySendData = _pendingSendRequest?.fingerprint === sendFingerprint
+            ? { ..._pendingSendRequest.msgData }
+            : null;
+        if (isFromTree && !retrySendData) {
+            // The shared composer means "start a standalone thread" while the
+            // tree is visible. Bind that intent to a new server-owned empty thread
+            // before deriving any parent; selected/latest nodes are navigation
+            // context only and must never become this send's parent.
+            // Cursor reconciliation may repaint the branch while this request is
+            // in flight. Persist the captured text first so a stale-cursor retry
+            // or a real failure cannot silently erase what the user submitted.
+            saveComposerDraft(sendConvId, sendCursorAtStart);
+            try {
+                sendCursor = await createServerLoomThreadCursor(sendConvId);
+                isNewRootThread = true;
+            } catch (err) {
+                if (_sameConvId(State.currentConvId, sendConvId)
+                    && !input.value && originalInputValue) {
+                    input.value = originalInputValue;
+                    autoResizeTextarea();
+                }
+                showToast(err.detail || err.message || 'Failed to create a new thread', 'error');
+                return;
+            }
+        }
+        let queueParentId = null;
+        if (retrySendData) {
+            isNewRootThread = retrySendData.topology_intent === 'new_thread'
+                || retrySendData.send_intent === 'new_thread';
+            queueParentId = retrySendData.queue_after_draft_id ?? null;
+        } else if (!isNewRootThread && streamingAtStart) {
+            if (queueAtStart) {
+                showToast('One message is already queued; edit or cancel it first', 'error');
+                return;
+            }
+            queueParentId = queueParentAtStart;
+            if (queueParentId == null) {
+                showToast('The running reply is not ready to accept a queued continuation yet', 'error');
+                return;
+            }
+        } else if (!isNewRootThread && _sendOwnerIsCurrent(sendOwner) && State.isStreaming) {
+            console.log('[SEND] stale isStreaming flag - resetting before new turn');
+            _resetStreamState();
+        }
+        const msgData = {
+            role: 'user',
+            content: content,
+            image_path: imagePaths,
+            client_request_id: retrySendData?.client_request_id || (
+                globalThis.crypto?.randomUUID
+                    ? globalThis.crypto.randomUUID()
+                    : `send-${Date.now()}-${Math.random().toString(36).slice(2)}`
+            ),
+            send_intent: isNewRootThread ? 'new_thread' : 'continue',
+            generation_count: generationCount,
+            launch_generation: true,
+        };
+        Object.assign(msgData, generationSettings);
+        if (describeContext) msgData.describe_context = describeContext;
+        // A standalone thread is an explicit root, independent of focus, view,
+        // active agents, or whichever branch most recently finished loading.
+        let targetParentId;
+        if (isNewRootThread) {
+            targetParentId = null;
+        } else if (queueParentId != null) {
+            // A queued continuation belongs after the running assistant. Using the
+            // pre-stream visible leaf here makes the user prompt and assistant
+            // siblings, which silently turns a linear queue into a branch.
+            targetParentId = queueParentId;
+            msgData.queue_after_draft_id = queueParentId;
+        } else {
+            // Continue the leaf this tab renders; another agent may update the
+            // conversation-wide active flag, but that is never this send's parent.
+            targetParentId = visibleLeafAtStart || null;
+        }
+
+        if (retrySendData) {
+            Object.assign(msgData, retrySendData);
+        } else {
+            Object.assign(
+                msgData,
+                await _messageTopologyContract(
+                    targetParentId,
+                    isNewRootThread ? 'new_thread' : sendTreeData.some(node => _sameMessageId(node.parent_id, targetParentId)) ? 'branch' : 'continue',
+                    sendConvId,
+                    sendCursor,
+                    sendTreeData,
+                ),
+            );
+        }
+        _pendingSendRequest = {
+            fingerprint: sendFingerprint,
+            msgData: { ...msgData },
+        };
+        const msg = await API.post(`/api/conversations/${sendConvId}/messages`, msgData);
+        _pendingSendRequest = null;
+        const firstRunId = msg.generation_ids?.length ? `gen:${msg.generation_ids[0]}` : null;
+        const terminalKey = _terminalRunKey(sendConvId, firstRunId);
+        const alreadyFinished = !msg.queued && firstRunId && _recentTerminalRuns.has(terminalKey);
+        // stream_start/end already advanced this cursor past the user row.
+        if (!alreadyFinished && _sendOwnerIsCurrent(sendOwner)) _acceptMessageCursor(msg, sendConvId);
+
+        // An older running server still needs its explicit WS launch. Dispatch
+        // that immutable action even if navigation changed the viewport while
+        // the user row was being persisted. No current picker/leaf is consulted.
+        if (!msg.queued && !Array.isArray(msg.generation_ids)) {
+            _triggerParallelGenerate(generationCount, msg.id, {
+                convId: sendConvId,
+                threadId: msg.loom_thread_id,
+                settings: generationSettings,
+                submitted: true,
+                owner: sendOwner,
+                mode: sendMode,
+            });
+        }
+
+        // The server already launched or durably queued this exact message.
+        // If the page navigated while the request was in flight, never paint
+        // the old conversation's message into the new viewport.
+        if (!_sendOwnerIsCurrent(sendOwner)) return;
+
+        // Preserve any text typed while the network request was in flight.
+        if (input.value === originalInputValue) {
+            input.value = '';
+            if (sendComposerKey) sessionStorage.removeItem(sendComposerKey);
+            saveComposerDraft(sendConvId, State.loomCursor);
+        } else {
+            saveComposerDraft(sendConvId, State.loomCursor);
+        }
         autoResizeTextarea();
         clearPendingImages();
         clearPendingReply();
 
-        // If sent from tree view, switch to that branch in chat
-        if (isFromTree) {
-            await switchToBranch(msg.id, msg.id, { exact: true });
-            rememberConversationLeaf(State.currentConvId, msg.id);
-            State._skipLoadOnChat = true;
-            switchView('chat');
-            showGenStatus('Sending...');
-            const count = State.branchCount || 1;
-            _triggerParallelGenerate(count, msg.id);
+        if (alreadyFinished) {
+            // Reconcile canonical order without inventing a second loading
+            // phase. Do not navigate a tab that moved to another thread while
+            // its POST was outstanding.
+            if (State._cursorSyncPromise) await State._cursorSyncPromise;
+            if (_sendOwnerIsCurrent(sendOwner)
+                && State.loomCursor?.thread_id === msg.loom_thread_id) {
+                if (isFromTree && State.currentView === 'tree') {
+                    const leaf = _recentTerminalRuns.get(terminalKey) || msg.id;
+                    const branchOwner = {...sendOwner, branchSeq: (State._branchSwitchSeq || 0) + 1};
+                    await switchToBranch(leaf, msg.id, { exact: true });
+                    if (!_sendOwnerIsCurrent(branchOwner)) return;
+                    State._skipLoadOnChat = true;
+                    switchView('chat');
+                } else {
+                    await loadMessages(sendConvId);
+                }
+            }
             return;
         }
 
-        // Ground-truth streaming check — State.isStreaming alone leaks after
-        // disconnect/reconnect or between turns when perm prompts create
-        // stray streamingDivs. If the flag is set but no streamingDiv is
-        // attached to the DOM, reset and treat as idle.
-        const reallyStreaming = _isActuallyStreaming();
-        if (!reallyStreaming && State.isStreaming) {
-            console.log('[SEND] stale isStreaming flag — resetting before new turn');
-            _resetStreamState();
+        // The server allocates the run in the same request that stores the
+        // user message. Usually generation_preparing reaches the WebSocket
+        // first; this response is the deterministic fallback if that event
+        // raced the socket or the tab reconnected at exactly that moment.
+        if (!msg.queued && Array.isArray(msg.generation_ids)
+            && msg.generation_ids.length && (!State.isStreaming || !streamingDiv?.isConnected)) {
+            const genId = msg.generation_ids[0];
+            const runId = `gen:${genId}`;
+            _subscribedRunIds.add(runId);
+            State._followingGenId = genId;
+            State._followingDraftMsgId = null;
+            State._streamIsOurBranch = true;
+            State.isStreaming = true;
+            _pendingLaunch = {
+                genId,
+                runId,
+                parentId: msg.id,
+                threadId: msg.loom_thread_id || null,
+            };
+            _streamStartTime = Date.now();
+            appendStreamingMessage(msg.cc_model || State.currentConv?.cc_model);
+            showGenStatus('Preparing turn…');
+            if (State.ws?.readyState === WebSocket.OPEN
+                && _sameConvId(State.ws._loomConvId, sendConvId)) {
+                // Local ownership alone does not authorize server delivery.
+                // The launch may have raced a replaced/absent origin socket.
+                State.ws.send(JSON.stringify({action: 'subscribe_run', run_id: runId}));
+                State.ws.send(JSON.stringify({action: 'request_snapshot'}));
+            } else {
+                connectWebSocket(sendConvId);
+            }
         }
-        if (reallyStreaming) {
+
+        const liveStartAlreadyRendered = !msg.queued
+            && _integrateSentMessageDuringLiveStart(msg);
+
+        // A tree-composer send created a standalone root above. Open that exact
+        // root in chat so the user can watch its run; no selected/latest tree
+        // node participates in placement.
+        if (isFromTree) {
+            if (liveStartAlreadyRendered) {
+                _isolateTreeRootLiveStart(msg);
+            } else {
+                const branchOwner = {...sendOwner, branchSeq: (State._branchSwitchSeq || 0) + 1};
+                await switchToBranch(msg.id, msg.id, { exact: true });
+                if (!_sendOwnerIsCurrent(branchOwner)) return;
+                const loadedMessage = State.messages.find(existing =>
+                    _sameMessageId(existing.id, msg.id)
+                );
+                if (loadedMessage) Object.assign(loadedMessage, msg);
+            }
+            State._skipLoadOnChat = true;
+            switchView('chat');
+        }
+
+        // Queue ownership and readiness come from the durable server response.
+        if (msg.queued) {
             // Queue it — will fire when current stream ends
             _queuedGeneration = msg;
-            State.messages.push(msg);
-            // Show queued message immediately in chat
-            const container = document.getElementById('messages');
-            const el = createMessageElement(msg);
-            el.classList.add('queued-message');
-            // Add cancel/edit bar to the queued message
-            const queueBar = document.createElement('div');
-            queueBar.className = 'queue-actions';
-            queueBar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
-                + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
-            queueBar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
-            queueBar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
-            el.appendChild(queueBar);
-            container.appendChild(el);
+            msg.queue_status = msg.queue_status || 'queued';
+            msg.queue_after_draft_id = msg.queue_after_draft_id ?? queueParentId;
+            _placeQueuedMessageAfterDraft(msg);
+            // Re-render so a tree-originated send updates the row that
+            // switchToBranch already painted instead of appending a duplicate.
+            renderMessages();
             scrollToBottom(true);
             showToast('Message queued — will send after current turn');
         } else {
-            State.messages.push(msg);
-            renderMessages();
+            if (!liveStartAlreadyRendered) {
+                if (!isFromTree) State.messages.push(msg);
+                renderMessages();
+            }
             scrollToBottom(true);
 
-            // Request generation via WebSocket — queue if socket isn't ready yet
-            const count = State.branchCount || 1;
-            showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Sending...');
-            _triggerParallelGenerate(count, msg.id);
+            const count = generationCount;
+            // Preserve an authoritative preparation phase that may have
+            // arrived over the socket before this POST response.
+            if (!_pendingLaunch) {
+                showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Sending...');
+            }
         }
     } catch (err) {
+        // A server HTTP response is definitive: nothing ambiguous remains to
+        // retry under this idempotency key. Network/transport failures retain
+        // the exact request because the server may already have committed it.
+        if (err?.status) _pendingSendRequest = null;
         showToast(err.detail || err.message || 'Failed to send message', 'error');
     } finally {
         _sendInFlight = false;
+        if (_submittedSendOwner === sendOwner) _submittedSendOwner = null;
     }
 }
 
@@ -2679,12 +4778,71 @@ async function cancelQueuedMessage(msg) {
     // Remove from DB
     try {
         await API.del(`/api/conversations/${State.currentConvId}/messages/${msg.id}`);
+        if (msg.parent_id != null) {
+            await selectServerLoomCursor(State.currentConvId, msg.parent_id);
+            rememberConversationLeaf(State.currentConvId, msg.parent_id);
+        }
     } catch { /* already gone */ }
     // Remove from local state
     State.messages = State.messages.filter(m => m.id !== msg.id);
     const el = document.querySelector(`.message[data-msg-id="${msg.id}"]`);
     if (el) el.remove();
     showToast('Queued message cancelled');
+}
+
+async function resumeQueuedMessage(msg) {
+    const convId = State.currentConvId;
+    try {
+        await API.post(
+            `/api/conversations/${convId}/generation-queue/${msg.id}/resume`,
+        );
+        if (!_sameConvId(convId, State.currentConvId)) return;
+        // Reconcile authoritative queue state without repainting editors or
+        // overwriting a queue_started event that already arrived during POST.
+        await _refreshQueuedGeneration(convId);
+        showToast('Queued message resumed');
+    } catch (err) {
+        showToast(err.detail || err.message || 'Failed to resume queued message', 'error');
+    }
+}
+
+function _currentQueueMessage(msg) {
+    return (State.messages || []).find(item => _sameMessageId(item.id, msg.id)) || msg;
+}
+
+function _updateQueueActions(bar, msg) {
+    bar._queueMessage = msg;
+    const paused = msg.queue_status === 'paused';
+    const label = bar.querySelector('.queue-status-label');
+    const text = paused ? 'paused' : 'queued';
+    if (label.textContent !== text) label.textContent = text;
+    const resume = bar.querySelector('.queue-resume-btn');
+    if (paused && !resume) {
+        const button = document.createElement('button');
+        button.className = 'btn-small queue-resume-btn';
+        button.title = 'Resume queued message';
+        button.textContent = 'Resume';
+        button.addEventListener('click', () => resumeQueuedMessage(bar._queueMessage));
+        label.after(button);
+    } else if (!paused) {
+        resume?.remove();
+    }
+}
+
+function createQueueActions(msg) {
+    const bar = document.createElement('div');
+    bar.className = 'queue-actions';
+    bar.innerHTML = '<span class="queue-status-label"></span>'
+        + '<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>'
+        + '<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>';
+    bar.querySelector('.queue-cancel-btn').addEventListener(
+        'click', () => cancelQueuedMessage(bar._queueMessage)
+    );
+    bar.querySelector('.queue-edit-btn').addEventListener(
+        'click', () => editQueuedMessage(bar._queueMessage)
+    );
+    _updateQueueActions(bar, msg);
+    return bar;
 }
 
 async function editQueuedMessage(msg) {
@@ -2719,20 +4877,16 @@ async function editQueuedMessage(msg) {
     if (queueBar) queueBar.replaceWith(btnRow);
     else textarea.after(btnRow);
 
-    btnRow.querySelector('.edit-cancel').addEventListener('click', () => {
+    const finishEdit = () => {
+        const current = _currentQueueMessage(msg);
         const newContent = document.createElement('div');
         newContent.className = 'message-content';
-        newContent.innerHTML = formatContent(msg.content);
+        newContent.innerHTML = formatContent(current.content);
         textarea.replaceWith(newContent);
-        // Restore queue bar
-        const bar = document.createElement('div');
-        bar.className = 'queue-actions';
-        bar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
-            + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
-        bar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
-        bar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
-        btnRow.replaceWith(bar);
-    });
+        btnRow.remove();
+        _syncQueuedMessagePresentation(msgEl, current);
+    };
+    btnRow.querySelector('.edit-cancel').addEventListener('click', finishEdit);
 
     btnRow.querySelector('.edit-save').addEventListener('click', async () => {
         const newText = textarea.value.trim();
@@ -2745,24 +4899,12 @@ async function editQueuedMessage(msg) {
             // Update local references
             msg.content = updated.content || newText;
             if (_queuedGeneration && _queuedGeneration.id === msg.id) {
-                _queuedGeneration = msg;
+                _queuedGeneration.content = msg.content;
             }
             const stateMsg = State.messages.find(m => m.id === msg.id);
             if (stateMsg) stateMsg.content = msg.content;
 
-            // Replace textarea with rendered content
-            const newContent = document.createElement('div');
-            newContent.className = 'message-content';
-            newContent.innerHTML = formatContent(msg.content);
-            textarea.replaceWith(newContent);
-            // Restore queue bar
-            const bar = document.createElement('div');
-            bar.className = 'queue-actions';
-            bar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
-                + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
-            bar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
-            bar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
-            btnRow.replaceWith(bar);
+            finishEdit();
             showToast('Queued message updated');
         } catch {
             showToast('Failed to update message', 'error');
@@ -2770,47 +4912,33 @@ async function editQueuedMessage(msg) {
     });
 }
 
-function _flushQueuedGeneration() {
-    if (!_queuedGeneration) return;
-    const msg = _queuedGeneration;
-    _queuedGeneration = null;
-    // Message already in State.messages and rendered — just trigger generation
-    // Remove queued styling and action bar
-    const queuedEl = document.querySelector('.queued-message');
-    if (queuedEl) {
-        queuedEl.classList.remove('queued-message');
-        const bar = queuedEl.querySelector('.queue-actions');
-        if (bar) bar.remove();
-    }
-    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-        showGenStatus('Sending queued message...');
-        const queueMsg = { action: 'generate', parent_id: msg.id };
-        _attachCCSettings(queueMsg);
-        State.ws.send(JSON.stringify(queueMsg));
-    }
-}
-
 // ── Regenerate ──
 
 async function regenerateMessage(msgId) {
-    if (State.isStreaming) return;
+    if (State.isStreaming) {
+        showToast('This branch is still running. Stop its current turn before regenerating.', 'warning');
+        return;
+    }
+    const convId = State.currentConvId;
+    const threadId = State.loomCursor?.thread_id;
+    const branchSwitchSeq = State._branchSwitchSeq;
+    // Capture the user's picker before moving to the prompt. Cursor loading
+    // can repaint the picker from an older assistant on that ancestor branch.
+    const settings = {};
+    _attachCCSettings(settings);
 
     try {
-        const result = await API.post(`/api/conversations/${State.currentConvId}/regenerate/${msgId}`);
+        const cursorAtStart = `${State.loomCursor?.cursor_id}:${State.loomCursor?.revision}:${State.loomCursor?.leaf_message_id ?? ''}`;
+        const result = await API.post(`/api/conversations/${convId}/regenerate/${msgId}`);
+        if (State._branchSwitchSeq !== branchSwitchSeq) return;
+        if (!_sameConvId(State.currentConvId, convId) || State.loomCursor?.thread_id !== threadId) return;
+        if (`${State.loomCursor?.cursor_id}:${State.loomCursor?.revision}:${State.loomCursor?.leaf_message_id ?? ''}` !== cursorAtStart) return;
+        await selectServerLoomCursor(convId, result.parent_id);
+        if (State._branchSwitchSeq !== branchSwitchSeq) return;
+        if (!_sameConvId(State.currentConvId, convId)) return;
 
-        // Remove the old message and everything after it from the view
-        const idx = State.messages.findIndex(m => m.id === msgId);
-        if (idx !== -1) {
-            State.messages = State.messages.slice(0, idx);
-            renderMessages();
-        }
-
-        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-            showGenStatus('Regenerating...');
-            const regenMsg = { action: 'regenerate', parent_id: result.parent_id };
-            _attachCCSettings(regenMsg);
-            State.ws.send(JSON.stringify(regenMsg));
-        }
+        _triggerParallelGenerate(1, result.parent_id, {convId, threadId: State.loomCursor.thread_id,
+            action: 'regenerate', settings, originalMessageId: msgId});
     } catch (err) {
         showToast('Regeneration failed', 'error');
     }
@@ -2818,14 +4946,26 @@ async function regenerateMessage(msgId) {
 
 // ── Cancel Generation ──
 
-function cancelGeneration() {
-    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-        const msg = { action: 'cancel' };
-        if (State._followingGenId != null) msg.gen_id = State._followingGenId;
-        const draftMsgId = State._followingDraftMsgId;
-        if (draftMsgId != null) msg.draft_msg_id = draftMsgId;
-        State.ws.send(JSON.stringify(msg));
+function _stopGeneration(disposition) {
+    if (!State.ws || State.ws.readyState !== WebSocket.OPEN) {
+        showToast('Reconnecting before this turn can be stopped', 'error');
+        return;
     }
+    const action = disposition === 'interrupt' ? 'interrupt' : 'cancel';
+    const msg = { action };
+    const genId = State._followingGenId ?? _pendingLaunch?.genId;
+    if (genId != null) msg.gen_id = genId;
+    const draftMsgId = State._followingDraftMsgId;
+    if (draftMsgId != null) msg.draft_msg_id = draftMsgId;
+    if (genId == null && draftMsgId == null) {
+        showToast('This turn is no longer active', 'error');
+        return;
+    }
+    showGenStatus(action === 'interrupt' ? 'Interrupting turn…' : 'Cancelling turn…');
+    document.querySelectorAll('.cancel-draft-btn, .interrupt-draft-btn').forEach(button => {
+        button.disabled = true;
+    });
+    State.ws.send(JSON.stringify(msg));
     // If not actively streaming (e.g. viewing a draft), reload after a short
     // delay to pick up the server-side cleanup (draft deletion)
     if (!State.isStreaming && State.currentConvId) {
@@ -2833,19 +4973,285 @@ function cancelGeneration() {
     }
 }
 
+function cancelGeneration() {
+    _stopGeneration('cancel');
+}
+
+function interruptGeneration() {
+    _stopGeneration('interrupt');
+}
+
 // ── Notifications (background generation landings + permission requests) ──
 
 const _notifications = [];
+const _BRANCH_ACTIVITY_SESSION_KEY = 'loom-branch-activity:v1';
+const _NOTIFICATION_DISMISSALS_KEY = 'loom-notification-dismissals:v1';
+function _notificationDismissalId(item) {
+    return JSON.stringify([item.type, item.convId ?? null, item.requestId ?? item.id ?? null,
+        item.id == null && item.requestId == null ? String(item.time || '') : null]);
+}
+function _readNotificationDismissals() {
+    try { const value = JSON.parse(localStorage.getItem(_NOTIFICATION_DISMISSALS_KEY) || '[]'); return new Set(Array.isArray(value) ? value.filter(id => typeof id === 'string') : []); }
+    catch { return new Set(); }
+}
+function _applyNotificationDismissals() {
+    const dismissed = _readNotificationDismissals();
+    for (let index = _notifications.length - 1; index >= 0; index--) {
+        const item = _notifications[index];
+        if (!(item.type === 'permission' && !item.resolved) && dismissed.has(_notificationDismissalId(item))) _notifications.splice(index, 1);
+    }
+}
+function _shareNotificationDismissals() {
+    const dismissed = _readNotificationDismissals();
+    for (const item of _notifications) if (!(item.type === 'permission' && !item.resolved)) dismissed.add(_notificationDismissalId(item));
+    try { localStorage.setItem(_NOTIFICATION_DISMISSALS_KEY, JSON.stringify([...dismissed].slice(-2048))); } catch {}
+}
+window.addEventListener('storage', event => {
+    if (event.key !== _NOTIFICATION_DISMISSALS_KEY) return;
+    _applyNotificationDismissals(); _persistBranchActivityNotifications(); _renderNotifBell(); _renderNotifDropdown();
+});
+let _parallelBranchActivity = [];
+let _parallelActivityPollTimer = null;
+let _parallelActivityRequestSeq = 0;
 
 function _sameConvId(a, b) {
     if (a === undefined || a === null || b === undefined || b === null) return false;
     return String(a) === String(b);
 }
 
+function _parallelActivityEnabled() {
+    const value = State.currentConv?.parallel_agents_enabled;
+    return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function _restoreBranchActivityNotifications() {
+    try {
+        const saved = JSON.parse(sessionStorage.getItem(_BRANCH_ACTIVITY_SESSION_KEY) || '[]');
+        if (!Array.isArray(saved)) return;
+        for (const item of saved.slice(0, 50)) {
+            if (!item || item.id == null || item.convId == null) continue;
+            _notifications.push({
+                ...item,
+                type: 'branch',
+                branchActivity: true,
+                time: item.time ? new Date(item.time) : new Date(),
+            });
+        }
+    } catch {
+        // sessionStorage can be unavailable in privacy-restricted contexts.
+    }
+}
+
+function _persistBranchActivityNotifications() {
+    try {
+        const saved = _notifications
+            .filter(item => item.type === 'branch' && item.branchActivity)
+            .slice(0, 50)
+            .map(item => ({
+                type: 'branch',
+                branchActivity: true,
+                id: item.id,
+                convId: item.convId,
+                convTitle: item.convTitle,
+                parentId: item.parentId ?? null,
+                preview: item.preview || '',
+                time: item.time instanceof Date ? item.time.toISOString() : item.time,
+            }));
+        sessionStorage.setItem(_BRANCH_ACTIVITY_SESSION_KEY, JSON.stringify(saved));
+    } catch {
+        // The in-memory notification remains usable even if persistence fails.
+    }
+}
+
+function _addBranchActivityNotification(notification) {
+    const existing = _notifications.find(item =>
+        item.type === 'branch'
+        && item.branchActivity
+        && _sameConvId(item.convId, notification.convId)
+        && _sameMessageId(item.id, notification.id)
+    );
+    if (existing) Object.assign(existing, notification, { branchActivity: true });
+    else _notifications.unshift({ ...notification, branchActivity: true });
+    _persistBranchActivityNotifications();
+    _renderNotifBell();
+}
+
+function markBranchActivitySeen(convId, messageIds) {
+    const ids = new Set((Array.isArray(messageIds) ? messageIds : [messageIds])
+        .filter(id => id != null)
+        .map(String));
+    if (!ids.size) return;
+    const before = _notifications.length;
+    for (let index = _notifications.length - 1; index >= 0; index--) {
+        const item = _notifications[index];
+        if (item.type === 'branch'
+            && item.branchActivity
+            && _sameConvId(item.convId, convId)
+            && ids.has(String(item.id))) {
+            _notifications.splice(index, 1);
+        }
+    }
+    if (_notifications.length !== before) {
+        _persistBranchActivityNotifications();
+        _renderNotifBell();
+    }
+}
+
+function _recomputeActivityBranchNames(treeData) {
+    if (!Array.isArray(treeData) || typeof computeBranchNames !== 'function') return;
+    const nodeMap = {};
+    const childrenMap = {};
+    const roots = [];
+    for (const node of treeData) {
+        nodeMap[node.id] = node;
+        childrenMap[node.id] = [];
+    }
+    for (const node of treeData) {
+        if (node.parent_id && nodeMap[node.parent_id]) childrenMap[node.parent_id].push(node.id);
+        else roots.push(node.id);
+    }
+    State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
+}
+
+function _activityHarnessLabel(mode) {
+    const labels = {
+        claude: 'Claude Code', codex: 'Codex', gemini: 'Antigravity',
+        goose: 'Goose', hermes: 'Hermes', dream: 'Dream',
+        umans: 'Umans', openrouter: 'OpenRouter', local: 'Local',
+    };
+    return labels[String(mode || '').toLowerCase()] || String(mode || 'Agent');
+}
+
+function _activityBranchPath(messageId) {
+    return State.branchNames?.[messageId] || `Message #${messageId}`;
+}
+
+function _activityElapsed(startedAt) {
+    const seconds = Math.max(0, Math.floor((Date.now() - Number(startedAt || 0) * 1000) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+async function refreshParallelBranchActivity() {
+    const requestSeq = ++_parallelActivityRequestSeq;
+    const convId = State.currentConvId;
+    if (!convId || !_parallelActivityEnabled()) {
+        _parallelBranchActivity = [];
+        _renderNotifBell();
+        if (!document.getElementById('notif-dropdown')?.classList.contains('hidden')) {
+            _renderNotifDropdown();
+        }
+        return;
+    }
+    try {
+        const [generationRows, queuedRows] = await Promise.all([
+            API.get('/api/generations'),
+            API.get(`/api/conversations/${convId}/generation-queue`),
+        ]);
+        if (requestSeq !== _parallelActivityRequestSeq || !_sameConvId(convId, State.currentConvId)) return;
+
+        const active = (Array.isArray(generationRows) ? generationRows : [])
+            .filter(row => _sameConvId(row.conv_id, convId));
+        const waiting = (Array.isArray(queuedRows) ? queuedRows : [])
+            .filter(row => row.status === 'queued' || row.status === 'paused');
+        const messageIds = [
+            ...active.map(row => row.draft_msg_id),
+            ...waiting.map(row => row.user_msg_id),
+        ].filter(id => id != null);
+        if (messageIds.some(id => !State.branchNames?.[id])) {
+            const treeData = await API.get(`/api/conversations/${convId}/tree`);
+            if (requestSeq !== _parallelActivityRequestSeq || !_sameConvId(convId, State.currentConvId)) return;
+            State.treeData = treeData;
+            if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
+            _recomputeActivityBranchNames(treeData);
+        }
+
+        _parallelBranchActivity = [
+            ...active.map(row => {
+                const awaitingPermission = _notifications.some(item =>
+                    item.type === 'permission'
+                    && !item.resolved
+                    && _sameMessageId(item.draftMsgId, row.draft_msg_id)
+                );
+                return {
+                    key: `active:${row.draft_msg_id}`,
+                    convId,
+                    messageId: row.draft_msg_id,
+                    state: awaitingPermission ? 'permission' : 'looming',
+                    stateLabel: awaitingPermission ? 'Permission' : 'Looming',
+                    harness: _activityHarnessLabel(row.mode),
+                    startedAt: Number(row.started_at || 0),
+                };
+            }),
+            ...waiting.map(row => ({
+                key: `${row.status}:${row.user_msg_id}`,
+                convId,
+                messageId: row.user_msg_id,
+                state: row.status,
+                stateLabel: row.status === 'paused' ? 'Paused' : 'Queued',
+                harness: _activityHarnessLabel(State.currentConv?.mode),
+                startedAt: Number(row.created_at || row.message_created_at || 0),
+            })),
+        ].sort((left, right) => right.startedAt - left.startedAt);
+        _renderNotifBell();
+        if (!document.getElementById('notif-dropdown')?.classList.contains('hidden')) {
+            _renderNotifDropdown();
+        }
+    } catch (error) {
+        console.warn('[ACTIVITY] Failed to refresh parallel branch activity:', error);
+    }
+}
+
+function _stopParallelActivityPolling() {
+    if (_parallelActivityPollTimer) clearInterval(_parallelActivityPollTimer);
+    _parallelActivityPollTimer = null;
+}
+
+function _startParallelActivityPolling() {
+    _stopParallelActivityPolling();
+    refreshParallelBranchActivity();
+    _parallelActivityPollTimer = setInterval(() => {
+        const dropdown = document.getElementById('notif-dropdown');
+        if (!dropdown || dropdown.classList.contains('hidden')) {
+            _stopParallelActivityPolling();
+            return;
+        }
+        refreshParallelBranchActivity();
+    }, 3000);
+}
+
+function addInfoNotification(message, severity = 'info') {
+    _notifications.unshift({ type: 'info', preview: String(message), severity, time: new Date() });
+    const infos = _notifications.filter(n => n.type === 'info');
+    for (const notice of infos.slice(50)) _notifications.splice(_notifications.indexOf(notice), 1);
+    _renderNotifBell();
+    if (!document.getElementById('notif-dropdown').classList.contains('hidden')) _renderNotifDropdown();
+}
+
+function showCopyLinkDialog(text) {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.innerHTML = '<div class="modal-content" role="dialog" aria-modal="true" aria-label="Copy Canvas link"><h2>Copy Canvas link</h2><input type="text" readonly aria-label="Canvas link"><button type="button">Close</button></div>';
+    const previous = document.activeElement;
+    const close = () => { modal.remove(); previous?.focus(); };
+    modal.querySelector('button').addEventListener('click', close);
+    modal.addEventListener('keydown', event => {
+        if (event.key === 'Escape') close();
+        if (event.key === 'Tab') {
+            event.preventDefault();
+            (document.activeElement === modal.querySelector('input') ? modal.querySelector('button') : modal.querySelector('input')).focus();
+        }
+    });
+    document.body.appendChild(modal);
+    const input = modal.querySelector('input'); input.value = text; input.focus(); input.select();
+}
+
 function addNotification(message) {
     const preview = (message.content || '').replace(/[#*_`>\[\]]/g, '').trim();
-    _notifications.push({
+    _addBranchActivityNotification({
         type: 'branch',
+        branchActivity: true,
         id: message.id,
         convId: State.currentConvId,
         convTitle: State.currentConv?.title || 'Conversation',
@@ -2853,7 +5259,6 @@ function addNotification(message) {
         preview: preview.slice(0, 120) + (preview.length > 120 ? '…' : ''),
         time: new Date(),
     });
-    _renderNotifBell();
 }
 
 function permissionSupportsAllowAll(toolName) {
@@ -2862,6 +5267,9 @@ function permissionSupportsAllowAll(toolName) {
 }
 
 function addPermissionNotification(data) {
+    // Replace the metadata notice when this page receives the owning prompt.
+    const noticeIndex = _notifications.findIndex(n => n.type === 'permission-notice' && n.requestId === data.request_id);
+    if (noticeIndex !== -1) _notifications.splice(noticeIndex, 1);
     // Don't duplicate — check if we already have this request_id
     if (_notifications.some(n => n.type === 'permission' && n.requestId === data.request_id)) return;
     _notifications.unshift({  // permissions go to the top
@@ -2871,11 +5279,14 @@ function addPermissionNotification(data) {
         genId: data.gen_id,
         parentId: data.parent_id,
         draftMsgId: data.draft_msg_id,
+        agentRunId: data.agent_run_id,
         toolName: data.tool_name || 'Unknown',
+        toolInput: data.tool_input,
         approvalMethod: data.approval_method || '',
-        inputSummary: (data.input_summary || '').substring(0, 200),
+        inputSummary: data.agent_run_id ? String(data.input_summary || '') : (data.input_summary || '').substring(0, 200),
         riskLevel: data.risk_level || '',
         riskReason: data.risk_reason || '',
+        rulePreview: data.rule_preview || '',
         supportsAllowAll: data.supports_allow_all !== false && permissionSupportsAllowAll(data.tool_name),
         resolved: false,
         time: new Date(),
@@ -2883,11 +5294,13 @@ function addPermissionNotification(data) {
     _renderNotifBell();
 }
 
-function resolvePermissionNotification(requestId, allowed) {
+function resolvePermissionNotification(requestId, allowed, feedback = '', decisionSource = 'user') {
     const n = _notifications.find(n => n.type === 'permission' && n.requestId === requestId);
     if (n) {
         n.resolved = true;
         n.allowed = allowed;
+        n.decisionSource = decisionSource;
+        n.feedback = feedback || n.feedback || '';
         // Re-render if dropdown is visible
         const dropdown = document.getElementById('notif-dropdown');
         if (dropdown && !dropdown.classList.contains('hidden')) _renderNotifDropdown();
@@ -2901,12 +5314,15 @@ function resolvePermissionNotification(requestId, allowed) {
 }
 
 function _renderNotifBell() {
+    _applyNotificationDismissals();
     const bell = document.getElementById('notif-bell');
     const badge = document.getElementById('notif-badge');
     if (!bell) return;
     bell.classList.remove('hidden');
-    const pendingPerms = _notifications.filter(n => n.type === 'permission' && !n.resolved).length;
+    const pendingPerms = _notifications.filter(n => (n.type === 'permission' || n.type === 'permission-notice') && !n.resolved).length;
     const total = _notifications.length;
+    const activeCount = _parallelBranchActivity.length;
+    bell.classList.toggle('notif-running', activeCount > 0);
     if (total > 0) {
         badge.textContent = total;
         badge.classList.remove('hidden');
@@ -2920,54 +5336,205 @@ function _renderNotifBell() {
     } else {
         badge.classList.add('hidden');
         bell.classList.remove('notif-active', 'notif-urgent');
-        document.getElementById('notif-dropdown').classList.add('hidden');
     }
 }
 
+function _appendNotifSection(list, title, items, renderItem, className = '') {
+    if (!items.length) return;
+    const section = document.createElement('section');
+    section.className = `notif-section ${className}`.trim();
+    const heading = document.createElement('div');
+    heading.className = 'notif-section-title';
+    heading.innerHTML = `<span>${escapeHtml(title)}</span><span>${items.length}</span>`;
+    section.appendChild(heading);
+    for (const item of items) section.appendChild(renderItem(item));
+    list.appendChild(section);
+}
+
+function _activityBranchUrl(convId, messageId) {
+    const url = new URL(window.location.href);
+    url.searchParams.set('conversation', String(convId));
+    url.searchParams.set('branch', String(messageId));
+    url.searchParams.delete('thread');
+    url.searchParams.set('view', 'chat');
+    return url.href;
+}
+
+async function _navigateToActivityBranch(convId, messageId) {
+    const dropdown = document.getElementById('notif-dropdown');
+    dropdown?.classList.add('hidden');
+    _stopParallelActivityPolling();
+    if (!_sameConvId(State.currentConvId, convId)) {
+        State._skipLoadOnChat = true;
+        await loadConversation(convId);
+    }
+    if (messageId != null) {
+        await switchToBranch(messageId, messageId, { exact: true });
+        markBranchActivitySeen(convId, [messageId]);
+    }
+    State._skipLoadOnChat = true;
+    switchView('chat');
+}
+
+function _renderParallelActivityItem(activity) {
+    const item = document.createElement('div');
+    item.className = `notif-item parallel-activity-item activity-${activity.state}`;
+    const path = _activityBranchPath(activity.messageId);
+    const icon = activity.state === 'permission'
+        ? '!'
+        : (activity.state === 'paused' ? 'Ⅱ' : (activity.state === 'queued' ? '·' : '◌'));
+    const elapsed = activity.startedAt ? _activityElapsed(activity.startedAt) : '';
+    item.innerHTML =
+        `<span class="parallel-activity-icon" aria-hidden="true">${icon}</span>` +
+        `<span class="parallel-activity-main">` +
+        `<span class="parallel-activity-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>` +
+        `<span class="parallel-activity-meta">${escapeHtml(activity.harness)} · ${escapeHtml(activity.stateLabel)}` +
+        (elapsed ? ` · ${escapeHtml(elapsed)}` : '') +
+        `</span></span>` +
+        `<button class="parallel-activity-popout" type="button" title="Open this branch in another Loom window">↗</button>`;
+    item.addEventListener('click', () => _navigateToActivityBranch(activity.convId, activity.messageId));
+    item.querySelector('.parallel-activity-popout')?.addEventListener('click', event => {
+        event.stopPropagation();
+        window.open(_activityBranchUrl(activity.convId, activity.messageId), '_blank', 'noopener');
+    });
+    return item;
+}
+
 function _renderNotifDropdown() {
+    _applyNotificationDismissals();
+    const dropdown = document.getElementById('notif-dropdown');
+    const mobile = document.documentElement.classList.contains('true-mobile');
+    const host = mobile ? document.body : document.getElementById('notif-bell-wrap');
+    if (host && dropdown.parentElement !== host) host.appendChild(dropdown);
     const list = document.getElementById('notif-list');
     list.innerHTML = '';
-    if (_notifications.length === 0) {
+    const branchActivity = _notifications.filter(item => item.type === 'branch' && item.branchActivity);
+    const otherNotifications = _notifications.filter(item => !(item.type === 'branch' && item.branchActivity));
+    if (_parallelBranchActivity.length === 0 && branchActivity.length === 0 && otherNotifications.length === 0) {
         list.innerHTML = '<div class="notif-empty">No notifications</div>';
         return;
     }
-    for (const n of _notifications) {
-        if (n.type === 'permission') {
-            list.appendChild(_renderPermissionNotifItem(n));
+    _appendNotifSection(
+        list,
+        'Active branches',
+        _parallelBranchActivity,
+        _renderParallelActivityItem,
+        'parallel-activity-section',
+    );
+    _appendNotifSection(list, 'New activity', branchActivity, _renderBranchNotifItem, 'new-activity-section');
+    const regularContainer = document.createDocumentFragment();
+    for (const n of otherNotifications) {
+        if (n.type === 'info') {
+            const item = document.createElement('div');
+            item.className = 'notif-item notif-info';
+            item.textContent = `${n.time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})} · ${n.preview}`;
+            regularContainer.appendChild(item);
+        } else if (n.type === 'permission-notice') {
+            const item = document.createElement('div');
+            item.className = 'notif-item notif-permission';
+            item.innerHTML = `<div class="notif-perm-header">Approval needed · Conversation #${escapeHtml(n.convId)}</div>
+                <div class="notif-perm-summary">Review on the originating page or in Admin Activity.</div>
+                <button type="button" class="notif-perm-btn">Review in Admin</button>`;
+            item.querySelector('button').addEventListener('click', () => {
+                const url = new URL(location.origin); url.port = '3002'; url.hash = 'activity';
+                window.open(url.href, '_blank', 'noopener');
+            });
+            item.addEventListener('click', event => {
+                if (event.target.closest('button')) return;
+                _navigateToActivityBranch(n.convId, n.messageId);
+            });
+            const openConversation = document.createElement('button');
+            openConversation.type = 'button';
+            openConversation.className = 'notif-perm-btn';
+            openConversation.textContent = 'Open conversation';
+            openConversation.addEventListener('click', event => {
+                event.stopPropagation();
+                _navigateToActivityBranch(n.convId, n.messageId);
+            });
+            if (typeof _loomRouteBase !== 'undefined' && _loomRouteBase === '/app/') {
+                item.querySelector('button').remove();
+                item.querySelector('.notif-perm-summary').textContent = 'Review on the originating page. Private Admin is available over Tailscale.';
+            }
+            const dismiss=document.createElement('button');
+            item.appendChild(openConversation);
+            dismiss.type='button';dismiss.className='notif-perm-btn';dismiss.textContent='Dismiss notification';
+            dismiss.title='Hide this notice on this browser. The approval decision remains pending.';
+            dismiss.addEventListener('click',event=>{event.stopPropagation();_dismissPermissionNotice(n.requestId);});
+            item.appendChild(dismiss);
+            regularContainer.appendChild(item);
+        } else if (n.type === 'permission') {
+            regularContainer.appendChild(_renderPermissionNotifItem(n));
         } else if (n.type === 'workspace') {
-            list.appendChild(_renderWorkspaceNotifItem(n));
+            regularContainer.appendChild(_renderWorkspaceNotifItem(n));
         } else {
-            list.appendChild(_renderBranchNotifItem(n));
+            regularContainer.appendChild(_renderBranchNotifItem(n));
         }
     }
+    if (otherNotifications.length) {
+        const regularSection = document.createElement('section');
+        regularSection.className = 'notif-section';
+        regularSection.innerHTML = '<div class="notif-section-title"><span>Notifications</span></div>';
+        regularSection.appendChild(regularContainer);
+        list.appendChild(regularSection);
+    }
     // Clear all button at bottom
-    const clearBtn = document.createElement('div');
-    clearBtn.className = 'notif-clear-all';
-    clearBtn.textContent = 'Clear all';
-    clearBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        _notifications.length = 0;
-        _renderNotifBell();
-    });
-    list.appendChild(clearBtn);
+    if (_notifications.length) {
+        const clearBtn = document.createElement('div');
+        clearBtn.className = 'notif-clear-all';
+        clearBtn.textContent = 'Clear notifications';
+        clearBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            _shareNotificationDismissals();
+            for (const notice of [..._notifications]) if (notice.type==='permission-notice') _dismissPermissionNotice(notice.requestId,false);
+            const pending = _notifications.filter(n =>
+                n.type === 'permission' && !n.resolved);
+            _notifications.splice(0, _notifications.length, ...pending);
+            _persistBranchActivityNotifications();
+            _renderNotifBell();
+            _renderNotifDropdown();
+        });
+        list.appendChild(clearBtn);
+    }
 }
 
 function _renderBranchNotifItem(n) {
     const item = document.createElement('div');
-    item.className = 'notif-item notif-branch';
+    item.className = 'notif-item notif-branch' + (n.branchActivity ? ' notif-new-branch' : '');
     const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    item.innerHTML = `<span class="notif-time">${timeStr}</span>`
-        + `<span class="notif-preview">${escapeHtml(n.preview || '(empty)')}</span>`;
+    if (n.branchActivity) {
+        const path = _sameConvId(n.convId, State.currentConvId)
+            ? _activityBranchPath(n.id)
+            : (n.convTitle || `Conversation ${n.convId}`);
+        item.innerHTML =
+            '<span class="notif-new-icon" aria-hidden="true">✦</span>' +
+            '<span class="parallel-activity-main">' +
+            `<span class="parallel-activity-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>` +
+            `<span class="parallel-activity-meta">Completed · ${escapeHtml(timeStr)}</span>` +
+            `<span class="notif-preview">${escapeHtml(n.preview || 'Response complete')}</span>` +
+            '</span>' +
+            '<button class="parallel-activity-popout" type="button" title="Open this branch in another Loom window">↗</button>';
+        item.querySelector('.parallel-activity-popout')?.addEventListener('click', event => {
+            event.stopPropagation();
+            window.open(_activityBranchUrl(n.convId, n.id), '_blank', 'noopener');
+        });
+    } else {
+        item.innerHTML = `<span class="notif-time">${timeStr}</span>`
+            + `<span class="notif-preview">${escapeHtml(n.preview || '(empty)')}</span>`;
+    }
     item.addEventListener('click', async () => {
         document.getElementById('notif-dropdown').classList.add('hidden');
+        _stopParallelActivityPolling();
         const idx = _notifications.indexOf(n);
         if (idx !== -1) _notifications.splice(idx, 1);
+        _persistBranchActivityNotifications();
         _renderNotifBell();
         if (!_sameConvId(State.currentConvId, n.convId)) {
             State._skipLoadOnChat = true;
             await loadConversation(n.convId);
         }
-        await switchToBranch(n.id);
+        if (n.branchActivity) await switchToBranch(n.id, n.id, { exact: true });
+        else await switchToBranch(n.id);
+        markBranchActivitySeen(n.convId, [n.id]);
         switchView('chat');
     });
     return item;
@@ -2981,8 +5548,9 @@ function _renderPermissionNotifItem(n) {
     if (n.resolved) {
         item.innerHTML =
             `<span class="notif-time">${timeStr}</span>` +
-            `<span class="notif-perm-status ${n.allowed ? 'perm-allowed' : 'perm-denied'}">${n.allowed ? 'Allowed' : 'Denied'}</span> ` +
-            `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>`;
+            `<span class="notif-perm-status ${n.allowed ? 'perm-allowed' : 'perm-denied'}">${n.decisionSource && n.decisionSource !== 'user' ? 'Ended' : (n.allowed ? 'Allowed' : 'Denied')}</span> ` +
+            `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
+            (n.feedback ? `<span class="notif-perm-feedback-sent">${escapeHtml(n.feedback)}</span>` : '');
         return item;
     }
 
@@ -2994,6 +5562,7 @@ function _renderPermissionNotifItem(n) {
             `<span class="notif-time">${timeStr}</span>` +
             `<span class="notif-perm-tool">&#x1F9F5; Plan Ready</span>` +
             `</div>` +
+            `<input class="permission-feedback-input notif-permission-feedback" type="text" maxlength="4000" placeholder="Optional note to the agent">` +
             `<div class="notif-perm-actions">` +
             `<button class="notif-perm-btn plan-approve" data-action="allow">Approve</button>` +
             `<button class="notif-perm-btn plan-revise" data-action="deny">Revise</button>` +
@@ -3008,8 +5577,12 @@ function _renderPermissionNotifItem(n) {
             `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
             `</div>` +
             (n.approvalMethod ? `<div class="notif-perm-summary">${escapeHtml(n.approvalMethod)}</div>` : '') +
-            (n.riskReason ? `<div class="notif-perm-summary notif-perm-risk">Destructive Git operation: ${escapeHtml(n.riskReason)}. Approval applies once.</div>` : '') +
+            (n.agentRunId ? `<div class="notif-perm-summary">Child ${escapeHtml(n.agentRunId.slice(0, 8))}</div>` : '') +
+            (n.riskReason ? `<div class="notif-perm-summary notif-perm-risk">Warning: ${escapeHtml(n.riskReason)}</div>` : '') +
+            (n.rulePreview ? `<div class="notif-perm-summary">Branch rule: ${escapeHtml(n.rulePreview)}</div>` : '') +
             `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
+            (n.toolInput != null ? `<details class="agent-request-arguments"><summary>Exact arguments</summary><pre>${escapeHtml(typeof n.toolInput === 'string' ? n.toolInput : JSON.stringify(n.toolInput, null, 2))}</pre></details>` : '') +
+            `<input class="permission-feedback-input notif-permission-feedback" type="text" maxlength="4000" placeholder="Optional note to the agent">` +
             `<div class="notif-perm-actions">` +
             `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
             `<button class="notif-perm-btn deny" data-action="deny">Deny</button>` +
@@ -3023,19 +5596,31 @@ function _renderPermissionNotifItem(n) {
             const action = btn.dataset.action;
             const allow = action === 'allow' || action === 'allow-all';
             const always = action === 'allow-all';
+            const feedback = (item.querySelector('.permission-feedback-input')?.value || '').trim();
+            if (!_sameConvId(n.convId, State.currentConvId)) {
+                showToast('Open the owning conversation to answer this permission request.', 'error');
+                return;
+            }
+            if (n.agentRunId && (!State.ws || State.ws.readyState !== WebSocket.OPEN)) {
+                showToast('Disconnected: reconnect before responding to this request.', 'error');
+                return;
+            }
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                 State.ws.send(JSON.stringify({
                     action: 'permission_response',
                     request_id: n.requestId,
-                    allow, always,
+                    allow, always, feedback,
                 }));
             }
             n.resolved = true;
             n.allowed = allow;
+            n.feedback = feedback;
+            item.querySelectorAll('button').forEach(button => { button.disabled = true; });
+            _scheduleAgentRender(true);
             _renderNotifDropdown();
             _renderNotifBell();
             // Also update the inline prompt if it exists
-            resolvePermissionPrompt(n.requestId, allow);
+            resolvePermissionPrompt(n.requestId, allow, feedback);
             // If plan was approved, flip dropdown back to Act
             if (isPlanNotif && allow) {
                 const permSel = document.getElementById('cc-permission-mode-inline');
@@ -3052,7 +5637,8 @@ function _renderPermissionNotifItem(n) {
 
     // Click on the item body (not buttons) navigates to the conversation
     item.addEventListener('click', async (e) => {
-        if (e.target.closest('.notif-perm-btn')) return;
+        if (e.target.closest('.notif-perm-btn, .permission-feedback-input')) return;
+        if (n.agentRunId) return; // Child review must not move the parent chat cursor.
         if (!_sameConvId(State.currentConvId, n.convId)) {
             State._skipLoadOnChat = true;
             await loadConversation(n.convId);
@@ -3070,36 +5656,35 @@ function _initNotifications() {
     const bell = document.getElementById('notif-bell');
     const dropdown = document.getElementById('notif-dropdown');
     if (!bell) return;
+    _restoreBranchActivityNotifications();
+    _renderNotifBell();
     bell.addEventListener('click', (e) => {
         e.stopPropagation();
         dropdown.classList.toggle('hidden');
-        if (!dropdown.classList.contains('hidden')) _renderNotifDropdown();
+        if (!dropdown.classList.contains('hidden')) {
+            _renderNotifDropdown();
+            _startParallelActivityPolling();
+        } else {
+            _stopParallelActivityPolling();
+        }
     });
     document.getElementById('notif-refresh').addEventListener('click', (e) => {
         e.stopPropagation();
         const before = _notifications.length;
         _notifications.splice(0, _notifications.length, ..._notifications.filter(n => !(n.type === 'permission' && n.resolved)));
-        if (_notifications.length !== before) _renderNotifBell();
-        else _renderNotifDropdown();
-    });
-    document.getElementById('notif-clear').addEventListener('click', (e) => {
-        e.stopPropagation();
-        dropdown.classList.add('hidden');
+        if (_notifications.length !== before) {
+            _persistBranchActivityNotifications();
+            _renderNotifBell();
+        }
+        refreshParallelBranchActivity();
     });
     // Close dropdown on outside click
     document.addEventListener('click', (e) => {
         if (!dropdown.contains(e.target) && e.target !== bell) {
             dropdown.classList.add('hidden');
+            _stopParallelActivityPolling();
         }
     });
-    // Request notification permission early for push notifs
-    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-        // Don't request immediately — wait for user interaction
-        document.addEventListener('click', function _reqPerm() {
-            Notification.requestPermission();
-            document.removeEventListener('click', _reqPerm);
-        }, { once: true });
-    }
 }
 
 // ── Render Messages ──
@@ -3111,7 +5696,31 @@ const VIRTUAL_SCROLL = {
     observer: null,     // IntersectionObserver for the sentinel
 };
 
+// An inline edit is user-owned transient state. Background queue/stream
+// reconciliation may update State.messages while it is open, but must not
+// repaint the container and detach the textarea underneath the user.
+let _inlineEditContext = null;
+let _messageRenderDeferredForEdit = false;
+
+function _releaseInlineEditRenderGuard({ flushDeferred = false } = {}) {
+    _inlineEditContext = null;
+    const shouldFlush = flushDeferred && _messageRenderDeferredForEdit;
+    _messageRenderDeferredForEdit = false;
+    if (shouldFlush) renderMessages();
+}
+
 function renderMessages() {
+    const activeEditor = document.querySelector('.edit-message-input');
+    if (_inlineEditContext
+        && activeEditor
+        && _sameConvId(_inlineEditContext.convId, State.currentConvId)) {
+        _messageRenderDeferredForEdit = true;
+        return;
+    }
+    if (_inlineEditContext && (!_sameConvId(_inlineEditContext.convId, State.currentConvId) || !activeEditor)) {
+        _releaseInlineEditRenderGuard();
+    }
+
     // Ensure branch names are computed from current tree data
     if (State.treeData && State.treeData.length > 0 && typeof computeBranchNames === 'function') {
         const nodeMap = {};
@@ -3124,6 +5733,9 @@ function renderMessages() {
         }
         State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
     }
+
+    if (typeof updateBranchNavigation === 'function') updateBranchNavigation();
+    if (State.currentView === 'chat' && typeof updateBreadcrumbs === 'function') updateBreadcrumbs();
 
     const container = document.getElementById('messages');
     container.innerHTML = '';
@@ -3173,17 +5785,38 @@ function renderMessages() {
         container.appendChild(createMessageElement(renderMsgs[i]));
     }
 
-    // If streaming and last message is a draft, convert it to a streaming div
+    // Convert the exact live draft to a streaming div. A queued continuation
+    // may follow it in State.messages, so the last row is not necessarily the
+    // assistant that is still streaming.
     const lastMsg = State.messages[State.messages.length - 1];
-    if (lastMsg && lastMsg.role === 'assistant' && State.isStreaming) {
-        const lastEl = container.querySelector(`.message[data-msg-id="${lastMsg.id}"]`);
-        if (lastEl) lastEl.remove();
-        appendStreamingMessage(lastMsg.cc_model_used, lastMsg.model_attestation, lastMsg.id);
+    const liveDraftId = State._liveStreamDraft?.id ?? State._followingDraftMsgId;
+    const streamingMsg = State.isStreaming
+        ? (State.messages.find(message =>
+            message.role === 'assistant'
+            && liveDraftId != null
+            && _sameMessageId(message.id, liveDraftId)
+        ) || (lastMsg?.role === 'assistant' ? lastMsg : null))
+        : null;
+    if (streamingMsg) {
+        const streamingEl = container.querySelector(
+            `.message[data-msg-id="${streamingMsg.id}"]`
+        );
+        const nextElement = streamingEl?.nextElementSibling || null;
+        if (streamingEl) streamingEl.remove();
+        appendStreamingMessage(
+            streamingMsg.cc_model_used,
+            streamingMsg.model_attestation,
+            streamingMsg.id,
+            streamingMsg.session_continuity,
+        );
+        if (nextElement?.isConnected && streamingDiv?.isConnected) {
+            container.insertBefore(streamingDiv, nextElement);
+        }
         // Render accumulated content_blocks from the draft
-        if (lastMsg.content_blocks && streamingDiv) {
+        if (streamingMsg.content_blocks && streamingDiv) {
             try {
-                const blocks = typeof lastMsg.content_blocks === 'string'
-                    ? JSON.parse(lastMsg.content_blocks) : lastMsg.content_blocks;
+                const blocks = typeof streamingMsg.content_blocks === 'string'
+                    ? JSON.parse(streamingMsg.content_blocks) : streamingMsg.content_blocks;
                 if (blocks && blocks.length > 0) {
                     const contentEl = streamingDiv.querySelector('.message-content');
                     contentEl.innerHTML = renderContentBlocks(blocks);
@@ -3191,11 +5824,14 @@ function renderMessages() {
             } catch {}
         }
         // Also show any text content accumulated so far
-        if (lastMsg.content && lastMsg.content.trim() && streamingDiv) {
+        if (streamingMsg.content && streamingMsg.content.trim() && streamingDiv) {
             const contentEl = streamingDiv.querySelector('.message-content');
             if (!contentEl.innerHTML.trim()) {
-                contentEl.innerHTML = formatContent(lastMsg.content);
+                contentEl.innerHTML = formatContent(streamingMsg.content);
             }
+        }
+        if (streamingDiv && parseChatItems(streamingMsg.chat_items).length) {
+            streamingDiv.insertAdjacentHTML('beforeend', renderChatItems(streamingMsg.chat_items));
         }
     } else {
         // Empty assistant messages are rendered as "Generating..." by createMessageElement.
@@ -3302,50 +5938,341 @@ function showChildBranchHint(msgId, container) {
     container.appendChild(hint);
 }
 
-// Pending generate stashed while we reconnect a dead/stale WS on mobile.
-// Flushed by connectWebSocket's onopen handler.
+// Submitted WS launches own their transport. Replacing the viewport socket
+// during navigation cannot delete a captured launch or replay it on another
+// conversation's socket. Modern Send uses the atomic HTTP endpoint above;
+// these bounded sockets also support manual Run and older running servers.
 let _pendingGenerate = null;
+const _pendingGenerates = new Map();
 
-function _triggerParallelGenerate(count, parentId) {
-    const isWeave = State.currentConv && State.currentConv.mode === 'weave';
-    const n = isWeave ? Math.max(1, Math.min(5, count)) : 1;
-    const targetParentId = parentId || _currentVisibleLeafId();
-
-    // Mobile safari / NAT can leave the socket reporting OPEN while it's
-    // actually TCP-dead. send() goes into the void and no stream_start ever
-    // comes back — the user sees their own message disappear into the grey.
-    // Detect staleness (no inbound traffic in 10s) or closed socket, force
-    // a reconnect, and replay the generate on the new socket's onopen.
-    const ws = State.ws;
-    const stale = !ws
-        || ws.readyState === WebSocket.CLOSED
-        || ws.readyState === WebSocket.CLOSING
-        || (ws.readyState === WebSocket.OPEN && Date.now() - (ws._lastActivity || 0) > 30000)
-        || ws.readyState === WebSocket.CONNECTING;
-    if (stale) {
-        console.log('[WS] generate: socket stale or not open — reconnecting and stashing');
-        _pendingGenerate = { count: n, parentId: targetParentId };
-        showGenStatus('Reconnecting...');
-        connectWebSocket(State.currentConvId);
-        return;
-    }
-
-    for (let i = 0; i < n; i++) {
-        const msg = { action: 'generate', parent_id: targetParentId || null };
-        _attachCCSettings(msg);
-        ws.send(JSON.stringify(msg));
-    }
-    showGenStatus(n > 1 ? `Generating ${n} branches...` : 'Sending...');
+function _launchOperationIsVisible(operation) {
+    return _sendOwnerIsCurrent(operation.owner)
+        && String(State.loomCursor?.thread_id) === String(operation.threadId);
 }
+
+function _forgetPendingGenerate(operation) {
+    if (_pendingGenerates.get(operation.key) !== operation) return;
+    _pendingGenerates.delete(operation.key);
+    _pendingGenerate = _pendingGenerates.values().next().value || null;
+}
+
+async function _recoverGenerationLaunch(operation) {
+    operation.view = LoomCoordination.launchStep(operation.view, 'disconnected');
+    if (!_launchOperationIsVisible(operation)) return;
+    if (!streamingDiv?.isConnected) appendStreamingMessage();
+    showGenStatus('Checking the submitted turn…', true);
+    connectWebSocket(operation.convId);
+    const recoverySocket = State.ws;
+    const snapshotCheck = new Promise(resolve => {
+        const timer = setTimeout(() => finish(null), 5000);
+        const receive = event => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'generation_active' || data.type === 'generation_idle') finish(data);
+        };
+        const closed = () => finish(null);
+        function finish(data) {
+            clearTimeout(timer);
+            recoverySocket.removeEventListener('message', receive);
+            recoverySocket.removeEventListener('close', closed);
+            resolve(data);
+        }
+        recoverySocket.addEventListener('message', receive);
+        recoverySocket.addEventListener('close', closed);
+    });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 5000);
+    let recovered = false;
+    let confirmedInactive = false;
+    try {
+        const url = `/api/conversations/${operation.convId}/messages/${operation.parentId}/children`;
+        const response = await fetch(url, {signal: controller.signal});
+        if (!response.ok) throw await apiError(response, 'GET', url);
+        const children = await response.json();
+        const snapshot = await snapshotCheck;
+        if (!_launchOperationIsVisible(operation)) return;
+        const running = (snapshot?.snapshots || []).some(run =>
+            String(run.client_instance_id) === String(_loomClientInstanceId)
+            && String(run.loom_thread_id) === String(operation.threadId)
+            && _sameMessageId(run.parent_id, operation.parentId));
+        // No draft is expected while workspace preparation is still running.
+        // Only the fresh snapshot can distinguish that from a failed launch.
+        if (running) { recovered = true; return; }
+        confirmedInactive = snapshot != null;
+        const candidates = children.filter(message => message.role === 'assistant'
+            && String(message.loom_thread_id) === String(operation.threadId)
+            && Number(message.created_at) >= operation.startedAt
+            && !_sameMessageId(message.id, operation.originalMessageId));
+        if (candidates.length === 1) {
+            recovered = true;
+            await selectServerLoomCursor(operation.convId, candidates[0].id);
+            if (!_launchOperationIsVisible(operation)) return;
+            await loadMessages(operation.convId, {preserveView: true});
+            connectWebSocket(operation.convId);
+        }
+    } catch (error) {
+        recovered = false;
+    } finally {
+        clearTimeout(deadline);
+        // A connected snapshot may already have recovered this exact launch.
+        // Never erase that run because the independent HTTP check found no draft.
+        const followedNewRun = State._followingGenId != null
+            && (operation.runId ? `gen:${State._followingGenId}` === operation.runId
+                : _sameMessageId(State._liveStreamDraft?.parent_id ?? _pendingLaunch?.parentId, operation.parentId));
+        if (!recovered && !followedNewRun && _launchOperationIsVisible(operation)) {
+            operation.view = LoomCoordination.launchStep(operation.view, 'rejected');
+            removeStreamingMessage();
+            _clearTerminalStreamState({clearParallel: true});
+            hideGenStatus();
+            _launchRecoveryNotice = {owner: operation.owner, text: operation.sent
+                ? 'Connection lost. Could not confirm this turn. Your saved reply is preserved; check the branch before rerunning.'
+                : 'Launch connection failed before the command was sent. Your saved reply is preserved.'};
+            _showLaunchRecoveryNotice();
+            if (operation.originalMessageId != null && (!operation.sent || confirmedInactive)) {
+                try {
+                    await selectServerLoomCursor(operation.convId, operation.originalMessageId);
+                    if (!_launchOperationIsVisible(operation)) return;
+                    await loadMessages(operation.convId, {preserveView: true});
+                } catch (_) { /* The persistent receipt still reports uncertainty. */ }
+            }
+            _launchRecoveryNotice = {owner: operation.owner, text: operation.sent
+                ? 'Connection lost. Could not confirm this turn. Your saved reply is preserved; check the branch before rerunning.'
+                : 'Launch connection failed before the command was sent. Your saved reply is preserved.'};
+            // Ambiguous admission is not permission to launch a second paid run.
+            _showLaunchRecoveryNotice();
+        }
+    }
+}
+
+function _openGenerationLaunchSocket(operation) {
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+    const params = new URLSearchParams({client_instance_id: _loomClientInstanceId});
+    const viewport = State.ws;
+    const reuseViewport = viewport?.readyState === WebSocket.OPEN
+        && _sameConvId(viewport._loomConvId, operation.convId)
+        && Date.now() - (viewport._lastActivity || 0) < 15000;
+    const socket = reuseViewport ? viewport
+        : new WebSocket(`${protocol}://${location.host}/ws/chat/${operation.convId}?${params}`);
+    const priorMessage = reuseViewport ? socket.onmessage : null;
+    const priorClose = reuseViewport ? socket.onclose : null;
+    let launchMessage, launchClose;
+    const finishTransport = () => {
+        clearTimeout(launchTimeout);
+        if (keepalive) clearInterval(keepalive);
+        if (!reuseViewport) { socket.close(); return; }
+        if (socket.onmessage === launchMessage) socket.onmessage = priorMessage;
+        if (socket.onclose === launchClose) socket.onclose = priorClose;
+    };
+    socket._loomConvId = operation.convId;
+    operation.socket = socket;
+    const launchTimeout = setTimeout(() => {
+        if (!operation.runId) {
+            finishTransport();
+            _forgetPendingGenerate(operation);
+            void _recoverGenerationLaunch(operation);
+        }
+    }, 5000);
+    let keepalive = null;
+    const launchOpen = () => {
+        _flushPendingGenerate(socket);
+        keepalive = setInterval(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({action: 'ping',
+                    ...(operation.runId ? {run_id: operation.runId, draft_msg_id: operation.draftId} : {})}));
+            }
+        }, 15000);
+    };
+    const receiveLaunch = event => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'branch_landed' || data.type === 'permission_notice') {
+            _handleSocketMessage(data);
+            return;
+        }
+        const runId = _canonicalClientRunId(data);
+        if ((data.type === 'generation_preparing' || data.type === 'stream_start'
+                || (data.type === 'error' && data.message && runId))
+            && _sameMessageId(data.parent_id, operation.parentId)
+            && String(data.client_instance_id || '') === String(_loomClientInstanceId)) {
+            operation.runId = runId;
+            operation.view = LoomCoordination.launchStep(operation.view, 'admitted');
+            operation.draftId = data.draft_msg_id ?? operation.draftId;
+            clearTimeout(launchTimeout);
+            _forgetPendingGenerate(operation);
+            if (_launchOperationIsVisible(operation) && runId) {
+                _subscribedRunIds.add(runId);
+                if (data.type === 'error') {
+                    State._followingGenId = data.gen_id;
+                    State._followingDraftMsgId = data.message.id;
+                    State._streamIsOurBranch = true;
+                    State.isStreaming = true;
+                }
+            }
+            if (_launchOperationIsVisible(operation) && operation.originalMessageId != null) {
+                const index = State.messages.findIndex(message => _sameMessageId(message.id, operation.originalMessageId));
+                if (index !== -1) {
+                    State.messages = State.messages.slice(0, index);
+                    renderMessages();
+                }
+            }
+            // Establish the viewport transport after launch acknowledgement.
+            // Connecting before admission can capture an idle snapshot that
+            // arrives after preparing/start on this independent socket.
+            if (_launchOperationIsVisible(operation)
+                && (!State.ws || State.ws.readyState !== WebSocket.OPEN
+                    || Date.now() - (State.ws._lastActivity || 0) > 30000)) {
+                connectWebSocket(operation.convId);
+            }
+            if (_launchOperationIsVisible(operation) && State.ws?.readyState === WebSocket.OPEN && runId) {
+                State.ws.send(JSON.stringify({action: 'subscribe_run', run_id: runId}));
+                State.ws.send(JSON.stringify({action: 'request_snapshot'}));
+            }
+        }
+        if (!operation.runId || runId !== operation.runId) {
+            if (data.type === 'error' && !runId) {
+                showToast(data.error || 'The submitted generation could not be launched', 'error');
+                _forgetPendingGenerate(operation);
+                if (_launchOperationIsVisible(operation)) hideGenStatus();
+                operation.terminal = true;
+                operation.view = LoomCoordination.launchStep(operation.view, 'rejected');
+                if (_launchOperationIsVisible(operation)) {
+                    removeStreamingMessage();
+                    showRetryBar(data.error || 'The submitted generation could not be launched');
+                }
+                finishTransport();
+            }
+            return;
+        }
+        const terminal = ['stream_end', 'generation_terminal', 'cancelled', 'interrupted', 'error'].includes(data.type);
+        if (_launchOperationIsVisible(operation)) {
+            // OPEN alone is not subscription evidence: a fast terminal can
+            // arrive before the viewport has acknowledged its exact run.
+            // Typed envelopes let both transports bridge that gap safely.
+            if (data.event_id || State.ws?.readyState !== WebSocket.OPEN) _handleSocketMessage(data);
+        } else if (terminal) {
+            const messageId = data.message?.id ?? data.draft_msg_id ?? null;
+            _recentTerminalRuns.set(_terminalRunKey(operation.convId, runId), messageId);
+            if (_recentTerminalRuns.size > 128) _recentTerminalRuns.delete(_recentTerminalRuns.keys().next().value);
+            if (messageId != null && ['stream_end', 'generation_terminal'].includes(data.type)) {
+                handleWSMessage({type: 'branch_landed', conv_id: operation.convId, message_id: messageId});
+            }
+        }
+        if (terminal) {
+            operation.terminal = true;
+            operation.view = LoomCoordination.launchStep(operation.view, 'terminal');
+            _forgetPendingGenerate(operation);
+            finishTransport();
+        }
+    };
+    const closeLaunch = () => {
+        clearTimeout(launchTimeout);
+        if (keepalive) clearInterval(keepalive);
+        if (_pendingGenerates.get(operation.key) !== operation) {
+            if (operation.runId && !operation.terminal) void _recoverGenerationLaunch(operation);
+            return;
+        }
+        _forgetPendingGenerate(operation);
+        // A sent command has an ambiguous outcome. Do not replay a possible
+        // launch and duplicate paid work; reconnect snapshots recover its run.
+        void _recoverGenerationLaunch(operation);
+    };
+    launchMessage = event => {
+        receiveLaunch(event);
+        if (priorMessage) priorMessage.call(socket, event);
+    };
+    launchClose = event => {
+        if (priorClose) priorClose.call(socket, event);
+        closeLaunch();
+    };
+    socket.onmessage = launchMessage;
+    socket.onclose = launchClose;
+    if (reuseViewport) launchOpen();
+    else {
+        socket.onopen = launchOpen;
+        socket.onerror = () => {};
+    }
+}
+
+function _triggerParallelGenerate(count, parentId, route = {}) {
+    if (State.ws?._authExpired) {
+        showToast('Sign-in expired. Reload this page to continue.', 'warning');
+        return false;
+    }
+    const convId = route.convId ?? State.currentConvId;
+    const cursor = State.loomCursors?.[String(convId)] || null;
+    const threadId = route.threadId ?? cursor?.thread_id ?? null;
+    if (!threadId || (!route.submitted && (!_sameConvId(State.currentConvId, convId)
+        || String(State.loomCursor?.thread_id || '') !== String(threadId)))) {
+        showToast('The selected Loom thread changed; generation was not launched', 'error');
+        return false;
+    }
+    const isWeave = (route.mode ?? State.currentConv?.mode) === 'weave';
+    const n = isWeave ? Math.max(1, Math.min(5, count)) : 1;
+    const targetParentId = parentId ?? _currentVisibleLeafId();
+    if (targetParentId == null) {
+        showToast('Choose an exact message before launching generation', 'error');
+        return false;
+    }
+    const settings = route.settings ? { ...route.settings } : {};
+    if (!route.settings) _attachCCSettings(settings);
+    const packet = {
+        ...settings,
+        action: route.action || 'generate',
+        parent_id: targetParentId,
+        client_instance_id: _loomClientInstanceId,
+        loom_thread_id: threadId,
+        generation_count: n,
+    };
+    const owner = route.owner || {
+        convId,
+        conversationSeq: _conversationLoadRequestSeq,
+        branchSeq: State._branchSwitchSeq || 0,
+        navigationEpoch: typeof _workspaceNavigationEpoch === 'undefined' ? 0 : _workspaceNavigationEpoch,
+    };
+
+    // Every launch needs acknowledgement. Reuse a recently responsive viewport;
+    // only a stale or disconnected viewport needs another transport handshake.
+    const key = `${convId}/${threadId}/${targetParentId}/${packet.action}`;
+    if (_pendingGenerates.has(key)) return false;
+    _launchRecoveryNotice = null;
+    const operation = {key, convId, threadId, parentId: targetParentId, packet, owner,
+        sent: false, startedAt: Date.now() / 1000, originalMessageId: route.originalMessageId,
+        view: LoomCoordination.launchStep('idle', 'submit')};
+    _pendingGenerates.set(key, operation);
+    _pendingGenerate = _pendingGenerate || operation;
+    if (_launchOperationIsVisible(operation)) {
+        if (!streamingDiv?.isConnected) appendStreamingMessage();
+        showGenStatus('Submitting turn…');
+    }
+    _openGenerationLaunchSocket(operation);
+    return true;
+}
+
+function _recoverForegroundConnection() {
+    if (document.hidden || !State.currentConvId || State.currentView === 'home') return;
+    const socket = State.ws;
+    if (socket?.readyState === WebSocket.CONNECTING) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN
+        || Date.now() - (socket._lastActivity || 0) > 15000) {
+        connectWebSocket(State.currentConvId);
+    } else {
+        socket.send(JSON.stringify({action: 'request_snapshot', ..._followedGenerationProbe()}));
+    }
+}
+document.addEventListener('visibilitychange', _recoverForegroundConnection);
+window.addEventListener('pageshow', _recoverForegroundConnection);
+window.addEventListener('focus', _recoverForegroundConnection);
 
 // Fired by connectWebSocket onopen — replays a stashed generate so the user
 // doesn't have to resend after a silent mobile reconnect.
-function _flushPendingGenerate() {
-    if (!_pendingGenerate) return;
-    const { count, parentId } = _pendingGenerate;
-    _pendingGenerate = null;
-    // Defer one tick so server has processed our ws_chat setup (generation_idle etc.)
-    setTimeout(() => _triggerParallelGenerate(count, parentId), 150);
+function _flushPendingGenerate(socket = State.ws) {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    for (const operation of _pendingGenerates.values()) {
+        if (operation.sent || operation.socket !== socket
+            || !_sameConvId(socket._loomConvId, operation.convId)) continue;
+        // Keep pending ownership until the server acknowledges this exact
+        // parent/run. No timer gap, and no mutable picker or viewport lookup.
+        socket.send(JSON.stringify(operation.packet));
+        operation.sent = true;
+    }
 }
 
 /** Attach cc_model/effort/permission to a WS message from current UI state */
@@ -3354,10 +6281,15 @@ function _attachCCSettings(msg) {
     if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini' && conv.mode !== 'goose' && conv.mode !== 'umans' && conv.mode !== 'openrouter')) return;
     const modelSel = document.getElementById('cc-model-inline');
     const effortSel = document.getElementById('cc-effort-inline');
-    const permSel = document.getElementById('cc-permission-mode-inline');
-    if (modelSel && modelSel.value) msg.cc_model = modelSel.value;
+    const branchModel = (typeof _selectedCCModelForBranch === 'function')
+        ? _selectedCCModelForBranch(conv) : null;
+    // The visible picker is authoritative at send time. Branch history only
+    // supplies a fallback when there is no selected model in the composer.
+    const chosenModel = (modelSel && modelSel.value) || branchModel || conv.cc_model || null;
+    if (chosenModel) msg.cc_model = chosenModel;
     if (effortSel && effortSel.value) msg.cc_effort = effortSel.value;
-    if (permSel && permSel.value) msg.cc_permission_mode = permSel.value;
+    else if (conv.cc_effort) msg.cc_effort = conv.cc_effort;
+    msg.cc_permission_mode = 'default';
 }
 
 function showGenerateBar() {
@@ -3390,43 +6322,11 @@ function _modelsMatch(a, b) {
 }
 
 function _agentKindForModel(model, conv) {
-    const msgModel = (model || '').toLowerCase();
+    // Persisted model route takes precedence over the current conversation.
+    // Runtime attestation remains the stronger evidence where available.
+    const route = EXOModelRegistry.resolve(model);
+    if (route.mode) return route.mode;
     const mode = (conv?.mode || '').toLowerCase();
-    // A conversation may hand off between harnesses. A persisted message's
-    // recorded model is stronger provenance than the current conversation mode.
-    if (msgModel.startsWith('hermes:')) return 'hermes';
-    if (msgModel.startsWith('goose:')) return 'goose';
-    if (
-        msgModel.startsWith('openrouter:') ||
-        msgModel === 'z-ai/glm-5.2' ||
-        msgModel === 'moonshotai/kimi-k2.7-code' ||
-        msgModel === 'openai/gpt-5.6-luna' ||
-        msgModel === 'deepseek/deepseek-v4-flash-0731'
-    ) return 'openrouter';
-    if (
-        msgModel.startsWith('codex') ||
-        msgModel.startsWith('gpt-5') ||
-        msgModel === 'gpt-4o' ||
-        msgModel.startsWith('o3') ||
-        msgModel.startsWith('o4')
-    ) return 'codex';
-    if (
-        msgModel.includes('gemini') ||
-        msgModel.startsWith('claude sonnet') ||
-        msgModel.startsWith('claude opus') ||
-        msgModel.startsWith('gpt-oss')
-    ) return 'gemini';
-    if (
-        msgModel === 'sonnet' ||
-        msgModel === 'opus' ||
-        msgModel === 'haiku' ||
-        msgModel.startsWith('sonnet[') ||
-        msgModel.startsWith('opus[') ||
-        msgModel.startsWith('haiku[') ||
-        msgModel.startsWith('claude-')
-    ) return 'claude';
-    if (msgModel.startsWith('umans-')) return 'umans';
-    if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
     if (['claude', 'gemini', 'codex', 'goose', 'local', 'hermes', 'umans', 'openrouter', 'dream'].includes(mode)) return mode;
     return '';
 }
@@ -3453,7 +6353,8 @@ function createMessageElement(msg, cost, elapsed) {
         elapsed = Math.round(msg.generation_ms / 1000);
     }
     const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
-    const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !isErrorMsg;
+    const hasBlocks = Array.isArray(msg.content_blocks) ? msg.content_blocks.length > 0 : (typeof msg.content_blocks === 'string' && msg.content_blocks.length > 2);
+    const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !hasBlocks && !isErrorMsg && (!msg.turn_lifecycle_state || msg.turn_lifecycle_state === 'generating');
     const isDescribeMsg = msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[Image description —');
     // A queued message is one that's been POSTed to the DB (so it has an id and
     // a role) but is waiting for the current stream to end before it generates.
@@ -3499,7 +6400,7 @@ function createMessageElement(msg, cost, elapsed) {
         : branchLabelFull;
 
     const isBm = State.bookmarks?.some(b => b.message_id === msg.id);
-    const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove bookmark' : 'Bookmark'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
+    const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove message from Leaves' : 'Pin message to Leaves'}" aria-label="${isBm ? 'Remove message from Leaves' : 'Pin message to Leaves'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
     let actionsHtml = '';
     if (msg.role === 'system') {
         if (isDescribeMsg) {
@@ -3507,7 +6408,7 @@ function createMessageElement(msg, cost, elapsed) {
         }
     } else if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
-            '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
+            '<button onclick="forkFromMessage(' + msg.id + ')" title="Branch" aria-label="Branch">&#x2325;</button>' +
             '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
     } else if (isQueued) {
         // Queued user message: editing goes through the queue-bar's Edit button
@@ -3517,7 +6418,7 @@ function createMessageElement(msg, cost, elapsed) {
         actionsHtml = '';
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
-            '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
+            '<button onclick="forkFromMessage(' + msg.id + ')" title="Branch" aria-label="Branch">&#x2325;</button>' +
             '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
     }
 
@@ -3535,7 +6436,8 @@ function createMessageElement(msg, cost, elapsed) {
 
     if (isDraft) {
         contentHtml = '<span class="generating-placeholder"><span class="thinking-dots"></span> Generating...</span>'
-            + ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>';
+            + ' <button onclick="cancelGeneration()" title="Cancel and discard partial context" aria-label="Cancel and discard partial context" class="cancel-draft-btn">&#x2298;</button>'
+            + ' <button onclick="interruptGeneration()" title="Interrupt and preserve partial context" aria-label="Interrupt and preserve partial context" class="interrupt-draft-btn">&#x23F8;</button>';
     } else if (msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[Image description —')) {
         // Render as describe message
         const modelMatch = msg.content.match(/^\[Image description — ([^\]]+)\]/);
@@ -3555,6 +6457,16 @@ function createMessageElement(msg, cost, elapsed) {
         contentHtml = formatContent(msg.content);
     }
 
+    // Provider failures can retain tool/think blocks but put their terminal
+    // diagnostic only in plain content. Do not hide that outcome behind the
+    // richer blocks and leave a tool-only turn looking unfinished.
+    if (blocks?.length && ['failed', 'partial_failed', 'cancelled', 'interrupted'].includes(msg.turn_lifecycle_state)) {
+        const diagnostic = String(msg.content || '').match(/(?:^|\n)\[([^\n]*(?:failed|cancelled|interrupted)[^\n]*)\]\s*$/i);
+        const label = diagnostic?.[1] || ({failed:'Turn failed.',partial_failed:'Turn failed before completion. Partial output is preserved.',
+            cancelled:'Turn cancelled.',interrupted:'Turn interrupted.'})[msg.turn_lifecycle_state];
+        contentHtml += `<p class="turn-terminal-notice" role="status">${escapeHtml(label)}</p>`;
+    }
+
     const timestampHtml = _formatMessageTimestamp(msg);
 
     // Footer metadata: message timestamp plus assistant generation stats.
@@ -3565,6 +6477,7 @@ function createMessageElement(msg, cost, elapsed) {
         const inTok = c.input_tokens || msg.turn_input_tokens || 0;
         const outTok = c.output_tokens || msg.turn_output_tokens || 0;
         const durMs = c.duration_ms || msg.generation_ms || (msg.role === 'assistant' && elapsed ? elapsed * 1000 : 0);
+        const firstTokenMs = msg.time_to_first_token_ms;
         const parts = [];
         if (timestampHtml) parts.push(timestampHtml);
         if (inTok || outTok) {
@@ -3573,7 +6486,15 @@ function createMessageElement(msg, cost, elapsed) {
             if (outTok) tokenParts.push(`${_fmtTok(outTok)} out`);
             parts.push(tokenParts.join(' / '));
         }
-        if (usd) parts.push(`$${usd.toFixed(4)}`);
+        const telemetry = [];
+        if (usd) telemetry.push(`Cost $${usd.toFixed(4)}`);
+        if (msg.role === 'assistant' && Number.isFinite(firstTokenMs) && firstTokenMs >= 0) {
+            const firstSecs = Math.round(firstTokenMs / 1000);
+            const firstLabel = firstSecs >= 60
+                ? _formatElapsed(firstSecs)
+                : `${(firstTokenMs / 1000).toFixed(1)}s`;
+            telemetry.push(`<span class="first-token-time" title="Time from launch to first observed provider output (response arrival for non-streaming models)">First response ${firstLabel}</span>`);
+        }
         if (msg.role === 'assistant' && durMs) {
             const secs = Math.round(durMs / 1000);
             let genTime = '';
@@ -3582,9 +6503,14 @@ function createMessageElement(msg, cost, elapsed) {
             } else {
                 genTime = `${(durMs/1000).toFixed(1)}s`;
             }
-            parts.push(`<span class="generation-time" title="Time spent generating this reply">Generation time ${genTime}</span>`);
+            telemetry.push(`<span class="generation-time" title="Time spent generating this reply">Generation time ${genTime}</span>`);
         }
-        if (parts.length) footerHtml = `<div class="message-footer">${parts.join(' · ')}</div>`;
+        if (parts.length || telemetry.length) {
+            const compact = parts.join(' · ');
+            footerHtml = telemetry.length
+                ? `<details class="message-footer message-telemetry"><summary aria-label="Message time, tokens and generation details">${compact || 'Generation details'}</summary><div class="message-telemetry-panel">${telemetry.join(' · ')}</div></details>`
+                : `<div class="message-footer">${compact}</div>`;
+        }
     }
 
     let imgHtml = '';
@@ -3613,41 +6539,22 @@ function createMessageElement(msg, cost, elapsed) {
         }
     }
 
-    // Detect project-relative image paths in assistant CC/local messages
+    // Show project images the reply itself names. Tool inputs/outputs (folder
+    // listings, greps, file reads) are deliberately not scanned: an image that
+    // merely appears in a listing was not produced by the turn.
     let projectImgHtml = '';
-    if (msg.role === 'assistant' && isCliAgentMode && State.currentConv) {
-        const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
-        const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
-        const matches = allText.match(imgRegex) || [];
-        // Dedup by filename — keep the shortest relative path
-        // (absolute paths from content_blocks get blocked by path traversal)
-        const byFilename = new Map();
-        for (const m of matches) {
-            const norm = m.replace(/\\/g, '/');
-            // Skip absolute paths (start with / or X:/)
- if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
-                continue;
-            }
-            const filename = norm.split('/').pop();
-            const existing = byFilename.get(filename);
-            if (!existing || norm.length > existing.length) {
-                byFilename.set(filename, norm);
-            }
-        }
-        const imgEntries = [];
-        for (const [filename, norm] of byFilename) {
-            imgEntries.push({
-                url: `/api/conversations/${State.currentConvId}/file?path=${norm}`,
-                name: filename,
-            });
-        }
- if (imgEntries.length > 0) {
-            projectImgHtml = '<div class="detected-images">' +
-                imgEntries.map(e =>
-                    `<figure class="detected-image-figure">` +
-                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy" onerror="console.warn('[IMG] Failed to load:', this.src, '— removing figure'); this.closest('figure').remove()">` +
-                    `<figcaption>${escapeHtml(e.name)}</figcaption></figure>`
-                ).join('') + '</div>';
+    if (msg.role === 'assistant' && isCliAgentMode && State.currentConv && msg.chat_items == null) {
+        const imgEntries = replyImageEntries(msg.content || '', State.currentConv.project_dir, State.currentConvId);
+        const figure = e =>
+            `<figure class="detected-image-figure">` +
+            `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy" onerror="this.closest('figure').remove()">` +
+            `<figcaption>${escapeHtml(e.name)}</figcaption></figure>`;
+        const VISIBLE = 6;
+        if (imgEntries.length > 0) {
+            const extra = imgEntries.slice(VISIBLE);
+            projectImgHtml = '<div class="detected-images">' + imgEntries.slice(0, VISIBLE).map(figure).join('') +
+                (extra.length ? `<details class="detected-images-more"><summary>${extra.length} more image${extra.length === 1 ? '' : 's'}</summary>` +
+                    extra.map(figure).join('') + '</details>' : '') + '</div>';
         }
     }
 
@@ -3659,7 +6566,7 @@ function createMessageElement(msg, cost, elapsed) {
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
-        imgHtml + projectImgHtml + footerHtml;
+        imgHtml + projectImgHtml + renderChatItems(msg.chat_items) + footerHtml;
 
     // Click-to-preview for detected project images
     div.querySelectorAll('.detected-images .generated-image').forEach(img => {
@@ -3676,12 +6583,31 @@ function createMessageElement(msg, cost, elapsed) {
     // Click-to-copy branch label
     const branchEl = div.querySelector('.message-branch-label');
     if (branchEl) {
-        branchEl.addEventListener('click', () => {
-            navigator.clipboard.writeText(branchEl.textContent).then(
-                () => showToast('Branch path copied'),
-                () => {}
-            );
+        branchEl.setAttribute('role', 'button');
+        branchEl.setAttribute('tabindex', '0');
+        branchEl.title = 'Copy full message path to the address bar';
+        branchEl.setAttribute('aria-label', 'Copy full message path: ' + branchLabelFull);
+        const copyPath = async () => {
+            await copyMessageBranchPath(msg.id, msg.conversation_id || State.currentConvId, branchEl);
+            branchEl.classList.add('path-copied');
+            branchEl.setAttribute('aria-label', 'Full message path copied to the address bar');
+            setTimeout(() => {
+                branchEl.classList.remove('path-copied');
+                branchEl.setAttribute('aria-label', 'Copy full message path: ' + branchLabelFull);
+            }, 2000);
+        };
+        branchEl.addEventListener('click', copyPath);
+        branchEl.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); copyPath(); }
         });
+    }
+
+    if (isQueued) {
+        div.classList.add('queued-message');
+        const queueStatus = _queuedGeneration?.queue_status || msg.queue_status || 'queued';
+        msg.queue_status = queueStatus;
+        if (queueStatus === 'paused') div.classList.add('paused-queued-message');
+        div.appendChild(createQueueActions(msg));
     }
 
     return div;
@@ -3810,6 +6736,49 @@ function renderToolBody(toolName, input, resultDisplay) {
     return inputHtml + resultHtml;
 }
 
+/** Inline figure for an image a tool returned (served from the project). */
+function toolImageFigureHtml(url) {
+    if (!url || !String(url).startsWith('/api/conversations/')) return '';
+    let name = 'image';
+    try { name = decodeURIComponent(String(url).split('path=').pop() || '').split(/[/\\]/).pop() || 'image'; } catch { /* keep default */ }
+    return '<div class="tool-image-result"><figure class="detected-image-figure">' +
+        '<img class="generated-image" src="' + escapeHtml(url) + '" alt="' + escapeHtml(name) + '" loading="lazy" ' +
+        'onerror="this.closest(\'figure\').remove()">' +
+        '<figcaption>' + escapeHtml(name) + '</figcaption></figure></div>';
+}
+
+function parseChatItems(value) {
+    try {
+        const items = typeof value === 'string' ? JSON.parse(value) : value;
+        return Array.isArray(items) ? items : [];
+    } catch { return []; }
+}
+
+function renderChatItem(item) {
+    // Public metadata supplies only Loom URLs; never trust a tool-supplied href.
+    if (!/^[0-9a-f-]{36}$/i.test(item?.id || '')) return '';
+    const url = `/api/chat-items/${item.id}/file`;
+    const label = escapeHtml(item.label || 'File');
+    const caption = item.caption ? `<p>${escapeHtml(item.caption)}</p>` : '';
+    let preview = '';
+    if (item.mode === 'attach' && item.kind === 'image') {
+        preview = `<a href="${url}" target="_blank" rel="noopener"><img class="generated-image" src="${url}" alt="${label}" loading="lazy"></a>`;
+    } else if (item.mode === 'attach' && item.kind === 'markdown') {
+        preview = `<div class="chat-item-markdown">${formatContent(item.content || '')}</div>`;
+    } else if (item.mode === 'attach' && item.kind === 'code') {
+        // Escape the whole text so snippets cannot close a Markdown fence or run HTML.
+        preview = `<pre><code>${escapeHtml(item.content || '')}</code></pre>`;
+    }
+    const description = item.mode === 'link' ? 'Current file' : 'Attached snapshot';
+    return `<section class="chat-item" data-chat-item-id="${item.id}">${preview}${caption}` +
+        `<a class="message-file-attach" href="${url}?download=true">${label}</a> <small>${description}${item.language ? ' · ' + escapeHtml(item.language) : ''}</small></section>`;
+}
+
+function renderChatItems(value) {
+    const items = parseChatItems(value);
+    return items.length ? `<div class="chat-presentations">${items.map(renderChatItem).join('')}</div>` : '';
+}
+
 function renderContentBlocks(blocks) {
     // Render chronologically: text / tool / text / tool. A sentence split by
     // a tool call shows as text-before, tool, text-after on consecutive lines
@@ -3830,12 +6799,16 @@ function renderContentBlocks(blocks) {
         const isEdit = (name === 'Edit');
         const diffHtml = isEdit ? renderEditDiff(input, result) : null;
         const bodyHtml = diffHtml || renderToolBody(name, input, resultDisplay);
-        return '<div class="tool-block">' +
+        // A tool-made image (screenshot) stays visible; a Read of an existing
+        // image stays inside the collapsed step.
+        const imageHtml = toolImageFigureHtml(block.image_url);
+        const open = imageHtml && name !== 'Read';
+        return '<div class="tool-block' + (open ? ' expanded' : '') + '">' +
             '<div class="tool-block-header" data-tool-toggle>' +
                 '<span class="tool-name">' + escapeHtml(name) + '</span>' +
-                '<span class="tool-toggle">&#9656;</span>' +
+                '<span class="tool-toggle">' + (open ? '&#9662;' : '&#9656;') + '</span>' +
             '</div>' +
-            '<div class="tool-block-body">' + bodyHtml + '</div>' +
+            '<div class="tool-block-body">' + bodyHtml + imageHtml + '</div>' +
         '</div>';
     };
     for (const block of blocks) {
@@ -3872,9 +6845,8 @@ function loadBranchIndicator(msgId, slot) {
 
     // Find siblings: messages with the same parent_id
     const parentId = msg.parent_id;
-    const siblings = parentId === null
-        ? State.treeData.filter(n => n.parent_id === null && n.role === msg.role)
-        : State.treeData.filter(n => n.parent_id === parentId);
+    if (parentId == null) return; // Independent roots are separate threads.
+    const siblings = State.treeData.filter(n => _sameMessageId(n.parent_id, parentId));
     if (siblings.length <= 1) return;
 
     siblings.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
@@ -3884,6 +6856,7 @@ function loadBranchIndicator(msgId, slot) {
 
     const indicator = document.createElement('span');
     indicator.className = 'branch-indicator';
+    indicator.title = `Response ${currentIndex + 1} of ${total}`;
     indicator.innerHTML = `
         <button ${currentIndex === 0 ? 'disabled' : ''}>‹</button>
         <span>${currentIndex + 1}/${total}</span>
@@ -3891,6 +6864,8 @@ function loadBranchIndicator(msgId, slot) {
     `;
 
     const buttons = indicator.querySelectorAll('button');
+    buttons[0].setAttribute('aria-label', 'Previous response');
+    buttons[1].setAttribute('aria-label', 'Next response');
     buttons[0].addEventListener('click', async (e) => {
         e.stopPropagation();
         if (currentIndex > 0) await switchToBranch(siblingIds[currentIndex - 1]);
@@ -3903,26 +6878,89 @@ function loadBranchIndicator(msgId, slot) {
     slot.replaceWith(indicator);
 }
 
+function _reconcileNavigatedBranch(branch, convId, launchRunIds = []) {
+    if (!_sameConvId(State.currentConvId, convId)) return branch;
+    // A branch GET can precede stream_end but arrive afterward. Preserve newer
+    // exact-message evidence; never pull a different/sibling run into this view.
+    const local = new Map(State.messages.map(message => [String(message.id), message]));
+    if (State._liveStreamDraft) local.set(String(State._liveStreamDraft.id), State._liveStreamDraft);
+    const terminalIds = new Set([..._recentTerminalRuns]
+        .filter(([key]) => key.startsWith(`${convId}/`)).map(([, id]) => String(id)));
+    const merged = branch.map(message => {
+        const newer = local.get(String(message.id));
+        const landed = message.generation_ms != null
+            || ['completed', 'failed', 'partial_failed', 'cancelled', 'interrupted'].includes(message.turn_lifecycle_state);
+        const accepted = LoomCoordination.viewStep(
+            terminalIds.has(String(message.id)), true, landed,
+        )[1];
+        return newer && (!accepted || (!landed
+            && _sameMessageId(State._followingDraftMsgId, message.id))) ? newer : message;
+    });
+    // Only a send/edit acknowledgement may follow its newly allocated child.
+    // Ordinary explicit navigation must retain its exact requested boundary.
+    for (const runId of launchRunIds) {
+        const draftId = _recentTerminalRuns.get(_terminalRunKey(convId, runId))
+            ?? (runId === `gen:${State._followingGenId}` ? State._followingDraftMsgId : null);
+        const child = local.get(String(draftId));
+        if (child && _sameMessageId(child.parent_id, merged.at(-1)?.id)) merged.push(child);
+    }
+    return merged;
+}
+
 async function switchToBranch(leafId, scrollToMsgId, options = {}) {
+    const convId = State.currentConvId;
+    const switchSeq = (State._branchSwitchSeq || 0) + 1;
+    State._branchSwitchSeq = switchSeq;
+    saveComposerDraft();
     try {
         if (typeof showLoading === 'function') showLoading();
         // Ordinary navigation follows the clicked branch to its newest leaf.
         // Exact navigation is used by tree Run so its generation parent cannot
         // drift to a newer descendant created by another agent.
-        const [branch, treeData] = await Promise.all([
+        let [branch, treeData] = await Promise.all([
             options.exact
-                ? API.get(`/api/conversations/${State.currentConvId}/branch/${leafId}`)
-                : API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`),
-            API.get(`/api/conversations/${State.currentConvId}/tree`),
+                ? API.get(`/api/conversations/${convId}/branch/${leafId}`)
+                : API.post(`/api/conversations/${convId}/switch-branch/${leafId}`),
+            API.get(`/api/conversations/${convId}/tree`),
         ]);
+        if (State._cursorSyncPromise) await State._cursorSyncPromise;
+        if (State._branchSwitchSeq !== switchSeq || !_sameConvId(State.currentConvId, convId)) return;
+        branch = _reconcileNavigatedBranch(branch, convId, options.launchRunIds);
+        let loadedLeaf = branch[branch.length - 1];
+        if (!loadedLeaf) throw new Error('The selected branch has no messages');
+        await selectServerLoomCursor(convId, loadedLeaf.id, [...treeData, ...branch]);
+        if (State._branchSwitchSeq !== switchSeq || !_sameConvId(State.currentConvId, convId)) return;
+        branch = _reconcileNavigatedBranch(branch, convId, options.launchRunIds);
+        loadedLeaf = branch[branch.length - 1];
+        // A run subscription owns output, not navigation. Detach the old
+        // renderer when this explicit branch no longer contains its draft.
+        if (State._followingGenId != null && !branch.some(message =>
+            _sameMessageId(message.id, State._followingDraftMsgId)
+        )) {
+            _resetStreamState();
+            removeStreamingMessage();
+            setBrowserTabState('idle');
+        }
+        // Explicit branch navigation supersedes an inline edit. Background
+        // message reconciliation never reaches this path and remains deferred.
+        _releaseInlineEditRenderGuard();
         State.messages = branch;
+        if (typeof _clearExplicitCCModel === 'function') _clearExplicitCCModel();
         State.treeData = treeData;
-        const loadedLeaf = branch[branch.length - 1];
+        markBranchActivitySeen(State.currentConvId, branch.map(message => message.id));
         if (loadedLeaf) rememberConversationLeaf(State.currentConvId, loadedLeaf.id);
+        restoreComposerDraft(State.currentConvId, State.loomCursor);
+        if (State.ws?.readyState === WebSocket.OPEN) {
+            State.ws.send(JSON.stringify({ action: 'request_snapshot' }));
+        }
         hideRetryBar();
         hideGenStatus();
         renderMessages();
         renderTree();
+        // Navigation must paint without waiting for optional model discovery.
+        if (typeof updateInlineCCControls === 'function' && State.currentConv) {
+            void updateInlineCCControls(State.currentConv).catch(() => {});
+        }
 
         // Scroll to the clicked message, or bottom if not specified
         const targetId = scrollToMsgId || leafId;
@@ -4022,7 +7060,80 @@ if (typeof marked !== 'undefined') {
         return '<div class="code-block-wrapper">' + toolbar +
             '<pre><code' + langClass + '>' + codeHtml + '</code></pre></div>\n';
     };
+    // Harnesses cite files as markdown links whose targets are local paths
+    // (C:/…, file:///G:/…, /mnt/c/…, /G:/…, <C:\…>, relative files). As web
+    // links they open a broken tab, so render them as copyable file chips.
+    const defaultLink = marked.Renderer.prototype.link;
+    renderer.link = function(token) {
+        const ref = localFileRef(token.href);
+        if (!ref) return defaultLink.call(this, token);
+        // A label that is itself inline code would nest <code> in the chip.
+        let label = this.parser.parseInline(token.tokens || []).replace(/^<code>([\s\S]*)<\/code>$/, '$1');
+        if (ref.line && !label.includes(ref.line)) label += escapeHtml(ref.line);
+        return '<code class="file-ref" role="button" tabindex="0" data-file-path="' + escapeHtml(ref.path) +
+            '" title="' + escapeHtml(ref.path + ref.line) + ' (click to copy)">' + label + '</code>';
+    };
     marked.setOptions({ breaks: true, gfm: true, renderer });
+}
+
+/** Project images named in reply text, as served-file entries (deduped by path). */
+function replyImageEntries(text, projectDir, convId) {
+    const root = String(projectDir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const seen = new Map();
+    const isImage = s => /\.(?:png|jpe?g|gif|webp)(?::\d+)?$/i.test(s.trim());
+    const body = String(text);
+    // Paths may contain spaces inside `code spans` and (link targets);
+    // elsewhere only space-free tokens count, so prose is never swallowed.
+    const spanPattern = /`([^`\n]+)`|\]\(<?([^)>\n]+)>?\)/g;
+    const candidates = [
+        ...[...body.matchAll(spanPattern)].map(m => m[1] || m[2]),
+        ...(body.replace(spanPattern, ' ')
+            .match(/(?:[A-Za-z]:)?[\w/\\.-]*[\w-]+\.(?:png|jpe?g|gif|webp)\b/gi) || []),
+    ].filter(isImage);
+    for (const raw of candidates) {
+        let norm = raw.trim().replace(/\\/g, '/');
+        const ref = localFileRef(norm);
+        if (ref) norm = ref.path.replace(/\\/g, '/');
+        if (/^[A-Za-z]:\//.test(norm) || norm.startsWith('/')) {
+            // Absolute paths are shown only when they sit inside the project.
+            if (!root || !norm.toLowerCase().startsWith(root + '/')) continue;
+            norm = norm.slice(root.length + 1);
+        }
+        norm = norm.replace(/^\.\//, '');
+        if (!norm || norm.split('/').includes('..')) continue;
+        const key = norm.toLowerCase();
+        if (!seen.has(key)) {
+            seen.set(key, {
+                url: `/api/conversations/${convId}/file?path=${encodeURIComponent(norm)}`,
+                name: norm.split('/').pop(),
+            });
+        }
+    }
+    return [...seen.values()];
+}
+
+/** Parse a markdown link target as a local file reference, or null for web links. */
+function localFileRef(href) {
+    let h = String(href || '').trim().replace(/^<|>$/g, '');
+    if (!h || /^(https?:|mailto:|tel:|#)/i.test(h)) return null;
+    try { h = decodeURI(h); } catch { /* keep raw */ }
+    h = h.replace(/^file:\/\/\/?/i, '');
+    let m = h.match(/^\/mnt\/([a-z])\/(.*)$/i);
+    if (m) h = m[1].toUpperCase() + ':/' + m[2];
+    m = h.match(/^\/([a-z]):[\\/](.*)$/i);
+    if (m) h = m[1].toUpperCase() + ':/' + m[2];
+    const absolute = /^[a-z]:[\\/]/i.test(h) || h.startsWith('/') || h.startsWith('\\\\');
+    if (!absolute && /^[a-z][a-z0-9+.-]*:/i.test(h)) return null;  // another URL scheme
+    let line = '';
+    const lineMatch = h.match(/(?::(\d+)(?:-(\d+))?|#L?(\d+)(?:-L?(\d+))?)$/i);
+    if (lineMatch) {
+        const start = lineMatch[1] || lineMatch[3];
+        const end = lineMatch[2] || lineMatch[4];
+        line = ':' + start + (end ? '-' + end : '');
+        h = h.slice(0, lineMatch.index);
+    }
+    if (!absolute && !/[\\/]/.test(h) && !/\.[\w-]{1,8}$/.test(h)) return null;
+    return { path: h, line };
 }
 
 function renderCompactMarker(content, msgId) {
@@ -4268,7 +7379,7 @@ function _requestSnapshotIfStreaming(force = false) {
     if (!State.ws || State.ws.readyState !== WebSocket.OPEN) return;
     _lastSnapshotRequestAt = now;
     try {
-        State.ws.send(JSON.stringify({ action: 'request_snapshot' }));
+        State.ws.send(JSON.stringify({ action: 'request_snapshot', ..._followedGenerationProbe() }));
     } catch {}
 }
 
@@ -4336,17 +7447,20 @@ function _fmtTok(n) {
 }
 
 function _startGenTimer() {
+    if (!_streamStartTime) _streamStartTime = Date.now();
     if (_genTimerInterval) clearInterval(_genTimerInterval);
-    _genTimerInterval = setInterval(() => {
+    const update = () => {
         if (!streamingDiv || !_streamStartTime) return;
-        const secs = Math.floor((Date.now() - _streamStartTime) / 1000);
+        const secs = Math.max(0, Math.floor((Date.now() - _streamStartTime) / 1000));
         const timerEl = streamingDiv.querySelector('.gen-timer');
         if (timerEl) timerEl.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
         const tokEl = streamingDiv.querySelector('.gen-token-info');
         if (tokEl && _streamTokenCount > 0 && !tokEl.dataset.hasUsage) {
             tokEl.textContent = '↓' + _fmtTok(_streamTokenCount) + ' · ';
         }
-    }, 1000);
+    };
+    update();
+    _genTimerInterval = setInterval(update, 1000);
     // Start loom animation
     if (_loomAnimInterval) clearInterval(_loomAnimInterval);
     let frame = 0;
@@ -4363,7 +7477,12 @@ function _stopGenTimer() {
     if (_loomAnimInterval) { clearInterval(_loomAnimInterval); _loomAnimInterval = null; }
 }
 
-function appendStreamingMessage(ccModel, modelAttestation = null, draftMsgId = null) {
+function appendStreamingMessage(
+    ccModel,
+    modelAttestation = null,
+    draftMsgId = null,
+    sessionContinuity = null,
+) {
     const container = document.getElementById('messages');
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
@@ -4374,7 +7493,7 @@ function appendStreamingMessage(ccModel, modelAttestation = null, draftMsgId = n
         : (ccModel || State.currentConv?.cc_model || State.currentConv?.local_model);
     const label = _assistantRoleLabelForModel(modelForLabel, State.currentConv);
     const initialHarness = isWeave ? 'Weave' : label;
-    const initialAttestation = modelAttestation
+    let initialAttestation = modelAttestation
         ? _parseModelAttestation(modelAttestation)
         : (modelForLabel ? {
             status: 'requested',
@@ -4383,26 +7502,53 @@ function appendStreamingMessage(ccModel, modelAttestation = null, draftMsgId = n
             source: 'loom_ui_selection',
             fallback_allowed: false,
         } : null);
+    if (initialAttestation && sessionContinuity) {
+        const continuity = typeof sessionContinuity === 'object'
+            ? sessionContinuity
+            : { status: sessionContinuity };
+        initialAttestation = {
+            ...initialAttestation,
+            session_continuity: continuity.status,
+            session_continuity_reason: continuity.reason,
+            source_session_id: continuity.source_session_id,
+        };
+    }
+    const stopControls = _pendingLaunch
+        ? '<button onclick="cancelGeneration()" title="Cancel launch; keep the user message" aria-label="Cancel launch; keep the user message" class="cancel-draft-btn">&#x2298;</button>'
+        : '<button onclick="cancelGeneration()" title="Cancel and discard partial context" aria-label="Cancel and discard partial context" class="cancel-draft-btn">&#x2298;</button>'
+          + '<button onclick="interruptGeneration()" title="Interrupt and preserve partial context" aria-label="Interrupt and preserve partial context" class="interrupt-draft-btn">&#x23F8;</button>';
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
             '<span class="message-role">' + escapeHtml(label) + '</span>' +
             '<span class="model-attestation-slot">' + _renderModelAttestation(initialAttestation) + '</span>' +
         '</div>' +
         '</div>' +
-        '<div class="message-content">' +
-            '<span class="stream-waiting">' +
-                '<span class="stream-waiting-anim"></span>' +
-                '<span class="stream-waiting-text">waiting for first token...</span>' +
-            '</span>' +
-        '</div>' +
+        '<div class="message-content"></div>' +
         '<div class="stream-thinking-footer">' +
-        '<button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
-        '<span class="loom-anim"></span><span class="looming-text"> Looming...</span>' +
+        '<span class="stream-waiting" role="status" aria-live="polite">' +
+            '<span class="stream-waiting-text" data-status-text="Waiting for first token…">Waiting for first token…</span>' +
+        '</span>' +
+        stopControls +
+        '<span class="stream-waiting-anim clotho-spinner" aria-hidden="true"></span>' +
+        '<span class="looming-phase hidden" aria-label="Looming">' +
+            '<span class="loom-anim" aria-hidden="true"></span>' +
+            '<span class="looming-text">Looming</span>' +
+            '<span class="looming-ellipsis" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>' +
+        '</span>' +
+        '<span class="turn-lifecycle-status hidden" role="status" aria-live="polite">' +
+            '<span class="turn-lifecycle-text"></span>' +
+        '</span>' +
         '<span class="gen-stats"><span class="gen-token-info"></span><span class="gen-timer">0:00</span></span>' +
         '</div>';
+    container.querySelector('.empty-loom-hint')?.remove();
     container.appendChild(streamingDiv);
     _startGenTimer();
     _startStreamWaitingTicker();
+    if (_pendingTurnStatus) {
+        const pendingStatus = _pendingTurnStatus;
+        _pendingTurnStatus = null;
+        showGenStatus(pendingStatus.text, pendingStatus.reconnecting);
+    }
     scrollToBottom();
 }
 
@@ -4510,6 +7656,20 @@ function _renderModelAttestation(value) {
         ? att.status : 'unverified';
     const model = att.effective_model || att.launch_model || att.requested_model || 'unknown model';
     const harness = att.harness || 'Unknown harness';
+    const continuity = att.session_continuity || '';
+    const continuityReason = att.session_continuity_reason || '';
+    const continuityLabel = continuityReason === 'provider_boundary' ? 'harness handoff'
+        : continuityReason === 'model_boundary' ? 'model handoff'
+        : continuity === 'forked' ? 'native fork'
+        : continuity === 'resumed' ? 'native resume'
+        : continuity === 'rebuilt' ? 'history rebuild'
+        : continuity;
+    const preparation = att.preparation && typeof att.preparation === 'object'
+        ? att.preparation : null;
+    const preparationCalls = Array.isArray(preparation?.calls) ? preparation.calls : [];
+    const preparationLabel = preparationCalls.length
+        ? `${preparationCalls.length} call${preparationCalls.length === 1 ? '' : 's'} · ${preparation.status || 'unverified'}`
+        : '';
     const mark = status === 'verified' ? '&#10003;'
         : status === 'mismatch' ? '&#10005;'
         : status === 'configured' ? '&#9671;'
@@ -4529,7 +7689,12 @@ function _renderModelAttestation(value) {
         ['Evidence', _modelAttestationSourceLabel(att.source)],
         ['Fallback', att.fallback_allowed === false ? 'disabled' : (att.fallback_allowed === true ? 'allowed' : '')],
         ['Thread', att.thread_id],
+        ['Session continuity', continuityLabel],
+        ['Continuity reason', att.session_continuity_reason],
+        ['Source session', att.source_session_id],
         ['App server', att.app_server],
+        ['Preparation', preparationLabel],
+        ['Identity warning', att.identity_warning],
     ].filter(([, val]) => val !== undefined && val !== null && val !== '');
     const title = status === 'verified'
         ? `${model} was reported by ${harness}. Click for the full chain of custody.`
@@ -4538,11 +7703,18 @@ function _renderModelAttestation(value) {
         : status === 'requested'
             ? `${model} is the selected model; waiting for provider confirmation.`
             : `Model identity is ${status}. Click for details.`;
-    const panel = rows.map(([key, val]) =>
+    const preparationRows = preparationCalls.map((call, index) => {
+        const route = [call.harness, call.requested_model].filter(Boolean).join(' · ');
+        const effective = call.effective_model ? ` → ${call.effective_model}` : '';
+        return [`Preparation ${index + 1}`, `${route}${effective} · ${call.status || 'unverified'}`];
+    });
+    const panel = rows.concat(preparationRows).map(([key, val]) =>
         `<div><span>${escapeHtml(String(key))}</span><code>${escapeHtml(String(val))}</code></div>`
     ).join('');
     return `<details class="model-attestation model-attestation-${status}" title="${escapeHtml(title)}">` +
-        `<summary>${mark} ${escapeHtml(harness)} · ${escapeHtml(model)}${escapeHtml(suffix)}</summary>` +
+        `<summary><span class="model-attestation-full">${mark} ${escapeHtml(harness)} · ${escapeHtml(model)}${escapeHtml(suffix)}` +
+        `${continuityLabel ? ` · ${escapeHtml(continuityLabel)}` : ''}</span>` +
+        `<span class="model-attestation-compact">${mark} ${escapeHtml(model)}${escapeHtml(suffix)}</span></summary>` +
         `<div class="model-attestation-panel">${panel}</div>` +
         `</details>`;
 }
@@ -4555,25 +7727,56 @@ function _updateStreamingModelAttestation(attestation) {
 
 let _streamWaitingTicker = null;
 let _streamWaitingFrame = 0;
-const _streamWaitingFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const _CLOTHO_SPINNER_INTERVAL_MS = 115;
+const _CLOTHO_SPINNER_FRAMES = [
+    '·           ·',
+    ' ·         · ',
+    '  ⠐       ⠂  ',
+    '   ⠒     ⠚   ',
+    '    ⠒⠤ ⠚⠤    ',
+    '   ⠤⢎   ⡰⠤   ',
+    '  ──⢎   ⡰──  ',
+    '  ──⤹   ⤸──  ',
+    ' ━━━⤹ ◈ ⤸━━━ ',
+    ' ━━━⠤ ◈ ⠤━━━ ',
+    ' ═════ ◈ ═════ ',
+    ' ═════ ✦ ═════ ',
+    ' ═════ ✧ ═════ ',
+    ' ━━━⠤ ◈ ⤤━━━ ',
+    ' ━━━⤸ ◈ ⤹━━━ ',
+    '  ──⤸   ⤹──  ',
+    '  ──⡰   ⢎──  ',
+    '   ⠤⡰   ⢎⠤   ',
+    '    ⠒⠤ ⠚⠤    ',
+    '   ⠒     ⠚   ',
+    '  ⠐       ⠂  ',
+    ' ·         · ',
+    '·           ·',
+    '             ',
+];
 function _startStreamWaitingTicker() {
     if (_streamWaitingTicker) clearInterval(_streamWaitingTicker);
     _streamWaitingFrame = 0;
     const start = Date.now();
-    _streamWaitingTicker = setInterval(() => {
+    const paint = () => {
         if (!streamingDiv) { _stopStreamWaitingTicker(); return; }
         const animEl = streamingDiv.querySelector('.stream-waiting-anim');
         const textEl = streamingDiv.querySelector('.stream-waiting-text');
         if (!animEl || !textEl) { _stopStreamWaitingTicker(); return; }
-        animEl.textContent = _streamWaitingFrames[_streamWaitingFrame];
-        _streamWaitingFrame = (_streamWaitingFrame + 1) % _streamWaitingFrames.length;
+        animEl.textContent = _CLOTHO_SPINNER_FRAMES[_streamWaitingFrame];
+        _streamWaitingFrame = (_streamWaitingFrame + 1) % _CLOTHO_SPINNER_FRAMES.length;
         const secs = Math.floor((Date.now() - start) / 1000);
-        if (secs > 10) {
-            textEl.textContent = `still working… (${secs}s — large context can take 30–90s before first token)`;
+        const status = textEl.dataset.statusText || 'Waiting for first token…';
+        if (secs > 10 && /waiting for first token/i.test(status)) {
+            textEl.textContent = `${status} (${secs}s — large context can take 30–90s)`;
         } else if (secs > 4) {
-            textEl.textContent = `waiting for first token… (${secs}s)`;
+            textEl.textContent = `${status} (${secs}s)`;
+        } else {
+            textEl.textContent = status;
         }
-    }, 80);
+    };
+    paint();
+    _streamWaitingTicker = setInterval(paint, _CLOTHO_SPINNER_INTERVAL_MS);
 }
 function _stopStreamWaitingTicker() {
     if (_streamWaitingTicker) { clearInterval(_streamWaitingTicker); _streamWaitingTicker = null; }
@@ -4583,6 +7786,8 @@ function _removeStreamWaiting() {
     if (!streamingDiv) return;
     const el = streamingDiv.querySelector('.stream-waiting');
     if (el) el.remove();
+    streamingDiv.querySelector('.stream-waiting-anim')?.remove();
+    streamingDiv.querySelector('.looming-phase')?.classList.remove('hidden');
 }
 
 let _streamBuffer = '';
@@ -4688,7 +7893,7 @@ function _flushStreamBufferNow() {
     _flushStreamBuffer();
 }
 
-function finalizeStreamingMessage(msg, cost) {
+function finalizeStreamingMessage(msg, cost, {preserveViewport = false} = {}) {
     if (!streamingDiv) return;
     _stopGenTimer();
     _stopStreamWaitingTicker();
@@ -4709,10 +7914,14 @@ function finalizeStreamingMessage(msg, cost) {
     else State.messages.push(msg);
     const elapsed = _streamStartTime ? Math.round((Date.now() - _streamStartTime) / 1000) : 0;
     const newEl = createMessageElement(msg, cost, elapsed);
+    const scroller = document.getElementById('messages-container');
+    const scrollTop = scroller?.scrollTop;
     streamingDiv.replaceWith(newEl);
     streamingDiv = null;
     State._liveStreamDraft = null;
-    scrollToBottom();
+    if (preserveViewport) {
+        if (scroller) scroller.scrollTop = scrollTop;
+    } else scrollToBottom();
 }
 
 function removeStreamingMessage() {
@@ -4722,8 +7931,19 @@ function removeStreamingMessage() {
         streamingDiv.remove();
         streamingDiv = null;
     }
+    _pendingLaunch = null;
     // Remove any draft messages remaining in the DOM
-    document.querySelectorAll('.message-generating').forEach(el => el.remove());
+    document.querySelectorAll('.message-generating').forEach(el => {
+        const msgId = el.dataset?.msgId;
+        if (msgId && State.messages?.some(m =>
+            String(m.id) === String(msgId) &&
+            (m.content?.trim() || (Array.isArray(m.content_blocks) ? m.content_blocks.length : m.content_blocks) || m.turn_lifecycle_state)
+        )) {
+            el.classList.remove('message-generating');
+            return;
+        }
+        el.remove();
+    });
 }
 
 function _streamingMessageHasContent() {
@@ -4732,7 +7952,8 @@ function _streamingMessageHasContent() {
     const contentEl = streamingDiv.querySelector('.message-content');
     if (!contentEl) return false;
     const clone = contentEl.cloneNode(true);
-    clone.querySelectorAll('.stream-waiting, .typing-cursor').forEach(el => el.remove());
+    clone.querySelectorAll('.stream-waiting, .stream-waiting-anim, .typing-cursor')
+        .forEach(el => el.remove());
     return clone.textContent.trim().length > 0 || !!clone.querySelector('.tool-block, .cc-thinking, .ask-question-block');
 }
 
@@ -4846,9 +8067,13 @@ function finalizeToolBlock(result, toolId, imageUrl, isError) {
         figure.appendChild(caption);
         imgContainer.appendChild(figure);
         block.querySelector('.tool-block-body').appendChild(imgContainer);
-        block.classList.add('expanded');
-        scrollToBottom();
-        return;
+        // Reading an existing image is looking, not producing: keep that
+        // step collapsed. Screenshots and other tool-made images open.
+        if (toolName !== 'Read') {
+            block.classList.add('expanded');
+            scrollToBottom();
+            return;
+        }
     }
     // Auto-collapse after result arrives
     block.classList.remove('expanded');
@@ -4884,13 +8109,11 @@ function appendThinkingChunk(text) {
 async function forkFromMessage(msgId) {
     if (!State.currentConvId) return;
     try {
-        const newConv = await API.post(`/api/conversations/${State.currentConvId}/fork/${msgId}`);
-        State.conversations.unshift(newConv);
-        showToast(`Forked → "${newConv.title}"`);
-        await loadConversation(newConv.id);
-        switchView('chat');
+        await switchToBranch(msgId, msgId, {exact: true});
+        document.getElementById('user-input').focus();
+        showToast('Branch point selected. Send a message to create a branch in this conversation.');
     } catch (err) {
-        showToast('Fork failed', 'error');
+        showToast('Branch failed', 'error');
     }
 }
 
@@ -4902,6 +8125,13 @@ function editMessage(msgId) {
 
     const msgEl = document.querySelector(`.message[data-msg-id="${msgId}"]`);
     if (!msgEl) return;
+    const existingEditor = document.querySelector('.edit-message-input');
+    if (existingEditor) {
+        existingEditor.focus();
+        return;
+    }
+    _inlineEditContext = { convId: State.currentConvId, msgId };
+    _messageRenderDeferredForEdit = false;
     const contentEl = msgEl.querySelector('.message-content');
 
     // Track files for this edit: start with originals, allow adding more
@@ -4955,10 +8185,11 @@ function editMessage(msgId) {
     renderEditFiles();
 
     // Describe focus input for image descriptions (only shown when images attached)
-    const describeRow = document.createElement('div');
+    const describeRow = document.createElement('details');
     describeRow.className = 'edit-describe-context hidden';
     describeRow.innerHTML = `
-        <label title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
+        <summary>Describe focus</summary>
+        <label class="hidden" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
         <textarea class="edit-describe-input" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false">${escapeHtml(msg.describe_context || '')}</textarea>
     `;
     filePreview.after(describeRow);
@@ -5069,6 +8300,7 @@ function editMessage(msgId) {
         filePreview.remove();
         describeRow.remove();
         btnRow.remove();
+        _releaseInlineEditRenderGuard({ flushDeferred: true });
     });
 
     btnRow.querySelector('.edit-save').addEventListener('click', async () => {
@@ -5078,29 +8310,57 @@ function editMessage(msgId) {
         try {
             const parentId = msg.parent_id || null;
             const allPaths = editFiles.map(f => f.path);
+            const convId = State.currentConvId;
+            const editsRootMessage = parentId == null;
+            if (editsRootMessage) {
+                await createServerLoomThreadCursor(convId);
+            }
 
             const editDescInput = describeRow.querySelector('.edit-describe-input');
             const editDescCtx = editDescInput ? editDescInput.value.trim() : '';
             const editMsgData = {
                 role: 'user',
                 content: newText,
-                parent_id: parentId,
                 image_path: allPaths.length > 0 ? allPaths : null,
+                // Branching conversation topology is not permission to run a
+                // second provider concurrently. The server can queue this
+                // exact branch if the single-agent lane is occupied.
+                send_intent: editsRootMessage ? 'new_thread' : 'continue',
+                generation_count: State.branchCount || 1,
+                launch_generation: true,
             };
+            Object.assign(
+                editMsgData,
+                await _messageTopologyContract(
+                    parentId,
+                    editsRootMessage ? 'new_thread' : 'branch',
+                    convId,
+                ),
+            );
+            _attachCCSettings(editMsgData);
             if (editDescCtx) editMsgData.describe_context = editDescCtx;
-            const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, editMsgData);
+            const newMsg = await API.post(`/api/conversations/${convId}/messages`, editMsgData);
+            const launchRunIds = (newMsg.generation_ids || []).map(id => `gen:${id}`);
+            if (!launchRunIds.some(id => _recentTerminalRuns.has(_terminalRunKey(convId, id)))) {
+                _acceptMessageCursor(newMsg, convId);
+            }
+            if (State._cursorSyncPromise) await State._cursorSyncPromise;
+            if (!_sameConvId(State.currentConvId, convId)) return;
 
             // Switch to and scroll to the new branch, then kick off generation
-            await switchToBranch(newMsg.id, newMsg.id);
+            await switchToBranch(newMsg.id, newMsg.id, { launchRunIds });
             hideRetryBar();  // loadMessages inside switchToBranch re-creates generate bar; hide it
             hidePlanBar();
 
-            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                const count = State.branchCount || 1;
-                _triggerParallelGenerate(count, newMsg.id);
+            if (!Array.isArray(newMsg.generation_ids)) {
+                _triggerParallelGenerate(State.branchCount || 1, newMsg.id, {
+                    convId,
+                    threadId: newMsg.loom_thread_id,
+                });
             }
+
         } catch (err) {
-            showToast('Failed to save edit', 'error');
+            showToast(err.detail || err.message || 'Failed to save edit', 'error');
         }
     });
 }
@@ -5122,7 +8382,6 @@ function copyMessage(msgId) {
 // appears; clicking it pins the excerpt above the input, and the next send
 // carries it as a quoted block. Mode-agnostic by design: the excerpt rides
 // inside the message text itself, so every backend (Loom, Braid, Hermes,
-// Weave, NROL-AO) sees it without attachment plumbing.
 
 let _replyFloatBtn = null;
 
@@ -5186,11 +8445,13 @@ function setPendingReply(msgEl, text) {
         text,
     };
     renderReplyQuoteBar();
+    saveComposerDraft();
 }
 
-function clearPendingReply() {
+function clearPendingReply({ persist = true } = {}) {
     State.pendingReply = null;
     renderReplyQuoteBar();
+    if (persist) saveComposerDraft();
 }
 
 function renderReplyQuoteBar() {
@@ -5207,8 +8468,7 @@ function renderReplyQuoteBar() {
 }
 
 /** Format the pending excerpt as a quoted block prepended to the outgoing message. */
-function _composeReplyContent(content) {
-    const reply = State.pendingReply;
+function _composeReplyContent(content, reply = State.pendingReply) {
     if (!reply) return content;
     const quoted = reply.text.split('\n').map(l => '> ' + l).join('\n');
     const header = `Replying to ${reply.label}:`;
@@ -5351,12 +8611,26 @@ async function toggleChatBookmark(msgId) {
 
 async function refreshTree() {
     if (!State.currentConvId) return;
+    if (refreshTree._pending) return refreshTree._pending;
+    const convId = State.currentConvId;
     try {
-        State.treeData = await API.get(`/api/conversations/${State.currentConvId}/tree`);
-        if (typeof TREE !== 'undefined') TREE._skipCenter = true;
-        renderTree();
+        refreshTree._pending = (async () => {
+            const data = typeof refreshTreeData === 'function'
+                ? await refreshTreeData({ force: true })
+                : await API.get(`/api/conversations/${convId}/tree`);
+            if (!_sameConvId(State.currentConvId, convId)) return;
+            State.treeData = data;
+            if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
+            if (typeof TREE !== 'undefined') TREE._skipCenter = true;
+            // Chat recovery must not lay out thousands of hidden tree nodes.
+            // Opening the tree view renders the current data on demand.
+            if (State.currentView === 'tree') await renderTree();
+        })();
+        await refreshTree._pending;
     } catch {
         // Silently fail
+    } finally {
+        refreshTree._pending = null;
     }
 }
 
@@ -5412,6 +8686,7 @@ function showPermissionPrompt(data) {
             (planFileName ? '<span class="plan-filename">' + escapeHtml(planFileName) + '</span>' : '') +
             '</div>' +
             (planRaw ? '<div class="permission-body"><div class="permission-input plan-content">' + planHtml + '</div></div>' : '') +
+            '<input class="permission-feedback-input" type="text" maxlength="4000" placeholder="Optional note to the agent">' +
             '<div class="permission-actions">' +
             '<button class="btn-permission allow plan-approve" data-perm-action="allow" data-request-id="' + data.request_id + '">Approve Plan</button>' +
             '<button class="btn-permission deny plan-revise" data-perm-action="deny" data-request-id="' + data.request_id + '">Revise</button>' +
@@ -5427,14 +8702,16 @@ function showPermissionPrompt(data) {
             : '';
         prompt.innerHTML = '<div class="permission-header">' +
             '<span class="permission-icon">' + (isDestructive ? '&#x26A0;' : '&#x1f512;') + '</span>' +
-            '<span class="permission-title">' + (isDestructive ? 'Destructive Git Approval' : 'Permission Request') + '</span>' +
+            '<span class="permission-title">' + (isDestructive ? 'Permission Request — Warning' : 'Permission Request') + '</span>' +
             '</div>' +
             '<div class="permission-body">' +
             '<div class="permission-tool">Tool: <strong>' + toolName + '</strong></div>' +
             (approvalMethod ? '<div class="permission-tool">Permission: <strong>' + approvalMethod + '</strong></div>' : '') +
-            (riskReason ? '<div class="permission-risk">' + riskReason + '. Loom will not remember this approval.</div>' : '') +
+            (riskReason ? '<div class="permission-risk">' + riskReason + '</div>' : '') +
+            (data.rule_preview ? '<div class="permission-tool">Branch rule: ' + escapeHtml(data.rule_preview) + '</div>' : '') +
             (inputSummary ? '<div class="permission-input"><pre>' + inputSummary + '</pre></div>' : '') +
             '</div>' +
+            '<input class="permission-feedback-input" type="text" maxlength="4000" placeholder="Optional note to the agent">' +
             '<div class="permission-actions">' +
             '<button class="btn-permission allow" data-perm-action="allow" data-request-id="' + data.request_id + '">Allow</button>' +
             '<button class="btn-permission deny" data-perm-action="deny" data-request-id="' + data.request_id + '">Deny</button>' +
@@ -5449,6 +8726,7 @@ function showPermissionPrompt(data) {
             const requestId = btn.dataset.requestId;
             const allow = action === 'allow' || action === 'allow-all';
             const always = action === 'allow-all';
+            const feedback = (prompt.querySelector('.permission-feedback-input')?.value || '').trim();
 
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                 State.ws.send(JSON.stringify({
@@ -5456,17 +8734,20 @@ function showPermissionPrompt(data) {
                     request_id: requestId,
                     allow: allow,
                     always: always,
+                    feedback: feedback,
                 }));
             }
 
             // Disable buttons while waiting
             prompt.querySelectorAll('.btn-permission').forEach(b => b.disabled = true);
+            const feedbackInput = prompt.querySelector('.permission-feedback-input');
+            if (feedbackInput) feedbackInput.disabled = true;
             prompt.querySelector('.permission-title').textContent =
                 allow ? 'Allowed' + (always ? ' (branch)' : '') : 'Denied';
             prompt.classList.add(allow ? 'resolved-allow' : 'resolved-deny');
 
             // Also clear the notification bell
-            resolvePermissionNotification(requestId, allow);
+            resolvePermissionNotification(requestId, allow, feedback);
 
             // If this was a plan approval, flip dropdown back to Act
             if (prompt.classList.contains('plan-prompt') && allow) {
@@ -5512,12 +8793,18 @@ function _permissionPromptHost(data) {
     return host.querySelector('.message-content');
 }
 
-function resolvePermissionPrompt(requestId, allowed) {
+function resolvePermissionPrompt(requestId, allowed, feedback = '', decisionSource = '') {
     // Update the prompt if it hasn't been updated yet (e.g., from timeout)
     const prompt = document.querySelector(`.permission-prompt[data-request-id="${requestId}"]`);
     if (prompt && !prompt.classList.contains('resolved-allow') && !prompt.classList.contains('resolved-deny')) {
         prompt.querySelectorAll('.btn-permission').forEach(b => b.disabled = true);
-        prompt.querySelector('.permission-title').textContent = allowed ? 'Allowed' : 'Denied';
+        const feedbackInput = prompt.querySelector('.permission-feedback-input');
+        if (feedbackInput) {
+            if (feedback && !feedbackInput.value) feedbackInput.value = feedback;
+            feedbackInput.disabled = true;
+        }
+        prompt.querySelector('.permission-title').textContent =
+            allowed ? 'Allowed' : (decisionSource === 'loom_timeout' ? 'Expired' : 'Denied');
         prompt.classList.add(allowed ? 'resolved-allow' : 'resolved-deny');
 
         // If this was a plan approval, flip dropdown back to Act
@@ -5602,6 +8889,48 @@ function hidePlanBar() {
 
 // ── Canvas ──
 
+let _canvasRevisionTimer = null;
+let _canvasRevisionBusy = false;
+let _canvasRevisionOwner = null;
+let _canvasLastRevision = null;
+
+function _visibleCanvasConvId() {
+    if (document.hidden || !State.currentConv?.canvas_enabled) return null;
+    const frames = document.querySelectorAll('#canvas-fullview-iframe, .canvas-node-iframe, #workspace-canvas-iframe, #workspace-canvas-pane-iframe');
+    return [...frames].some(frame => frame.getClientRects().length
+        && frame.src.startsWith(`${location.origin}/api/canvas/${State.currentConvId}/`))
+        ? State.currentConvId : null;
+}
+
+async function _pollCanvasRevision() {
+    clearTimeout(_canvasRevisionTimer);
+    _canvasRevisionTimer = null;
+    const convId = _visibleCanvasConvId();
+    if (convId == null || _canvasRevisionBusy) return;
+    _canvasRevisionBusy = true;
+    try {
+        const resp = await fetch(`/api/conversations/${convId}/canvas/revision`, { cache: 'no-store' });
+        if (!resp.ok) return;
+        const state = await resp.json();
+        if (!_sameConvId(_visibleCanvasConvId(), convId)) return;
+        if (!state.complete || !state.revision) return;
+        if (_sameConvId(_canvasRevisionOwner, convId) && _canvasLastRevision
+            && _canvasLastRevision !== state.revision) refreshCanvasIframe();
+        _canvasRevisionOwner = convId;
+        _canvasLastRevision = state.revision;
+    } catch { /* An unavailable host is not a Canvas edit. */ }
+    finally {
+        _canvasRevisionBusy = false;
+        if (_visibleCanvasConvId() != null) _canvasRevisionTimer = setTimeout(_pollCanvasRevision, 3000);
+    }
+}
+
+function _scheduleCanvasRevision() {
+    clearTimeout(_canvasRevisionTimer);
+    _canvasRevisionTimer = setTimeout(_pollCanvasRevision, 0);
+}
+document.addEventListener('visibilitychange', _scheduleCanvasRevision);
+
 function refreshCanvasIframe() {
     if (!State.currentConvId) return;
     const src = `/api/canvas/${State.currentConvId}/index.html?t=${Date.now()}`;
@@ -5613,6 +8942,10 @@ function refreshCanvasIframe() {
     // Also refresh the tree node thumbnail
     const thumb = document.querySelector('.canvas-node-iframe');
     if (thumb) thumb.src = src;
+    const sidebar = document.getElementById('workspace-canvas-iframe');
+    if (sidebar && !sidebar.hidden) sidebar.src = src;
+    const pane = document.getElementById('workspace-canvas-pane-iframe');
+    if (pane && !pane.hidden) pane.src = src;
 }
 
 function openCanvasFullview() {
@@ -5627,6 +8960,7 @@ function openCanvasFullview() {
     // Hide canvas toggle — no purpose inside the canvas
     const canvasBtn = document.getElementById('btn-canvas-toggle');
     if (canvasBtn) canvasBtn.classList.add('hidden');
+    _scheduleCanvasRevision();
 }
 
 function closeCanvasFullview() {
@@ -5639,16 +8973,20 @@ function closeCanvasFullview() {
     }
     // Restore canvas toggle button
     const canvasBtn = document.getElementById('btn-canvas-toggle');
-    if (canvasBtn && (State.currentConv?.mode === 'claude' || State.currentConv?.mode === 'gemini' || State.currentConv?.mode === 'umans')) canvasBtn.classList.remove('hidden');
+    if (canvasBtn) canvasBtn.classList.toggle('hidden', !State.currentConv || !['tree', 'chat'].includes(State.currentView));
+    _scheduleCanvasRevision();
 }
 
 async function toggleCanvas() {
     if (!State.currentConvId || !State.currentConv) return;
     const isEnabled = State.currentConv.canvas_enabled;
     const newState = !isEnabled;
+    const convId = State.currentConvId;
     try {
-        const resp = await API.post(`/api/conversations/${State.currentConvId}/canvas`, { enabled: newState });
+        const resp = await API.post(`/api/conversations/${convId}/canvas`, { enabled: newState });
+        if (!_sameConvId(State.currentConvId, convId)) return;
         State.currentConv.canvas_enabled = newState ? 1 : 0;
+        if (resp?.project_dir) State.currentConv.project_dir = resp.project_dir;
         if (resp && resp.canvas_slug) State.currentConv.canvas_slug = resp.canvas_slug;
         const btn = document.getElementById('btn-canvas-toggle');
         if (btn) btn.classList.toggle('active', newState);
@@ -5656,8 +8994,11 @@ async function toggleCanvas() {
         // Re-render tree without resetting camera position
         if (typeof TREE !== 'undefined') TREE._skipCenter = true;
         if (typeof renderTree === 'function') renderTree();
+        _scheduleCanvasRevision();
+        if (typeof scheduleWorkspaceRender === 'function') scheduleWorkspaceRender();
     } catch (e) {
         console.error('Canvas toggle failed:', e);
+        showToast(e.detail || e.message || 'Could not change Canvas settings', 'error');
     }
 }
 
@@ -5665,14 +9006,16 @@ function updateCanvasVisibility() {
     const btn = document.getElementById('btn-canvas-toggle');
     if (!btn) return;
     const hasConv = !!State.currentConv;
-    const showBtn = hasConv && State.currentView === 'tree';
+    const showBtn = hasConv && ['tree', 'chat'].includes(State.currentView);
     btn.classList.toggle('hidden', !showBtn);
     if (btn) btn.classList.toggle('active', !!(hasConv && State.currentConv?.canvas_enabled));
+    btn.textContent = State.currentConv?.canvas_enabled ? 'Disable Canvas' : 'Enable Canvas';
     // Show/hide canvas focus button in tree toolbar
     const focusBtn = document.getElementById('btn-canvas-focus');
     if (focusBtn) focusBtn.classList.toggle('hidden', !(showBtn && State.currentConv?.canvas_enabled));
     // Close fullview if canvas was disabled
     if (!State.currentConv?.canvas_enabled) closeCanvasFullview();
+    _scheduleCanvasRevision();
 }
 
 document.getElementById('btn-canvas-toggle')?.addEventListener('click', toggleCanvas);
@@ -5685,17 +9028,86 @@ function updateCanvasSlugPill() {
     if (!pill) return;
     const slug = State.currentConv?.canvas_slug;
     const enabled = !!State.currentConv?.canvas_enabled;
+    const toggle = document.getElementById('btn-canvas-toggle');
+    if (toggle) toggle.textContent = enabled ? 'Disable Canvas' : 'Enable Canvas';
     if (slug && enabled) {
+        _canvasShareLink(State.currentConv).catch(() => {});
         pill.textContent = '🔗 ' + slug;
         pill.classList.remove('hidden');
         pill.onclick = () => {
-            navigator.clipboard.writeText(location.origin + '/' + slug).then(() => {
+            copyCanvasLink().then(copied => {
+                if (!copied || State.currentConv?.canvas_slug !== slug) return;
                 pill.textContent = 'Copied!';
-                setTimeout(() => { pill.textContent = '🔗 ' + slug; }, 1500);
+                setTimeout(() => {
+                    if (State.currentConv?.canvas_slug === slug) pill.textContent = '🔗 ' + slug;
+                }, 1500);
             });
         };
     } else {
         pill.classList.add('hidden');
+    }
+}
+
+const _canvasShareLinks = new Map();
+
+function _canvasShareLink(conv) {
+    const key = `${conv.id}:${conv.canvas_slug}`;
+    if (!_canvasShareLinks.has(key)) {
+        const request = API.get(`/api/canvas/${conv.id}/share-link`).then(data => {
+            if (!data.url) throw new Error('Canvas sharing endpoint unavailable; reload Main through Admin');
+            return data.url;
+        }).catch(error => {
+            _canvasShareLinks.delete(key);
+            throw error;
+        });
+        _canvasShareLinks.set(key, request);
+    }
+    return _canvasShareLinks.get(key);
+}
+
+async function copyCanvasLink() {
+    const conv = State.currentConv;
+    if (!conv?.canvas_enabled || !conv.canvas_slug) return false;
+    try {
+        const url = _canvasShareLink(conv);
+        // Pass the promise during the click gesture; Safari expires activation
+        // when a network lookup is awaited before invoking the clipboard API.
+        if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+            try {
+                await navigator.clipboard.write([new ClipboardItem({'text/plain':
+                    url.then(text => new Blob([text], {type: 'text/plain'}))})]);
+            } catch (_) {
+                const text = await url;
+                const field = document.createElement('textarea');
+                field.value = text;
+                field.style.cssText = 'position:fixed;opacity:0';
+                document.body.appendChild(field);
+                field.select();
+                const copied = document.execCommand('copy');
+                field.remove();
+                if (!copied) { showCopyLinkDialog(text); return false; }
+            }
+        } else {
+            const text = await url;
+            try { await navigator.clipboard.writeText(text); }
+            catch (_) {
+                const field = document.createElement('textarea');
+                field.value = text;
+                field.style.cssText = 'position:fixed;opacity:0';
+                document.body.appendChild(field);
+                field.select();
+                const copied = document.execCommand('copy');
+                field.remove();
+                if (!copied) { showCopyLinkDialog(text); return false; }
+            }
+        }
+        showToast('Canvas tailnet link copied');
+        return true;
+    } catch (error) {
+        showToast(error.status === 404
+            ? 'Canvas sharing endpoint is not loaded. Reload Main through Admin, then refresh this page.'
+            : error.detail || error.message || 'Could not copy Canvas tailnet link', 'error');
+        return false;
     }
 }
 
@@ -5708,33 +9120,99 @@ updateCanvasVisibility = function () {
 
 // ── Canvas postMessage Bridge ──
 // Allows canvas iframes to trigger Loom actions via window.parent.postMessage
+const _canvasRequests = new WeakMap();
+
+function _canvasMessageFrame(e, convId) {
+    if (e.origin !== location.origin || !State.currentConv?.canvas_enabled) return null;
+    return [...document.querySelectorAll('#canvas-fullview-iframe, .canvas-node-iframe, #workspace-canvas-iframe, #workspace-canvas-pane-iframe')]
+        .find(frame => frame.contentWindow === e.source && frame.isConnected
+            && frame.src.startsWith(`${location.origin}/api/canvas/${convId}/`));
+}
+
 window.addEventListener('message', async (e) => {
     // Only accept messages from our own canvas iframes
     if (!e.data || e.data.source !== 'loom-canvas') return;
     const convId = State.currentConvId;
-    if (!convId) return;
+    if (!convId || !_canvasMessageFrame(e, convId)) return;
+    const reply = data => e.source.postMessage({
+        source: 'loom-host', request_id: e.data.request_id, ...data,
+    }, location.origin);
 
     if (e.data.type === 'send-message') {
-        // Create user message and trigger generation
-        try {
-            const payload = { role: 'user', content: e.data.content || '' };
+        let requests = _canvasRequests.get(e.source);
+        if (!requests) { requests = new Map(); _canvasRequests.set(e.source, requests); }
+        const requestId = String(e.data.request_id || (globalThis.crypto?.randomUUID
+            ? crypto.randomUUID() : `canvas-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+        // Repeated delivery reuses the same operation and response, not a new cursor write.
+        if (requests.has(requestId)) { reply(await requests.get(requestId).promise); return; }
+        for (const [id, request] of requests) {
+            if (requests.size < 64) break;
+            if (request.done) requests.delete(id);
+        }
+        if (requests.size >= 64) {
+            reply({ type: 'error', error: 'Too many pending Canvas requests; wait for them to finish.' });
+            return;
+        }
+        const operation = (async () => {
+          try {
+            const queueParentId = e.data.parent_id === undefined && !e.data.parallel
+                ? _activeQueueParentId() : null;
+            const parentId = e.data.parent_id !== undefined
+                ? e.data.parent_id
+                : (queueParentId ?? _currentVisibleLeafId() ?? null);
+            const topologyIntent = e.data.parallel ? 'branch' : 'continue';
+            const payload = {
+                role: 'user',
+                content: e.data.content || '',
+                send_intent: e.data.parallel ? 'parallel' : 'continue',
+                generation_count: 1,
+                launch_generation: true,
+                client_request_id: `canvas-${requestId}`,
+            };
+            if (queueParentId != null) payload.queue_after_draft_id = queueParentId;
+            _attachCCSettings(payload);
+            Object.assign(
+                payload,
+                await _messageTopologyContract(parentId, topologyIntent, convId),
+            );
+            if (!_sameConvId(State.currentConvId, convId) || !_canvasMessageFrame(e, convId)) {
+                throw new Error('Conversation changed before Canvas could send. No message was sent.');
+            }
             if (e.data.image_paths) payload.image_path = e.data.image_paths;
-            if (e.data.parent_id !== undefined) payload.parent_id = e.data.parent_id;
             const resp = await fetch(`/api/conversations/${convId}/messages`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             });
+            if (!resp.ok) throw await apiError(resp, 'POST', `/api/conversations/${convId}/messages`);
             const msg = await resp.json();
             if (msg.id) {
-                _triggerParallelGenerate(1, msg.id);
-                // Notify canvas of the message ID
-                e.source?.postMessage({ source: 'loom-host', type: 'message-sent', id: msg.id }, '*');
+                const sameConv = _sameConvId(State.currentConvId, convId);
+                if (sameConv) _acceptMessageCursor(msg, convId);
+                if (msg.queued && sameConv) {
+                    _queuedGeneration = msg;
+                    rememberConversationLeaf(convId, msg.id);
+                    if (_sameConvId(State.currentConvId, convId)) await loadMessages(convId);
+                } else if (!Array.isArray(msg.generation_ids)
+                    && _sameConvId(State.currentConvId, convId)) {
+                    _triggerParallelGenerate(1, msg.id, {
+                        convId,
+                        threadId: msg.loom_thread_id,
+                    });
+                }
+                return { type: 'message-sent', id: msg.id, queued: !!msg.queued };
             }
-        } catch (err) {
-            e.source?.postMessage({ source: 'loom-host', type: 'error', error: err.message }, '*');
-        }
+            throw new Error('Canvas send returned no message ID.');
+          } catch (err) {
+            return { type: 'error', error: err.message };
+          }
+        })();
+        const request = { promise: operation, done: false };
+        requests.set(requestId, request);
+        const result = await operation;
+        request.done = true;
+        reply(result);
     } else if (e.data.type === 'get-conv-id') {
-        e.source?.postMessage({ source: 'loom-host', type: 'conv-id', convId }, '*');
+        reply({ type: 'conv-id', convId });
     }
 });
 
@@ -5814,7 +9292,44 @@ function previewArtifact(filename, content) {
 
 
 // ── Event Delegation for Tool Blocks + Thinking + Code Actions ──
+const _fileCopyFeedbackTimers = new WeakMap();
+async function copyFileReference(fileRef) {
+    try {
+        await navigator.clipboard.writeText(fileRef.dataset.filePath);
+        clearTimeout(_fileCopyFeedbackTimers.get(fileRef));
+        let feedback = fileRef.querySelector('.file-copy-feedback');
+        if (!feedback) {
+            feedback = document.createElement('span');
+            feedback.className = 'file-copy-feedback';
+            feedback.setAttribute('role', 'status');
+            fileRef.appendChild(feedback);
+        }
+        feedback.textContent = ' ✓ Path copied';
+        _fileCopyFeedbackTimers.set(fileRef, setTimeout(() => {
+            feedback.remove();
+            _fileCopyFeedbackTimers.delete(fileRef);
+        }, 2200));
+        showToast('Path copied: ' + fileRef.dataset.filePath);
+    } catch {
+        showToast('Could not copy the path', 'error');
+    }
+}
+document.addEventListener('keydown', event => {
+    const fileRef = event.target.closest('.file-ref[data-file-path]');
+    if (fileRef && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault();
+        fileRef.click();
+    }
+});
 document.addEventListener('click', (e) => {
+    // File reference chip: copy the full path
+    const fileRef = e.target.closest('.file-ref[data-file-path]');
+    if (fileRef) {
+        e.preventDefault();
+        e.stopPropagation();
+        void copyFileReference(fileRef);
+        return;
+    }
     // Code block: Copy
     const copyBtn = e.target.closest('[data-code-action="copy"]');
     if (copyBtn) {

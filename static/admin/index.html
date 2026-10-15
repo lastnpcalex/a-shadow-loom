@@ -3,12 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Loom Admin</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text x='4' y='25' font-size='24' fill='%2300ffff'>◈</text></svg>">
+    <title>EXO: Admin</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/admin-icon.svg?v=2">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/admin.css?v=6">
+    <link rel="stylesheet" href="/assets/admin.css?v=15">
+    <link rel="stylesheet" href="/assets/provider-usage.css?v=3">
+    <link rel="stylesheet" href="/assets/admin-activity.css?v=5">
+    <link rel="stylesheet" href="/assets/admin-settings.css?v=1">
 </head>
 <body>
     <div class="bg-glow bg-glow-1"></div>
@@ -19,19 +22,22 @@
         <aside id="sidebar">
             <div class="brand">
                 <span class="brand-mark">◈</span>
-                <span class="brand-text">LOOM<em>ADMIN</em></span>
+                <span class="brand-text" title="EX umbra Omnia">EXO<em>ADMIN</em></span>
             </div>
             <nav id="nav">
                 <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span><span class="nav-label">Overview</span></button>
-                <button class="nav-item" data-view="terminal"><span class="nav-icon">⌨</span><span class="nav-label">Terminal</span></button>
-                <button class="nav-item" data-view="tools"><span class="nav-icon">⚒</span><span class="nav-label">Tools</span></button>
-                <button class="nav-item" data-view="cron"><span class="nav-icon">⏲</span><span class="nav-label">Cron</span></button>
+                <button class="nav-item" data-view="activity" title="Permissions and active runs"><span class="nav-icon">◇</span><span class="nav-label">Activity</span><span id="activity-count" class="count"></span></button>
+                <button class="nav-item" data-view="extensions" title="Workspace-owned services and MCPs"><span class="nav-icon">⌘</span><span class="nav-label">Extensions</span></button>
+                <button class="nav-item" data-view="openrouter" title="OpenRouter budgets, keys and model slugs"><span class="nav-icon">◈</span><span class="nav-label">OpenRouter</span></button>
+                <button class="nav-item" data-view="usage" title="Token usage and activity across providers"><span class="nav-icon">⇅</span><span class="nav-label">Usage</span></button>
                 <button class="nav-item" data-view="guide"><span class="nav-icon">✦</span><span class="nav-label">Guide</span></button>
+                <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></button>
             </nav>
             <div class="sidebar-foot">
                 <div class="pulse-grid" id="pulse-grid" title="Live port probes"></div>
                 <button class="btn btn-cyan btn-block" id="btn-admin-restart">↻ Restart Admin</button>
                 <button class="btn btn-warn btn-block" id="btn-admin-shutdown">⏻ Shutdown Admin</button>
+                <div id="admin-lifecycle-status" role="status" aria-live="polite"></div>
                 <div class="foot-note">admin :<span id="admin-port">…</span></div>
             </div>
         </aside>
@@ -41,13 +47,42 @@
                 <h1 id="view-title">Overview</h1>
                 <div id="quick-links" class="quick-links"></div>
             </header>
+            <section id="view-settings" class="view">
+                <div class="card">
+                    <div class="card-head"><h2>Exoloom background studio</h2><button class="btn btn-ghost" id="visual-load" type="button">Load preset</button></div>
+                    <p class="empty-note">Configure the shared animation, orbit, camera, nebula and floor. Main has simple appearance options. Changes preview here; Save publishes the preset to your browsers.</p>
+                    <iframe id="visual-preview" title="Background preview" style="width:100%;height:420px;border:0;background:#080616" hidden></iframe>
+                    <form id="visual-form"><div id="visual-fields"></div><button class="btn btn-cyan" type="submit" disabled>Save background preset</button><button class="btn btn-ghost" id="visual-reset" type="button" disabled>Preview original preset</button></form>
+                    <p id="visual-status" class="empty-note" role="status">Load the preset to configure the background.</p>
+                </div>
+                <div class="card">
+                    <div class="card-head"><h2>Main EXO settings</h2><button class="btn btn-ghost" id="btn-machine-reload">Reload settings</button></div>
+                    <p class="empty-note">Shared machine configuration. Saving does not restart any server. Use Overview to apply local server changes.</p>
+                    <form id="machine-settings-form"><div id="machine-settings-fields" class="machine-settings-grid"></div><button class="btn btn-cyan" type="submit" disabled>Save configuration</button></form>
+                </div>
+                <div class="card">
+                    <h2>Local model tuning</h2>
+                    <label>Model on disk <select id="machine-tuning-model" class="select"></select></label>
+                    <form id="machine-tuning-form"><div id="machine-tuning-fields" class="machine-settings-grid"></div><button class="btn btn-cyan" type="submit" disabled>Save model tuning</button></form>
+                </div>
+                <p id="machine-settings-status" class="empty-note" role="status">Settings have not been loaded.</p>
+            </section>
 
             <!-- ── Overview ─────────────────────────────────────────── -->
             <section id="view-overview" class="view active">
+                <div class="card" id="provider-usage-monitor">
+                    <div class="card-head">
+                        <h2>Subscription usage <span class="port-tag">Host accounts</span></h2>
+                        <button class="btn btn-ghost" id="btn-provider-usage-refresh">Refresh</button>
+                    </div>
+                    <p class="empty-note">Account quota windows, separate from OpenRouter spend and context size. Monitoring starts no model turns.</p>
+                    <div id="provider-usage-cards"></div>
+                    <div id="provider-usage-status" class="empty-note" role="status">Usage has not been loaded.</div>
+                </div>
                 <div class="servers-grid">
                     <div class="card server-card" data-server="main">
                         <div class="card-head">
-                            <h2><span class="dot" id="dot-main"></span> Main Loom <span class="port-tag" id="main-port-tag"></span> <span id="main-managed-tag"></span></h2>
+                            <h2><span class="dot" id="dot-main"></span> Main EXO <span class="port-tag" id="main-port-tag"></span> <span id="main-managed-tag"></span></h2>
                             <div class="head-actions" id="head-actions-main"></div>
                         </div>
                         <div class="action-row">
@@ -59,7 +94,7 @@
 
                     <div class="card server-card" data-server="test">
                         <div class="card-head">
-                            <h2><span class="dot" id="dot-test"></span> Test Loom <span class="port-tag" id="test-port-tag"></span> <span id="test-managed-tag"></span></h2>
+                            <h2><span class="dot" id="dot-test"></span> Test EXO <span class="port-tag" id="test-port-tag"></span> <span id="test-managed-tag"></span></h2>
                             <div class="head-actions" id="head-actions-test"></div>
                         </div>
                         <div class="action-row">
@@ -78,7 +113,6 @@
                             <button class="btn btn-ghost" onclick="runTool('llama-status', {target:'out-llama'})">Status</button>
                             <button class="btn btn-warn" id="btn-llama-unload" title="Stop llama-server and release model memory">Unload</button>
                             <button class="btn btn-green" id="btn-llama-reload" title="Start llama-server again with the selected/default model">Reload Llama</button>
-                            <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">Release VRAM</button>
                             <span class="action-spacer"></span>
                             <select id="llama-model-switch" class="select" title="Switch llama-server to another GGUF (stop + reload, ~30-90s)">
                                 <option value="">Loading models…</option>
@@ -106,25 +140,6 @@
                         <pre class="server-out" id="out-dream"></pre>
                     </div>
 
-                    <div class="card server-card" data-server="hermes">
-                        <div class="card-head">
-                            <h2><span class="dot" id="dot-hermes"></span> Hermes Runtimes <span class="port-tag" id="hermes-port-tag"></span></h2>
-                            <div class="head-actions" id="head-actions-hermes"></div>
-                        </div>
-                        <div class="action-row">
-                            <button class="btn btn-ghost" id="btn-hermes-status" title="Status of Prometheus + the two attendants + model liveness">Status</button>
-                            <button class="btn btn-cyan" id="btn-prometheus-restart" title="Re-route Prometheus backend (rewrite config) and clear warm runtime">Restart Prometheus</button>
-                            <button class="btn btn-warn" id="btn-prometheus-stop" title="Stop Prometheus' warm runtime (independent of model servers)">Stop Prometheus</button>
-                            <span class="action-spacer"></span>
-                            <button class="btn btn-ghost" id="btn-attendant-llama-stop" title="Force-clear the llama attendant's warm process (soul survives)">Clear Llama Att.</button>
-                            <button class="btn btn-ghost" id="btn-attendant-dream-stop" title="Force-clear the dream attendant's warm process (soul survives)">Clear Dream Att.</button>
-                        </div>
-                        <div id="hermes-runtime-panel" class="memory-panel">
-                            <span class="memory-muted">Checking Hermes runtimes…</span>
-                        </div>
-                        <pre class="server-out" id="out-hermes"></pre>
-                    </div>
-
                     <div class="card server-card" data-server="comfy">
                         <div class="card-head">
                             <h2><span class="dot" id="dot-comfy"></span> ComfyUI <span class="port-tag">:8188</span></h2>
@@ -142,31 +157,25 @@
                         <pre class="server-out" id="out-comfy"></pre>
                     </div>
 
-                    <div class="card server-card" data-server="nrol">
-                        <div class="card-head">
-                            <h2><span class="dot" id="dot-nrol"></span> NROL-AO <span class="port-tag" id="nrol-port-tag"></span></h2>
-                            <div class="head-actions" id="head-actions-nrol"></div>
-                        </div>
-                        <div class="action-row">
-                            <button class="btn btn-ghost" onclick="runTool('nrol-status', {target:'out-nrol'})">Status</button>
-                            <button class="btn btn-ghost" onclick="runTool('nrol-topic-status', {target:'out-nrol'})">Topics</button>
-                            <button class="btn btn-ghost" onclick="runTool('nrol-mcp-activity', {target:'out-nrol'})">MCP activity</button>
-                            <button class="btn btn-ghost" onclick="runTool('nrol-mcp-smoke', {target:'out-nrol'})">MCP smoke test</button>
-                            <button class="btn btn-ghost" onclick="confirmTool('nrol-mcp-register', 'Register nrol-ao MCP in Claude Code user config?', {target:'out-nrol'})">Register MCP</button>
-                        </div>
-                        <pre class="server-out" id="out-nrol"></pre>
+                    
+                </div>
+
+                <div class="card" id="acceptance-monitor">
+                    <div class="card-head">
+                        <h2>Lifecycle acceptance <span id="acceptance-state" class="port-tag">checking</span></h2>
+                        <button class="btn btn-ghost" id="btn-acceptance-refresh">↻ Refresh</button>
                     </div>
+                    <p class="empty-note">Compares the published isolated preflight with this checkout and the source actually loaded by Main.</p>
+                    <div id="acceptance-status" class="empty-note" role="status">Checking acceptance evidence…</div>
+                    <div id="acceptance-identities" class="empty-note"></div>
                 </div>
 
                 <div class="card">
                     <div class="card-head">
-                        <h2>Active Generations <span class="count" id="gens-count"></span></h2>
+                        <h2>Activity <span id="activity-summary" class="count"></span></h2>
+                        <button class="btn btn-cyan" onclick="setView('activity')">Permissions &amp; active runs</button>
                     </div>
-                    <div id="generations-empty" class="empty-note">None tracked.</div>
-                    <table id="generations-table" class="data-table" style="display:none;">
-                        <thead><tr><th>Conv</th><th>Draft</th><th>PID</th><th>Status</th><th>Mode</th><th>Age</th><th></th></tr></thead>
-                        <tbody id="generations-body"></tbody>
-                    </table>
+                    <div class="empty-note">Supervise every reachable EXO instance without changing a conversation's selected branch.</div>
                 </div>
 
                 <div class="card">
@@ -200,6 +209,26 @@
                     <div class="empty-note">Use a local, unsynced folder such as <code>C:\LoomData</code>. Copying requires Main Loom to stop first so SQLite files are not copied mid-write.</div>
                 </div>
 
+                <div class="card" id="devices-card">
+                    <div class="card-head">
+                        <h2>Admin access</h2>
+                        <button class="btn btn-cyan" id="btn-pair-device">Set up password + Authy</button>
+                    </div>
+                    <div id="pair-device-output" class="empty-note">Checking Admin authentication...</div>
+                    <div class="action-row" style="margin-top:1rem">
+                        <button class="btn btn-ghost" id="btn-sessions-refresh">Refresh browsers</button>
+                        <button class="btn btn-ghost" id="btn-browser-logout">Sign out this browser</button>
+                    </div>
+                    <div id="browser-sessions" class="empty-note" style="margin-top:1rem"></div>
+                    <form id="admin-recovery-form" hidden style="margin-top:1rem">
+                        <p>Replace recovery codes using your password and a fresh Authy code. Previous codes will stop working.</p>
+                        <label>Password <input id="admin-recovery-password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+                        <label>Authy code <input id="admin-recovery-otp" inputmode="numeric" autocomplete="one-time-code" required pattern="[0-9]{6}"></label>
+                        <button class="btn btn-ghost" type="submit">Replace recovery codes</button>
+                    </form>
+                    <div id="recovery-code-output" class="empty-note" style="margin-top:1rem"></div>
+                </div>
+
                 <div class="card">
                     <div class="card-head">
                         <h2>System</h2>
@@ -209,67 +238,158 @@
                 </div>
             </section>
 
-            <!-- ── Terminal ─────────────────────────────────────────── -->
-            <section id="view-terminal" class="view">
-                <div class="card term-card">
+            <section id="view-openrouter" class="view">
+                <div class="card" id="openrouter-monitor">
                     <div class="card-head">
-                        <h2><span class="dot" id="dot-ttyd"></span> Web Terminal <span class="port-tag" id="ttyd-port-tag"></span></h2>
-                        <div class="head-actions">
-                            <select id="ttyd-shell" class="select">
-                                <option value="powershell">PowerShell</option>
-                                <option value="cmd">cmd</option>
-                                <option value="claude">Claude Code</option>
-                            </select>
-                            <button class="btn btn-green" id="btn-ttyd-start">▶ Start</button>
-                            <button class="btn btn-warn" id="btn-ttyd-stop">⏹ Stop</button>
-                            <a class="btn btn-ghost" id="ttyd-open" target="_blank" rel="noopener">⧉ Open in tab</a>
-                        </div>
+                        <h2>OpenRouter <span class="port-tag">Main EXO</span></h2>
+                        <button class="btn btn-ghost" id="btn-openrouter-refresh">↻ Refresh</button>
                     </div>
-                    <div id="ttyd-hint" class="empty-note"></div>
-                    <iframe id="ttyd-frame" title="ttyd terminal"></iframe>
+                    <p class="empty-note">API-key spend in USD across apps and harnesses using this key. EXO budgets apply to direct API requests; the OpenRouter key cap applies at the provider.</p>
+                    <div id="openrouter-periods" class="openrouter-periods"><div class="empty-note">Usage has not been loaded.</div></div>
+                    <div id="openrouter-key-cap" class="empty-note"></div>
+                    <div id="openrouter-account" class="empty-note"></div>
+                    <div id="openrouter-monitor-status" class="empty-note" role="status"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Connection &amp; budgets <span class="port-tag">Main EXO</span></h2>
+                        <button class="btn btn-ghost" id="btn-or-settings-reload">↻ Reload</button>
+                    </div>
+                    <p class="empty-note">Budgets and base URL live in Main EXO's config. Keys are stored in Main's .env and are never displayed again.</p>
+                    <div class="or-settings-grid">
+                        <label><span>Weekly limit USD</span><input type="number" id="or-weekly-limit" class="text-input" step="0.50" min="0"></label>
+                        <label><span>Monthly limit USD</span><input type="number" id="or-monthly-limit" class="text-input" step="1" min="0"></label>
+                        <label><span>Max prompt $/1M</span><input type="number" id="or-prompt-price" class="text-input" step="0.01" min="0"></label>
+                        <label><span>Max output $/1M</span><input type="number" id="or-completion-price" class="text-input" step="0.01" min="0"></label>
+                        <label class="or-wide"><span>Base URL</span><input type="text" id="or-base-url" class="text-input" placeholder="https://openrouter.ai/api/v1" spellcheck="false"></label>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-cyan" id="btn-or-settings-save">Save Settings</button>
+                        <span id="or-settings-status" class="empty-note" role="status"></span>
+                    </div>
+                    <div class="or-keys">
+                        <label><span>Inference API key</span><input type="password" id="or-api-key" class="text-input" autocomplete="new-password" placeholder="Leave blank to keep current key"></label>
+                        <label><span>Management key</span><input type="password" id="or-management-key" class="text-input" autocomplete="new-password" placeholder="Leave blank to keep current key"></label>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-cyan" id="btn-or-keys-save">Save Keys</button>
+                        <span id="or-keys-status" class="empty-note" role="status"></span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>OpenRouter model slugs <span class="port-tag">Main EXO</span></h2>
+                        <button class="btn btn-ghost" id="btn-or-models-reload">↻ Reload</button>
+                    </div>
+                    <p class="empty-note">Slug is the OpenRouter model ID (e.g. <code>z-ai/glm-5.2</code>). Saved rows override the shipped catalog and hot-reload every picker — no restart. Routes: <code>openrouter</code> Loom &amp; Weave, <code>goose</code> Goose ACP, <code>goose_smart</code> Goose subagents, <code>weave</code> Weave chat.</p>
+                    <div id="or-models-rows"></div>
+                    <div class="action-row">
+                        <button class="btn btn-ghost" id="btn-or-models-add">+ Add model</button>
+                        <span class="action-spacer"></span>
+                        <button class="btn btn-cyan" id="btn-or-models-save">Save Models</button>
+                    </div>
+                    <div id="or-models-status" class="empty-note" role="status"></div>
                 </div>
             </section>
 
-            <!-- ── Tools ────────────────────────────────────────────── -->
-            <section id="view-tools" class="view">
-                <div class="card">
-                    <div class="card-head"><h2>Claude Auth</h2></div>
-                    <div class="tools-grid">
-                        <button class="tool-btn" onclick="runTool('auth-status')"><span class="icon">🔑</span> Auth Status<span class="label">Check Claude login</span></button>
-                        <button class="tool-btn" onclick="runTool('auth-refresh')"><span class="icon">🔄</span> Auth Check/Fix<span class="label">Test auth, show fix steps</span></button>
+            <section id="view-usage" class="view">
+                <div class="card" id="usage-dashboard">
+                    <div class="card-head">
+                        <h2>Token usage <span class="port-tag">Main EXO</span></h2>
+                        <button class="btn btn-ghost" id="btn-usage-refresh">↻ Refresh</button>
                     </div>
-                </div>
-                <div class="card">
-                    <div class="card-head"><h2>Maintenance</h2></div>
-                    <div class="tools-grid">
-                        <button class="tool-btn" onclick="runTool('clear-vram')"><span class="icon">GPU</span> Release Llama VRAM<span class="label">Unload llama-server</span></button>
-                        <button class="tool-btn" onclick="runTool('memory-status')"><span class="icon">RAM</span> Memory Status<span class="label">Show parked services</span></button>
-                        <button class="tool-btn" onclick="runTool('disk-usage')"><span class="icon">💾</span> Disk Usage<span class="label">DB &amp; log sizes</span></button>
-                        <button class="tool-btn" onclick="runTool('system-specs')"><span class="icon">💻</span> System Specs<span class="label">CPU / RAM / VRAM</span></button>
-                    </div>
-                </div>
-                <div class="card">
-                    <div class="card-head"><h2>Output</h2></div>
-                    <div id="tool-output"></div>
+                    <p class="empty-note">Aggregated from the per-turn counters already stored on assistant messages — the same figures shown in chat footers. Subagent runs record no token telemetry and are not included.</p>
+                    <div id="usage-periods" class="usage-periods"><div class="empty-note">Usage has not been loaded.</div></div>
+                    <div class="card-head sub"><h3>Token history</h3></div>
+                    <form id="usage-chart-controls">
+                        <label>Period <select id="usage-chart-period" class="select"><option value="max">Max</option><option value="year">Year</option><option value="month" selected>Month</option><option value="week">Week</option><option value="day">Day</option><option value="custom">Custom</option></select></label>
+                        <label>Breakdown <select id="usage-chart-group" class="select"><option value="harness">Harness</option><option value="provider">Backend / provider</option></select></label>
+                        <label>Category <select id="usage-chart-category" class="select"><option value="all">All categories</option></select></label>
+                        <label>Bar colors <select id="usage-chart-colors" class="select"><option value="category">Category</option><option value="io">Input / output</option></select></label>
+                        <div id="usage-chart-custom" hidden><label>From <input id="usage-chart-start" type="date" class="text-input"></label><label>Through <input id="usage-chart-end" type="date" class="text-input"></label><button class="btn btn-ghost" type="submit">Apply dates</button></div>
+                    </form>
+                    <div id="usage-chart-status" class="empty-note" role="status"></div>
+                    <div id="usage-daily" class="usage-daily"><div class="empty-note">No daily history yet.</div></div>
+                    <div id="usage-chart-legend" class="usage-chart-legend"></div>
+                    <div id="usage-chart-breakdown" class="usage-providers"></div>
+                    <div class="card-head sub"><h3>All-time providers</h3></div>
+                    <div id="usage-providers" class="usage-providers"><div class="empty-note">No provider history yet.</div></div>
+                    <div id="usage-all-time" class="empty-note"></div>
+                    <div id="usage-averages" class="empty-note"></div>
+                    <p id="usage-accounting-note" class="empty-note"></p>
+                    <div class="card-head sub"><h3>My day in tokens</h3><button id="btn-usage-yesterday" class="btn btn-ghost">Create yesterday’s snapshot</button></div>
+                    <form id="usage-schedule">
+                        <label>Timezone <input id="usage-timezone" class="text-input" required maxlength="128" placeholder="America/Los_Angeles"></label>
+                        <label>Morning hour <input id="usage-hour" class="text-input" type="number" min="0" max="23" required></label>
+                        <label><span>Automatic snapshots</span><input id="usage-auto" type="checkbox"></label>
+                        <button id="btn-usage-schedule" class="btn btn-ghost" type="submit">Save schedule</button>
+                    </form>
+                    <p class="empty-note">Missed reports are created when Main comes back online. Saved snapshots keep their original timestamp and totals.</p>
+                    <div class="action-row"><select id="usage-report-picker" class="select" aria-label="Saved daily snapshots"></select><button class="btn btn-ghost" data-usage-export="png" disabled>Download PNG</button><button class="btn btn-ghost" data-usage-export="markdown" disabled>Download Markdown</button><button class="btn btn-ghost" data-usage-export="json" disabled>Download JSON</button></div>
+                    <article id="usage-report-card" class="usage-snapshot" aria-label="Daily token snapshot"></article>
+                    <details class="usage-report-source"><summary>Markdown source</summary><pre id="usage-report-preview"></pre></details>
+                    <div id="usage-report-status" class="empty-note" role="status"></div>
+                    <div id="usage-status" class="empty-note" role="status"></div>
                 </div>
             </section>
 
-            <!-- ── Cron ─────────────────────────────────────────────── -->
-            <section id="view-cron" class="view">
+            <section id="view-activity" class="view">
                 <div class="card">
                     <div class="card-head">
-                        <h2>Cron Jobs <span class="count" id="cron-count"></span></h2>
-                        <div class="head-actions">
-                            <button id="cron-active-tab" class="btn btn-ghost active" onclick="setCronTab(false)">Active</button>
-                            <button id="cron-archive-tab" class="btn btn-ghost" onclick="setCronTab(true)">Archive</button>
-                            <a href="/api/cron-help-proxy" target="_blank" class="btn btn-ghost">Help</a>
-                        </div>
+                        <h2>Permission requests <span id="permissions-count" class="count"></span></h2>
+                        <button id="btn-activity-refresh" class="btn btn-ghost">Refresh</button>
                     </div>
-                    <div id="cron-empty" class="empty-note">None tracked.</div>
-                    <table id="cron-table" class="data-table" style="display:none;">
-                        <thead><tr><th>ID</th><th>Conv</th><th>Script</th><th>Repeat</th><th>Last</th><th>Next</th><th>Status</th><th>Details</th><th>Actions</th></tr></thead>
-                        <tbody id="cron-body"></tbody>
-                    </table>
+                    <p class="empty-note">Same decisions and branch rules as chat. Only your explicit click answers a request.</p>
+                    <div id="activity-status" class="empty-note" role="status"></div>
+                    <div id="permissions-empty" class="empty-note">Checking active requests…</div>
+                    <div id="permissions-list"></div>
+                </div>
+                <div class="card">
+                    <div class="card-head"><h2>Active generations <span id="gens-count" class="count"></span></h2></div>
+                    <div id="generations-empty" class="empty-note">Checking active generations…</div>
+                    <div id="generations-list"></div>
+                </div>
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Landed generations <span id="landed-count" class="count"></span></h2>
+                        <label class="empty-note"><input type="checkbox" id="landed-show-reviewed"> Show reviewed</label>
+                    </div>
+                    <p class="empty-note">Latest landed turn per root thread, grouped by workspace; child-job results stay separate. Up to 100 recent entries per instance. A new landing becomes unreviewed. Review marks stay in this browser; opening chat does not mark reviewed.</p>
+                    <div id="landed-status" class="empty-note" role="status"></div>
+                    <div id="landed-empty" class="empty-note">Checking completion history…</div>
+                    <div id="landed-list"></div>
+                </div>
+            </section>
+            <section id="view-extensions" class="view">
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Workspace-owned extensions</h2>
+                        <button id="btn-extensions-refresh" class="btn btn-ghost">Refresh</button>
+                    </div>
+                    <p class="empty-note">Register an <code>exo-extension.json</code> by absolute path. EXO stores only the reference; the owning workspace retains its manifest, commands, Git history, and update policy.</p>
+                    <div class="extension-register-row">
+                        <input id="extension-manifest-path" class="text-input" type="text" spellcheck="false" placeholder="G:\Project\exo-extension.json">
+                        <button id="btn-extension-register" class="btn btn-cyan">Register</button>
+                    </div>
+                    <div id="extensions-status" class="empty-note" role="status"></div>
+                    <div id="extensions-list" class="extensions-grid"></div>
+                </div>
+                <div class="card guide">
+                    <div class="card-head"><h2>Manifest shape</h2></div>
+                    <pre class="server-out">{
+  "schema_version": 1,
+  "id": "my-project.service",
+  "name": "My Project Service",
+  "kind": "service",
+  "workspace_root": ".",
+  "cwd": ".",
+  "start": {"command": ["python", "server.py"]},
+  "health": {"url": "http://127.0.0.1:8123/health"},
+  "update": {"command": ["git", "pull", "--ff-only"]}
+}</pre>
+                    <p>Commands are argument arrays, never shell strings. Working directories stay inside the declared workspace. Health probes are loopback-only. Update and stop are explicit human actions.</p>
                 </div>
             </section>
             <!-- ── Guide ────────────────────────────────────────────── -->
@@ -281,70 +401,42 @@
                         <tbody>
                             <tr><td>Main Loom</td><td>:3000</td><td>The branching chat interface — all five conversation modes</td></tr>
                             <tr><td>Test Loom</td><td>:3001</td><td>Second instance against <code>loom_test.db</code></td></tr>
-                            <tr><td>Admin (this page)</td><td>:3002</td><td>Service lifecycle, terminal, tools, cron</td></tr>
-                            <tr><td>llama-server</td><td>:8000</td><td>llama.cpp serving the local GGUF — powers Braid, Hermes, Weave, and all NROL-AO matching/deliberation</td></tr>
-                            <tr><td>NROL-AO dashboard</td><td>:8098</td><td>Topic posteriors and governance views</td></tr>
+                            <tr><td>Admin (this page)</td><td>:3002</td><td>Service lifecycle, permissions and active runs</td></tr>
+                            
+                            
                             <tr><td>ComfyUI</td><td>:8188</td><td>Image generation</td></tr>
-                            <tr><td>ttyd</td><td>:7681</td><td>Web terminal (Terminal tab; localhost-bound by default)</td></tr>
                         </tbody>
                     </table>
                 </div>
 
                 <div class="card guide">
                     <div class="card-head"><h2>Loom Conversation Modes</h2></div>
-                    <p><strong>Loom</strong> — Claude Code via the Anthropic API; the model dropdown also carries Codex and Antigravity groups, switchable mid-conversation. <strong>Braid</strong> — Claude Code on the local llama-server. <strong>Hermes</strong> — the ACP agent on the same local model. <strong>Weave</strong> — structured RP with characters, personas, and the OODA state harness. <strong>NROL-AO</strong> — the locked-down epistemic-engine operator: file and shell tools stripped, beliefs move only through typed, human-approved transitions.</p>
+                    <p><strong>Loom</strong> — Claude Code via the Anthropic API; the model dropdown also carries Codex and Antigravity groups, switchable mid-conversation. <strong>Braid</strong> — Claude Code on the local llama-server. <strong>Goose</strong> — the ACP harness with OpenRouter, llama-server and Dream backends. <strong>Weave</strong> — structured RP with characters, personas, and the OODA state harness.</p>
                     <p>Everything shares one branching tree, one search index, one chat surface: highlight any message text to quote it in your next send; attach files; queue messages mid-generation; branch, fork, and regenerate without losing anything.</p>
                 </div>
 
-                <div class="card guide">
-                    <div class="card-head"><h2>NROL-AO — The Operator Loop</h2></div>
-                    <p class="guide-rule">Nothing moves a posterior except <code>commit_match</code> on a pending proposal, or <code>submit_transition</code> with an <code>indicator_id</code> and <code>commit=true</code>. Prose never moves beliefs — no matter how well it describes the evidence.</p>
-                    <p>In an NROL-AO conversation, these plain requests run the whole machine:</p>
-                    <ol>
-                        <li><strong>"Run the evidence loop on &lt;topic&gt;"</strong> — status check, then a scan: web search per hypothesis, full-article fetch, strict matcher, and the advocate / rebuttal / jury debate over its PARKs. Safe policy: PARK and SCHEMA_GAP auto-apply (they cannot move posteriors); FIRE and OBSERVE land in the proposal queue.</li>
-                        <li><strong>"Show me the pending proposals"</strong> — review each: indicator binding, value and units, and whether several proposals describe the <em>same underlying event</em> (one causal event = commit ONE; the engine decays and de-correlates repeats, but don't lean on it).</li>
-                        <li><strong>"Commit #N, withdraw the rest"</strong> — each commit raises a browser approval prompt. <em>That click is the authority gate.</em> Posteriors move through pre-committed likelihoods, repeat-fire decay, and the confidence-inflation guard; the result reports before → after.</li>
-                        <li><strong>"Work down the parked queue"</strong> — <code>review_parked</code> re-judges shelved evidence against the current schema with full article text and the debate. Items stay in the retained archive (kept-but-timestamped) but escalations return to step 2 as <em>rebind</em> proposals that commit against the existing ledger entry. The <code>parkedReviewDebt.dueCount</code> number in topic_status is the active work queue; <code>flaggedForIndicatorReview</code> is archive size.</li>
-                        <li><strong>"Show shadow posteriors"</strong> — the dynamics model's first-passage probabilities, derived from pre-committed regime priors plus elapsed time (Gamma conjugacy prices "still closed, day N"). Zero authority; divergence from committed posteriors is a calibration conversation, not an error.</li>
-                    </ol>
-                </div>
+                
 
-                <div class="card guide">
-                    <div class="card-head"><h2>NROL-AO — Creating a Topic</h2></div>
-                    <p>Say: <em>"Design a topic for &lt;question&gt; — hypotheses with priors and a written rationale, tier-1 indicators with pre-committed LRs, and a dynamics spec."</em> The pipeline behind it:</p>
-                    <ol>
-                        <li><code>design_topic</code> drafts through the governor gates — inadmissible hypotheses (unclear, unobservable, unfalsifiable) block creation outright; a <code>priors_rationale</code> is required and recorded as the topic's first history entry.</li>
-                        <li>The <strong>red-team review is mandatory</strong> and runs automatically: verdict SOUND or REVISE stamped on the draft. UNREVIEWED drafts can never activate; activating over a REVISE requires an explicit, logged override.</li>
-                        <li><code>activate_topic</code> is the final human-gated commit — it also <em>refuses</em> any topic without a lint-clean dynamics spec, so every topic prices time-as-evidence from day one.</li>
-                    </ol>
-                    <p>Drafts move no beliefs and stay out of active listings until you approve activation in the browser.</p>
-                </div>
+                
 
-                <div class="card guide">
-                    <div class="card-head"><h2>Reading the Digests (failure modes have names now)</h2></div>
-                    <table class="data-table">
-                        <thead><tr><th>Digest line</th><th>Meaning</th></tr></thead>
-                        <tbody>
-                            <tr><td><code>no actionable evidence this window (a valid result)</code></td><td>Real quiet window — articles were found and judged; nothing crossed a threshold.</td></tr>
-                            <tr><td><code>⚠ MATCHER FAILED</code></td><td>The model returned no content (e.g. thinking budget exhausted). The scan window is left open so nothing is lost; investigate, don't interpret.</td></tr>
-                            <tr><td><code>⚠ DEBATE FAILED</code></td><td>A deliberation stage errored — zero rescues is a malfunction here, not consensus.</td></tr>
-                            <tr><td><code>deliberation: N parks debated, M argued, K rescued</code></td><td>The jury layer working: K parked items escalated to proposals.</td></tr>
-                            <tr><td><code>parked: true, parked_reason: sustained observation…</code></td><td>The engine declining to double-count an unchanged fact on an already-fired indicator. Correct behavior.</td></tr>
-                            <tr><td><code>scan coverage: … window left open</code></td><td>lastScanned deliberately not stamped after a failure — the next scan re-covers these articles.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+                
 
-                <div class="card guide">
-                    <div class="card-head"><h2>Status &amp; Known Gaps <span class="count">as of 2026-06-11</span></h2></div>
-                    <p><strong>Working, with acceptance tests:</strong> the full lifecycle (design → red team → activate → scan → deliberate → propose → human commit → posterior moves) and the parked-queue loop (re-adjudication → rebind commit). Pinned by <code>test_FULL_LIFECYCLE…</code> and <code>test_THE_LOOP…</code> in the NROL suite.</p>
-                    <p><strong>Open items:</strong> dynamics <code>evidence_nudges</code> have no gated write tool yet (specs are repo-edited); the shadow model needs 2–3 weeks of comparison against committed posteriors before promotion to a typed transition; debate quality on live batches is unproven; the Hormuz parked backlog (~109 due) awaits a full <code>review_parked</code> sweep now that rebind commits land.</p>
-                </div>
+                
             </section>
         </main>
     </div>
 
     <div id="toast"></div>
-    <script src="/assets/admin.js?v=9"></script>
+    <script src="/assets/admin-layout.js?v=1"></script>
+    <script src="/assets/admin-landed.js?v=2"></script>
+    <script src="/assets/admin-supervision.js?v=4"></script>
+    <script src="/assets/admin-extensions.js?v=3"></script>
+    <script src="/assets/admin-openrouter.js?v=3"></script>
+    <script src="/assets/admin-activity.js?v=7"></script>
+    <script src="/assets/admin-security.js?v=1"></script>
+    <script src="/assets/admin.js?v=25"></script>
+    <script src="/assets/provider-usage.js?v=6"></script>
+    <script src="/assets/admin-settings.js?v=5"></script>
+    <script src="/assets/admin-visual.js?v=1"></script>
 </body>
 </html>

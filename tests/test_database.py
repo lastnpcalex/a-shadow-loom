@@ -1,8 +1,39 @@
 """Tests for the database layer."""
 
+import asyncio
+
 import pytest
 import aiosqlite
 import database as db
+
+
+async def test_cancelled_multistatement_write_rolls_back_and_releases_lock():
+    inserted = asyncio.Event()
+
+    async def interrupted_write():
+        async with db.write_transaction() as connection:
+            await connection.execute(
+                """INSERT INTO conversations (title, created_at, updated_at)
+                   VALUES ('cancelled transaction', 1, 1)"""
+            )
+            inserted.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(interrupted_write())
+    await inserted.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    connection = await db.get_db()
+    rows = await connection.execute_fetchall(
+        "SELECT id FROM conversations WHERE title = 'cancelled transaction'"
+    )
+    assert rows == []
+
+    # A following write proves no hidden transaction or file lock survived.
+    created = await db.create_conversation("write after cancellation")
+    assert created["title"] == "write after cancellation"
 
 
 async def test_init_db():
@@ -18,6 +49,7 @@ async def test_init_db():
     assert "messages" in table_names
     assert "summaries" in table_names
     assert "style_state" in table_names
+    assert "branch_pins" in table_names
 
 
 async def test_local_model_migration():
@@ -113,6 +145,29 @@ async def test_get_active_leaf():
     assert leaf["id"] == m2["id"]
 
 
+async def test_branch_pins_are_conversation_scoped_and_editable():
+    conv = await db.create_conversation("Pinned Paths")
+    other = await db.create_conversation("Other Loom")
+    message = await db.add_message(conv["id"], "user", "Pinned root")
+
+    pin = await db.add_branch_pin(conv["id"], message["id"], "Lab revisions")
+    assert pin["conversation_id"] == conv["id"]
+    assert pin["message_id"] == message["id"]
+    assert pin["label"] == "Lab revisions"
+    assert await db.add_branch_pin(other["id"], message["id"], "Wrong Loom") == {}
+
+    repinned = await db.add_branch_pin(conv["id"], message["id"], "Updated label")
+    assert repinned["id"] == pin["id"]
+    assert repinned["label"] == "Updated label"
+    assert [item["id"] for item in await db.get_branch_pins(conv["id"])] == [pin["id"]]
+    assert await db.get_branch_pins(other["id"]) == []
+
+    updated = await db.update_branch_pin(pin["id"], "Final label")
+    assert updated["label"] == "Final label"
+    assert await db.delete_branch_pin(pin["id"]) is True
+    assert await db.delete_branch_pin(pin["id"]) is False
+
+
 async def test_list_conversations():
     """list_conversations returns all conversations."""
     await db.create_conversation("First")
@@ -173,6 +228,38 @@ async def test_codex_goal_columns_round_trip():
     assert updated["codex_goal_tokens_used"] == 123
     assert updated["codex_goal_time_used_seconds"] == 7
     assert updated["codex_goal_updated_at"] == 42.0
+
+
+async def test_codex_attestation_backfills_missing_session_scope():
+    """Attested cancelled Codex turns do not force permanent history rebuilds."""
+    import json
+
+    conv = await db.create_conversation("Attested legacy Codex")
+    user = await db.add_message(conv["id"], "user", "hello")
+    assistant = await db.add_message(
+        conv["id"],
+        "assistant",
+        "partial",
+        parent_id=user["id"],
+        cc_session_id="codex-attested-session",
+    )
+    await db.update_message_content(
+        assistant["id"],
+        model_attestation=json.dumps(
+            {
+                "status": "verified",
+                "source": "codex_app_server_thread_response",
+                "effective_model": "gpt-5.6-sol",
+            }
+        ),
+    )
+
+    before = await db.get_message(assistant["id"])
+    assert before["cc_session_mode"] is None
+    await db.close_db()
+    await db.init_db()
+    after = await db.get_message(assistant["id"])
+    assert after["cc_session_mode"] == "codex"
 
 
 async def test_cc_session_mode_round_trip_and_null_is_unscoped():

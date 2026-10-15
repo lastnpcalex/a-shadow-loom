@@ -1,0 +1,11 @@
+#modal-settings .settings-toggle { display: flex; flex-wrap: wrap; gap: 1px; background: var(--border); }
+#modal-settings > .modal-content > h2 { font-size: 26px; line-height: 1.3; }
+#modal-settings[data-loading="1"] .settings-section { display: none; }
+#modal-settings[data-loading="1"] #settings-tabs { visibility: hidden; }
+#modal-settings .settings-toggle .toggle-btn { border-right: 0; }
+#modal-settings .settings-toggle .toggle-btn { flex: 1 1 120px; }
+#modal-settings .hint { display: block; line-height: 1.5; }
+#modal-settings .settings-admin-note { padding-top: 12px; border-top: 1px solid var(--border-color, #536171); }
+#settings-admin-link { color: var(--accent-cyan, #69d5ca); cursor: pointer; }
+.settings-usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; }
+#settings-usage section { margin-bottom: 16px; }

@@ -14,6 +14,7 @@ Usage:
 import asyncio
 import importlib
 import json
+import math
 import os
 import re
 import shutil
@@ -22,30 +23,23 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
-# Monkey-patch asyncio ProactorEventLoop to suppress Windows-specific ConnectionResetError
-if sys.platform == "win32":
-    try:
-        from asyncio.proactor_events import _ProactorBasePipeTransport
-        _orig_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+from asyncio_compat import install_windows_transport_cleanup
 
-        def _patched_call_connection_lost(self, exc):
-            try:
-                _orig_call_connection_lost(self, exc)
-            except (ConnectionResetError, OSError, ConnectionAbortedError):
-                pass
-
-        _ProactorBasePipeTransport._call_connection_lost = _patched_call_connection_lost
-    except Exception:
-        pass
-
+install_windows_transport_cleanup()
 
 from fastapi import Body, FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import uvicorn
 import httpx
 import io
+from managed_extensions import ExtensionError, ExtensionRegistry
+import loom_auth
+import admin_auth
+from acceptance_status import evaluate_acceptance, read_published_report, source_identity
 
 
 def _run_subprocess(cmd, **kwargs):
@@ -130,7 +124,8 @@ async def _relay_to_main(path: str, *, method: str = "POST", timeout: float = 3.
         port = 3000
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 if method == "POST":
                     resp = await client.post(f"{scheme}://localhost:{port}{path}")
                 else:
@@ -163,29 +158,441 @@ _load_initial_main_db()
 _server_ref: list = []
 # Track child processes we've launched (for restart)
 _child_procs: dict[str, subprocess.Popen] = {}
-_dream_starting: bool = False
-NROL_AO_REPO = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
-NROL_AO_PORT = int(os.environ.get("ALPHA_OMEGA_PORT", "8098"))
-NROL_SCAN_WORKSPACE = Path(
-    os.environ.get(
-        "NROL_SCAN_WORKSPACE",
-        str(Path(__file__).parent / "workspaces" / "nrol_ao"),
-    )
+_instance_lifecycle_locks: dict[str, asyncio.Lock] = {}
+_INSTANCE_GRACEFUL_EXIT_TIMEOUT = float(
+    # Main shutdown has a 20s provider grace period, an 8s forced provider
+    # reap, a 5s task drain, and can still spend up to SQLite's 30s busy
+    # timeout checkpointing WAL. Keep the admin's outer deadline longer.
+    os.getenv("LOOM_ADMIN_GRACEFUL_EXIT_TIMEOUT", "75")
 )
+_INSTANCE_FORCE_EXIT_TIMEOUT = float(
+    os.getenv("LOOM_ADMIN_FORCE_EXIT_TIMEOUT", "8")
+)
+_ADMIN_SELF_GRACEFUL_EXIT_TIMEOUT = float(
+    os.getenv("LOOM_ADMIN_SELF_GRACEFUL_EXIT_TIMEOUT", "15")
+)
+_ADMIN_SELF_FORCE_EXIT_TIMEOUT = float(
+    os.getenv("LOOM_ADMIN_SELF_FORCE_EXIT_TIMEOUT", "5")
+)
+_admin_restart_requested = False
+_admin_restart_helper = None
+_admin_restart_requested_at: float | None = None
+_dream_starting: bool = False
+_extension_registry = ExtensionRegistry()
+_extension_locks: dict[str, asyncio.Lock] = {}
 
-app = FastAPI(title="Loom Admin")
+app = FastAPI(title="EXO: Admin")
+
+
+def _extension_lock(extension_id: str) -> asyncio.Lock:
+    lock = _extension_locks.get(extension_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _extension_locks[extension_id] = lock
+    return lock
+
+
+class _ProcessInspectionError(RuntimeError):
+    """The OS would not let Loom prove whether an exact process is alive."""
+
+
+@dataclass(frozen=True)
+class _InstanceProcessDiscovery:
+    identities: tuple[tuple[int, float], ...]
+    errors: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.errors
+
+
+def _instance_lifecycle_lock(name: str) -> asyncio.Lock:
+    """One lifecycle action at a time for an exact Loom instance."""
+    lock = _instance_lifecycle_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _instance_lifecycle_locks[name] = lock
+    return lock
+
+
+def _assert_safe_lifecycle_target(name: str) -> None:
+    """Never let an in-process pytest call operate on the live main host.
+
+    Route-unit tests import this module and call the handlers directly. A
+    missing HTTP mock must fail locally rather than POSTing /shutdown to the
+    Loom process carrying the test's own agent turn.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and name == "main":
+        raise RuntimeError(
+            "pytest lifecycle calls must use an isolated test instance, not main"
+        )
+
+
+def _process_identity(
+    pid: int | None, *, fail_closed: bool = False
+) -> tuple[int, float] | None:
+    """Return a PID plus create time so PID reuse cannot fool a restart."""
+    if not pid:
+        return None
+    try:
+        import psutil
+
+        proc = psutil.Process(int(pid))
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return None
+        return (int(pid), float(proc.create_time()))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
+    except Exception as exc:
+        if fail_closed:
+            raise _ProcessInspectionError(
+                f"could not inspect PID {pid}: {type(exc).__name__}: {exc}"
+            ) from exc
+        return None
+
+
+def _identity_alive(identity: tuple[int, float]) -> bool:
+    pid, created_at = identity
+    try:
+        current = _process_identity(pid, fail_closed=True)
+    except _ProcessInspectionError:
+        # Unknown is not dead. A restart may never treat lack of inspection
+        # authority as permission to launch a replacement beside this PID.
+        return True
+    return bool(current and abs(current[1] - created_at) < 0.001)
+
+
+def _wait_for_identity_exit_blocking(
+    identity: tuple[int, float], timeout: float
+) -> bool:
+    """Wait outside the admin event loop for an exact PID identity to exit."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while _identity_alive(identity) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return not _identity_alive(identity)
+
+
+def _terminate_exact_process(identity: tuple[int, float]) -> None:
+    """Terminate only the old admin PID, never its detached Loom children."""
+    if not _identity_alive(identity):
+        return
+    import psutil
+
+    process = psutil.Process(identity[0])
+    # Recheck create time immediately before termination so PID reuse cannot
+    # target an unrelated process.
+    if abs(float(process.create_time()) - identity[1]) >= 0.001:
+        return
+    process.terminate()
+
+
+def _admin_port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        return probe.connect_ex(("127.0.0.1", int(port))) != 0
+
+
+def _run_admin_restart_helper(
+    old_identity: tuple[int, float],
+    *,
+    port: int,
+    admin_script: Path | None = None,
+    admin_dir: Path | None = None,
+    child_log: Path | None = None,
+) -> int:
+    """Wait for the old admin to die, then start exactly one replacement.
+
+    This runs in a detached helper process. It must never start a replacement
+    merely because the HTTP listener disappeared: the old PID itself must be
+    gone, and the admin port must be free.
+    """
+    admin_script = (admin_script or Path(__file__)).resolve()
+    admin_dir = (admin_dir or admin_script.parent).resolve()
+    child_log = child_log or (admin_dir / "admin_server.log")
+
+    if not _wait_for_identity_exit_blocking(
+        old_identity, _ADMIN_SELF_GRACEFUL_EXIT_TIMEOUT
+    ):
+        try:
+            _terminate_exact_process(old_identity)
+        except Exception as exc:
+            print(
+                f"[ADMIN-RESTART] Could not terminate old admin PID "
+                f"{old_identity[0]}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        if not _wait_for_identity_exit_blocking(
+            old_identity, _ADMIN_SELF_FORCE_EXIT_TIMEOUT
+        ):
+            print(
+                f"[ADMIN-RESTART] Refusing replacement: old admin PID "
+                f"{old_identity[0]} is still alive",
+                flush=True,
+            )
+            return 2
+
+    port_deadline = time.monotonic() + _ADMIN_SELF_FORCE_EXIT_TIMEOUT
+    while not _admin_port_is_free(port) and time.monotonic() < port_deadline:
+        time.sleep(0.1)
+    if not _admin_port_is_free(port):
+        print(
+            f"[ADMIN-RESTART] Refusing replacement: port {port} is still in use",
+            flush=True,
+        )
+        return 3
+
+    log_handle = open(child_log, "a", encoding="utf-8")
+    kwargs: dict = {
+        "cwd": str(admin_dir),
+        "env": os.environ.copy(),
+        "stdout": log_handle,
+        "stderr": log_handle,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        replacement = subprocess.Popen([sys.executable, str(admin_script)], **kwargs)
+    finally:
+        log_handle.close()
+    print(
+        f"[ADMIN-RESTART] Started replacement admin PID {replacement.pid} "
+        f"on :{port}",
+        flush=True,
+    )
+    return 0
+
+
+def _instance_db_path(name: str) -> Path:
+    configured = Path(str(INSTANCES[name]["db"]))
+    if not configured.is_absolute():
+        configured = Path(__file__).parent / configured
+    return configured.resolve()
+
+
+def _collect_instance_processes(name: str) -> _InstanceProcessDiscovery:
+    """Find the exact Loom processes that can still own an instance DB.
+
+    The tracked Popen is primary. Listener ownership finds servers that were
+    not launched by this admin process, while open-file matching finds the
+    dangerous listenerless remnants that caused SQLite lockouts.
+    """
+    identities: dict[int, tuple[int, float]] = {}
+    errors: list[str] = []
+    tracked = _child_procs.get(name)
+    try:
+        tracked_identity = _process_identity(
+            getattr(tracked, "pid", None), fail_closed=True
+        )
+    except _ProcessInspectionError as exc:
+        tracked_identity = None
+        errors.append(str(exc))
+    if tracked_identity:
+        identities[tracked_identity[0]] = tracked_identity
+
+    import psutil
+
+    # Listener discovery and database-owner discovery are deliberately
+    # independent. Failure of one must never skip the other.
+    try:
+        port = int(INSTANCES[name]["port"])
+        for conn in psutil.net_connections(kind="inet"):
+            if (
+                conn.pid
+                and conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and int(conn.laddr.port) == port
+            ):
+                identity = _process_identity(conn.pid, fail_closed=True)
+                if identity:
+                    identities[identity[0]] = identity
+    except Exception as exc:
+        errors.append(
+            f"could not enumerate port {INSTANCES[name]['port']} listeners: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    try:
+        target_db = os.path.normcase(str(_instance_db_path(name)))
+        server_py = os.path.normcase(str((Path(__file__).parent / "server.py").resolve()))
+        for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
+            try:
+                cwd = Path(proc.info.get("cwd") or Path(__file__).parent)
+                command_paths = set()
+                for part in proc.info.get("cmdline") or []:
+                    if not str(part).lower().endswith("server.py"):
+                        continue
+                    candidate = Path(str(part))
+                    if not candidate.is_absolute():
+                        candidate = cwd / candidate
+                    command_paths.add(os.path.normcase(str(candidate.resolve())))
+                if server_py not in command_paths:
+                    continue
+                open_paths = {
+                    os.path.normcase(str(item.path))
+                    for item in (proc.open_files() or [])
+                }
+                if not any(
+                    path == target_db or path in {target_db + "-wal", target_db + "-shm"}
+                    for path in open_paths
+                ):
+                    continue
+                identity = _process_identity(
+                    proc.info.get("pid"), fail_closed=True
+                )
+                if identity:
+                    identities[identity[0]] = identity
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, OSError) as exc:
+                errors.append(
+                    f"could not inspect possible {name} DB owner PID "
+                    f"{proc.info.get('pid')}: {type(exc).__name__}: {exc}"
+                )
+    except Exception as exc:
+        errors.append(
+            f"could not enumerate {name} database owners: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    return _InstanceProcessDiscovery(
+        identities=tuple(identities.values()), errors=tuple(errors)
+    )
+
+
+async def _wait_for_instance_exit(
+    identities: list[tuple[int, float]], timeout: float
+) -> list[tuple[int, float]]:
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    alive = [identity for identity in identities if _identity_alive(identity)]
+    while alive and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.1)
+        alive = [identity for identity in alive if _identity_alive(identity)]
+    return alive
+
+
+def _force_terminate_process_trees(identities: list[tuple[int, float]]) -> None:
+    """Terminate only the captured process identities and their descendants."""
+    import psutil
+
+    processes: dict[int, psutil.Process] = {}
+    for identity in identities:
+        if not _identity_alive(identity):
+            continue
+        try:
+            parent = psutil.Process(identity[0])
+            for child in parent.children(recursive=True):
+                processes[child.pid] = child
+            processes[parent.pid] = parent
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    ordered = list(processes.values())
+    for proc in ordered:
+        try:
+            proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _, survivors = psutil.wait_procs(ordered, timeout=2.0)
+    for proc in survivors:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if survivors:
+        psutil.wait_procs(survivors, timeout=2.0)
+
+
+async def _stop_instance_and_verify(name: str) -> dict:
+    """Stop an instance and do not return success while an old PID survives."""
+    _assert_safe_lifecycle_target(name)
+    port = int(INSTANCES[name]["port"])
+    captured_handle = _child_procs.get(name)
+    discovery = _collect_instance_processes(name)
+    identities = list(discovery.identities)
+    reachable = False
+    try:
+        await _get_instance(port, "/api/config")
+        reachable = True
+    except Exception:
+        pass
+    if reachable and not identities:
+        raise RuntimeError(
+            f"Could not identify the {name} server PID; refusing an unverifiable restart"
+        )
+
+    graceful_requested = False
+    if reachable or identities:
+        try:
+            await _post_instance(port, "/shutdown")
+            graceful_requested = True
+        except Exception:
+            pass
+
+    survivors = await _wait_for_instance_exit(
+        identities,
+        _INSTANCE_GRACEFUL_EXIT_TIMEOUT if graceful_requested else 0.0,
+    )
+    forced = False
+    if survivors:
+        forced = True
+        await asyncio.to_thread(_force_terminate_process_trees, survivors)
+        survivors = await _wait_for_instance_exit(
+            survivors, _INSTANCE_FORCE_EXIT_TIMEOUT
+        )
+    if survivors:
+        pids = ", ".join(str(identity[0]) for identity in survivors)
+        raise RuntimeError(
+            f"{name} process PID(s) {pids} survived shutdown; replacement refused"
+        )
+
+    # If initial discovery was incomplete, only a clean second inspection can
+    # prove that listenerless DB owners are gone. Never convert AccessDenied
+    # into a successful restart.
+    if not discovery.complete:
+        final_discovery = _collect_instance_processes(name)
+        if not final_discovery.complete:
+            raise RuntimeError(
+                f"Could not verify {name} process exit; replacement refused: "
+                + "; ".join(final_discovery.errors)
+            )
+        if final_discovery.identities:
+            pids = ", ".join(str(identity[0]) for identity in final_discovery.identities)
+            raise RuntimeError(
+                f"{name} process PID(s) {pids} still own the instance; replacement refused"
+            )
+
+    # Do not let an older stop action discard a newer process handle.
+    if _child_procs.get(name) is captured_handle:
+        _child_procs.pop(name, None)
+    return {
+        "pids": [identity[0] for identity in identities],
+        "graceful_requested": graceful_requested,
+        "forced": forced,
+    }
 
 # The main Loom UI (https://host:3000) calls admin endpoints straight from the
 # browser (e.g. Settings -> Apply & Restart llama-server). Without CORS headers
 # the POST still executes but the browser can't read the response, so the UI
 # reported "error contacting admin" for actions that actually succeeded.
 from fastapi.middleware.cors import CORSMiddleware
+# Only Loom instance pages (same host, instance ports) may call the admin API,
+# and they must send the independent Admin cookie (credentials: 'include').
+_CORS_PORTS = sorted({str(info["port"]) for info in INSTANCES.values()}
+                     | {os.getenv("LOOM_PORT", "3000")})
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=rf"^https?://[^/:]+:({'|'.join(_CORS_PORTS)})$",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Installed after CORS so it is the outermost layer: network gate first, then
+# independent password + TOTP sessions for every admin route.
+admin_auth.install(app, instance_ports=_CORS_PORTS)
 
 
 async def check_instance(name: str, info: dict) -> dict:
@@ -202,7 +609,8 @@ async def check_instance(name: str, info: dict) -> dict:
     # Try HTTPS first (main server uses SSL), then HTTP
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=2.0, verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 resp = await client.get(f"{scheme}://localhost:{port}/api/config")
                 if resp.status_code == 200:
                     result["status"] = "online"
@@ -212,22 +620,19 @@ async def check_instance(name: str, info: dict) -> dict:
         except Exception:
             continue
 
-    # Check if we have a tracked child process
-    # On Windows with DETACHED_PROCESS, poll() is unreliable — cross-check with port status
+    # A listenerless process may still own SQLite. Keep its identity visible
+    # until the PID actually exits; an HTTP probe is not process authority.
     proc = _child_procs.get(name)
     if proc:
-        proc.poll()  # refresh returncode
-        if proc.returncode is not None:
-            # Process exited — clean up
-            _child_procs.pop(name, None)
-            result["managed"] = False
-        elif result["status"] == "offline":
-            # Handle says alive but port is dead — stale handle
+        identity = _process_identity(proc.pid)
+        if not identity:
             _child_procs.pop(name, None)
             result["managed"] = False
         else:
             result["pid"] = proc.pid
             result["managed"] = True
+            if result["status"] == "offline":
+                result["status"] = "stopping"
     else:
         result["managed"] = False
 
@@ -518,152 +923,6 @@ async def tool_comfyui_status():
         return JSONResponse({"status": "ok", "output": "ComfyUI is NOT running (port 8188 not responding)"})
     except Exception as e:
         return JSONResponse({"status": "error", "output": f"Error checking ComfyUI: {e}"})
-
-
-def _hermes_exe_path() -> str:
-    """Resolve the `hermes` CLI path the same way the main server does."""
-    if _loom_config is not None:
-        try:
-            return _loom_config.hermes_executable()
-        except Exception:
-            pass
-    explicit = os.environ.get("HERMES_EXE")
-    if explicit:
-        return explicit
-    home = os.environ.get(
-        "HERMES_HOME",
-        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
-    )
-    exe_name = "hermes.exe" if os.name == "nt" else "hermes"
-    cand = os.path.join(home, "hermes-agent", ".venv",
-                        "Scripts" if os.name == "nt" else "bin", exe_name)
-    return cand if os.path.exists(cand) else "hermes"
-
-
-@app.post("/tools/hermes-status")
-async def tool_hermes_status():
-    """Probe whether Hermes Agent (ACP mode) is installed and reachable.
-
-    Mirrors the comfyui-status probe: checks the `hermes` CLI runs,
-    reports the version + HERMES_HOME, and confirms the local model endpoint
-    is up. Does NOT do a full `hermes acp` JSON-RPC round-trip here — that's
-    heavy for a status poke.
-    """
-    home = os.environ.get(
-        "HERMES_HOME",
-        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
-    )
-    exe = _hermes_exe_path()
-    lines: list[str] = []
-    available = False
-    version = ""
-    try:
-        env = {**os.environ, "HERMES_HOME": home}
-        proc = await asyncio.create_subprocess_exec(
-            exe, "--version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError("`hermes --version` timed out after 15s")
-        text = (out or b"").decode("utf-8", "replace").strip()
-        if proc.returncode == 0:
-            available = True
-            version = text.splitlines()[0] if text else ""
-            lines.append(f"Hermes Agent is INSTALLED ({version})")
-            lines.append(f"  exe: {exe}")
-            lines.append(f"  HERMES_HOME: {home}")
-            cfg = os.path.join(home, "config.yaml")
-            lines.append(f"  config.yaml: {'present' if os.path.exists(cfg) else 'MISSING'}")
-            for extra in text.splitlines()[1:]:
-                lines.append(f"  {extra.strip()}")
-        else:
-            lines.append(f"Hermes CLI exited {proc.returncode}:")
-            lines.append(text or "(no output)")
-    except FileNotFoundError:
-        lines.append(f"Hermes is NOT installed — `{exe}` not found.")
-        lines.append("Install: irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex")
-    except Exception as e:
-        lines.append(f"Error probing Hermes: {e}")
-
-    # Llama Server reachability (probes the endpoint Hermes/ACM agents use).
-    try:
-        llama_host = (_loom_config.llama_host_url() if _loom_config else "http://localhost:8000").rstrip("/")
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{llama_host}/v1/models")
-        if r.status_code == 200:
-            models_data = r.json().get("data", [])
-            n = len(models_data)
-            lines.append(f"\nLlama Server: reachable on {llama_host} ({n} models)")
-        else:
-            lines.append(f"\nLlama Server: {llama_host} responded {r.status_code}")
-    except Exception:
-        llama_host_display = (_loom_config.llama_host_url() if _loom_config else "http://localhost:8000")
-        lines.append(f"\nLlama Server: NOT reachable on {llama_host_display}")
-
-    return JSONResponse({
-        "status": "ok" if available else "error",
-        "available": available,
-        "version": version,
-        "output": "\n".join(lines),
-    })
-
-
-# ── Hermes runtime management (Prometheus + attendants) ──────────────────────
-# Relays to the MAIN Loom server process, which owns the in-memory _RUNTIMES
-# (hermes_client.py:917). The admin panel uses these to manage the three Hermes
-# runtimes: Prometheus (start/stop/restart/status) + the two attendants
-# (check/stop). Attendant-stop on model-stop is wired separately into the
-# llama-unload / dream-stop paths (see _relay_to_main usage there).
-
-@app.get("/api/hermes/status")
-async def api_hermes_status():
-    """Relayed Hermes runtime status (three runtimes + model liveness)."""
-    result = await _relay_to_main("/api/hermes/status", method="GET", timeout=5.0)
-    if result is None:
-        return JSONResponse({"status": "error", "error": "main server unreachable"},
-                             status_code=502)
-    return JSONResponse(result)
-
-
-@app.post("/api/hermes/prometheus/stop")
-async def api_hermes_prometheus_stop():
-    """Stop Prometheus' warm runtime (independent of model servers)."""
-    result = await _relay_to_main("/api/hermes/prometheus/stop", method="POST")
-    if result is None:
-        return JSONResponse({"status": "error", "error": "main server unreachable"},
-                             status_code=502)
-    return JSONResponse(result)
-
-
-@app.post("/api/hermes/prometheus/restart")
-async def api_hermes_prometheus_restart():
-    """Restart Prometheus: re-route backend (rewrite config), clear warm runtime."""
-    result = await _relay_to_main("/api/hermes/prometheus/restart", method="POST")
-    if result is None:
-        return JSONResponse({"status": "error", "error": "main server unreachable"},
-                             status_code=502)
-    return JSONResponse(result)
-
-
-@app.post("/api/hermes/attendant/stop")
-async def api_hermes_attendant_stop(backend: str = "llama"):
-    """Force-stop an attendant's warm runtime (clears from _RUNTIMES).
-
-    `backend` is "llama" or "dream". Same path the model-stop binding uses, but
-    exposed as an explicit admin action so an attendant can be cleared without
-    stopping the model server underneath (e.g. to force a clean re-init).
-    """
-    if backend not in ("llama", "dream"):
-        return JSONResponse({"status": "error", "error": f"unknown backend: {backend}"},
-                             status_code=400)
-    result = await _relay_to_main(f"/api/hermes/attendant/clear?backend={backend}", method="POST")
-    if result is None:
-        return JSONResponse({"status": "error", "error": "main server unreachable"},
-                             status_code=502)
-    return JSONResponse(result)
 
 
 @app.post("/tools/comfyui-free")
@@ -1098,14 +1357,6 @@ async def tool_llama_stop():
         lines.append(out or f"taskkill exit {r.returncode}")
     except Exception as e:
         lines.append(f"taskkill failed: {e}")
-    # Attendant-clear-on-model-stop coupling: llama-server is going down, so the
-    # llama attendant's warm Hermes process (pointed at this /v1) must be cleared
-    # from the MAIN server's _RUNTIMES — otherwise it outlives the dead endpoint.
-    # Relayed to the main process (admin can't see its in-memory runtimes). Best-
-    # effort: a relay hiccup must NOT block the model stop.
-    relay = await _relay_to_main("/api/hermes/attendant/clear?backend=llama")
-    if relay and relay.get("cleared"):
-        lines.append(f"Cleared llama attendant runtime (main: {relay.get('cleared')}).")
     return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Llama Server processes found."})
 
 
@@ -1211,8 +1462,7 @@ def _dream_cmd() -> str:
     if not exe:
         exe = r"C:\tmp\llama-diffusion-gemma-pr\build\bin\llama-diffusion-gemma-server.exe"
     if not model:
-        model = (r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion"
-                 r"\models\diffusiongemma-26b-a4b-it-nvfp4.gguf")
+        model = os.path.join(os.path.expanduser("~"), "models", "diffusiongemma-26b-a4b-it-nvfp4.gguf")
     # Context size: CRITICAL. The C++ server defaults n_ctx to 4096 when -c is
     # omitted (server.cpp: srv.n_ctx = params.n_ctx > 0 ? params.n_ctx : 4096).
     # A Weave OODA turn (system prompt + state cards + 12-msg verbatim window)
@@ -1417,12 +1667,6 @@ async def tool_dream_stop():
         except Exception as e:
             lines.append(f"taskkill {img}: {e}")
     lines.append("VRAM + working set released.")
-    # Attendant-clear-on-model-stop coupling (dream): the dream sidecar is going
-    # down, so the dream attendant's warm Hermes process must be cleared from the
-    # MAIN server's _RUNTIMES. Same relay pattern as the llama stop path above.
-    relay = await _relay_to_main("/api/hermes/attendant/clear?backend=dream")
-    if relay and relay.get("cleared"):
-        lines.append(f"Cleared dream attendant runtime (main: {relay.get('cleared')}).")
     return JSONResponse({"status": "ok", "output": "\n".join(lines)})
 
 
@@ -1533,10 +1777,10 @@ async def api_dream_models():
     global _dream_last_activity
     h = await _dream_probe()
     port = _dream_port()
-    pid = _dream_resolve_pid()
-    ws_mb, cached_mb = _dream_proc_mem(pid)
+    pid = await asyncio.to_thread(_dream_resolve_pid)
+    ws_mb, cached_mb = await asyncio.to_thread(_dream_proc_mem, pid)
     # VRAM via nvidia-smi (process-specific if we can resolve it, else total).
-    vram_used_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
+    vram_used_mb = await asyncio.to_thread(_gpu_vram_for_pid, pid) if pid else await asyncio.to_thread(_gpu_total_vram_used_mb)
     loaded = (h or {}).get("loaded_model")
     available = (h or {}).get("available", [])
     maxtok = (h or {}).get("maxtok", 0)
@@ -1714,22 +1958,22 @@ async def api_memory_services():
     llama_proc = _child_procs.get("llama")
     if llama_proc and llama_proc.poll() is None:
         llama_pid = llama_proc.pid
-    llama_pids = [llama_pid] if llama_pid else _pids_by_signature("llama-server.exe")
+    llama_pids = [llama_pid] if llama_pid else await asyncio.to_thread(_pids_by_signature, "llama-server.exe")
     services.append({
         "key": "llama",
         "state": "warm" if llama_up and llama_models else ("ready" if llama_up else "off"),
         "loaded": llama_models,
         "pids": llama_pids,
-        "gpu_mb": _gpu_vram_for_pid(llama_pids[0]) if llama_pids else 0,
-        "active_ram_mb": _working_set_for_pids(llama_pids),
+        "gpu_mb": await asyncio.to_thread(_gpu_vram_for_pid, llama_pids[0]) if llama_pids else 0,
+        "active_ram_mb": await asyncio.to_thread(_working_set_for_pids, llama_pids),
         "reserved_ram_mb": 0,
         "cache_mb": 0,
         "release_action": "Unload stops llama-server.",
     })
 
     dream_h = await _dream_probe()
-    dream_pid = _dream_resolve_pid()
-    dream_ws_mb, dream_cache_mb = _dream_proc_mem(dream_pid)
+    dream_pid = await asyncio.to_thread(_dream_resolve_pid)
+    dream_ws_mb, dream_cache_mb = await asyncio.to_thread(_dream_proc_mem, dream_pid)
     dream_memory = await _dream_memory_breakdown(_dream_port()) if dream_h is not None else None
     dream_summary = _dream_memory_summary(dream_memory)
     dream_loaded = []
@@ -1750,7 +1994,7 @@ async def api_memory_services():
         "loaded": dream_loaded,
         "pids": [dream_pid] if dream_pid else [],
         "gpu_mb": dream_summary.get("cuda_self_mb") or (
-            _gpu_vram_for_pid(dream_pid) if dream_pid else _gpu_total_vram_used_mb()
+            await asyncio.to_thread(_gpu_vram_for_pid, dream_pid) if dream_pid else await asyncio.to_thread(_gpu_total_vram_used_mb)
         ),
         "active_ram_mb": dream_ws_mb,
         "reserved_ram_mb": dream_summary.get("host_self_mb", 0),
@@ -1779,14 +2023,14 @@ async def api_memory_services():
             comfy_gpu_mb = int(comfy_gpu_mb / 1048576)
     except Exception:
         pass
-    comfy_pids = _pids_by_signature("comfyui", "main.py")
+    comfy_pids = await asyncio.to_thread(_pids_by_signature, "comfyui", "main.py")
     services.append({
         "key": "comfy",
         "state": "ready" if comfy_up else "off",
         "loaded": [],
         "pids": comfy_pids,
         "gpu_mb": comfy_gpu_mb,
-        "active_ram_mb": _working_set_for_pids(comfy_pids),
+        "active_ram_mb": await asyncio.to_thread(_working_set_for_pids, comfy_pids),
         "reserved_ram_mb": 0,
         "cache_mb": 0,
         "release_action": "Unload stops ComfyUI.",
@@ -1861,9 +2105,9 @@ async def tool_dream_status():
             pass
     if not maxtok:
         maxtok = (_loom_config.dream_context_size if _loom_config else 0) or 0
-    pid = _dream_resolve_pid()
-    ws_mb, cached_mb = _dream_proc_mem(pid)
-    vram_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
+    pid = await asyncio.to_thread(_dream_resolve_pid)
+    ws_mb, cached_mb = await asyncio.to_thread(_dream_proc_mem, pid)
+    vram_mb = await asyncio.to_thread(_gpu_vram_for_pid, pid) if pid else await asyncio.to_thread(_gpu_total_vram_used_mb)
     memory = await _dream_memory_breakdown(port)
     memory_summary = _dream_memory_summary(memory)
     if memory_summary.get("device_used_mb"):
@@ -1894,354 +2138,30 @@ async def tool_dream_status():
     return JSONResponse({"status": "ok", "output": "\n".join(lines)})
 
 
-async def _probe_nrol_dashboard() -> tuple[bool, str]:
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"http://127.0.0.1:{NROL_AO_PORT}/topics")
-        if r.status_code == 200:
-            topics = r.json()
-            return True, f"NROL-AO dashboard running on :{NROL_AO_PORT} ({len(topics)} topics)"
-        return False, f"NROL-AO dashboard responded HTTP {r.status_code} on :{NROL_AO_PORT}"
-    except Exception as e:
-        return False, f"NROL-AO dashboard is NOT running on :{NROL_AO_PORT}: {e}"
 
 
-def _nrol_activity_path() -> Path:
-    return Path(os.environ.get("NROL_AO_ACTIVITY_DIR", str(NROL_AO_REPO / "loom" / "mcp_activity")))
 
 
-def _ensure_nrol_scan_workspace() -> Path:
-    NROL_SCAN_WORKSPACE.mkdir(parents=True, exist_ok=True)
-    (NROL_SCAN_WORKSPACE / "canvas").mkdir(parents=True, exist_ok=True)
-    (NROL_SCAN_WORKSPACE / "canvas" / "triggers").mkdir(parents=True, exist_ok=True)
-    return NROL_SCAN_WORKSPACE
 
 
-def _nrol_env() -> dict:
-    env = os.environ.copy()
-    env["NROL_AO_REPO"] = str(NROL_AO_REPO)
-    env["ALPHA_OMEGA_PORT"] = str(NROL_AO_PORT)
-    env["NROL_AO_ACTIVITY_DIR"] = str(_nrol_activity_path())
-    if _loom_config is not None:
-        try:
-            env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
-            if getattr(_loom_config, "llama_model", ""):
-                env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
-            if getattr(_loom_config, "llama_chat_template_file", ""):
-                env.setdefault("NROL_AO_LLAMA_CHAT_TEMPLATE_FILE", _loom_config.llama_chat_template_file)
-        except Exception:
-            pass
-    return env
 
 
-def _nrol_mcp_server_config() -> dict:
-    env = _nrol_env()
-    env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + env.get("PYTHONPATH", "")
-    return {
-        "nrol-ao": {
-            "type": "stdio",
-            "command": sys.executable,
-            "args": ["-m", "mcp_servers.nrol_ao.server"],
-            "env": {
-                key: value
-                for key, value in env.items()
-                if key.startswith("NROL_AO_")
-                or key in {"ALPHA_OMEGA_PORT", "LOOM_PORT", "LOOM_CONV_ID", "PYTHONPATH"}
-            },
-        }
-    }
 
 
-def _call_nrol_mcp_tool(name: str, *args, **kwargs) -> dict:
-    env = _nrol_env()
-    keys = (
-        "NROL_AO_REPO", "ALPHA_OMEGA_PORT", "NROL_AO_ACTIVITY_DIR",
-        "NROL_AO_LLAMA_HOST", "NROL_AO_LLAMA_MODEL",
-        "NROL_AO_LLAMA_CHAT_TEMPLATE_FILE",
-    )
-    previous = {key: os.environ.get(key) for key in keys}
-    try:
-        for key in keys:
-            if key in env:
-                os.environ[key] = env[key]
-        nrol_mcp = importlib.import_module("mcp_servers.nrol_ao.server")
-        raw = getattr(nrol_mcp, name)(*args, **kwargs)
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"raw": raw}
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
-@app.post("/tools/nrol-status")
-async def tool_nrol_status():
-    """Check NROL-AO repo, dashboard, MCP bridge, activity, and llama reachability."""
-    lines = [f"NROL-AO repo: {NROL_AO_REPO}"]
-    lines.append(f"  exists: {NROL_AO_REPO.exists()}")
-    lines.append(f"  engine.py: {(NROL_AO_REPO / 'engine.py').exists()}")
-    lines.append(f"  server.py: {(NROL_AO_REPO / 'server.py').exists()}")
-    workspace = _ensure_nrol_scan_workspace()
-    lines.append(f"\nScan workspace: {workspace}")
-    lines.append(f"  CLAUDE.md: {(workspace / 'CLAUDE.md').exists()}")
-    lines.append(f"  canvas/index.html: {(workspace / 'canvas' / 'index.html').exists()}")
-
-    mcp_server = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "server.py"
-    lines.append(f"\nMCP bridge: {mcp_server}")
-    lines.append(f"  exists: {mcp_server.exists()}")
-    lines.append("  transport: stdio, on-demand per Claude Code session")
-    lines.append(f"  command: {sys.executable} {Path(__file__).parent / 'nrol_ao_mcp_server.py'}")
-
-    up, dash_msg = await _probe_nrol_dashboard()
-    lines.append(f"\nDashboard: {dash_msg}")
-    lines.append(f"  URL: http://localhost:{NROL_AO_PORT}")
-    proc = _child_procs.get("nrol_dashboard")
-    if proc:
-        lines.append(f"  tracked PID: {proc.pid}, poll={proc.poll()}")
-
-    act_dir = _nrol_activity_path()
-    snap = act_dir / "snapshot.json"
-    lines.append(f"\nActivity snapshot: {snap}")
-    lines.append(f"  exists: {snap.exists()}")
-    if snap.exists():
-        try:
-            data = json.loads(snap.read_text(encoding="utf-8"))
-            lines.append(f"  active jobs: {data.get('active', 0)}")
-            lines.append(f"  jobs recorded: {len(data.get('jobs', []) or [])}")
-            lines.append(f"  updated_at: {data.get('updated_at')}")
-        except Exception as e:
-            lines.append(f"  read error: {e}")
-
-    llama_port = _get_llama_port()
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"http://127.0.0.1:{llama_port}/v1/models")
-        if r.status_code == 200:
-            models = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
-            lines.append(f"\nLlama Server: online on :{llama_port}")
-            lines.append(f"  loaded: {', '.join(models) or '(none)'}")
-        else:
-            lines.append(f"\nLlama Server: HTTP {r.status_code} on :{llama_port}")
-    except Exception as e:
-        lines.append(f"\nLlama Server: not reachable on :{llama_port}: {e}")
-
-    try:
-        proc = _run_subprocess(
-            ["claude", "mcp", "list"],
-            cwd=str(Path(__file__).parent),
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        has_nrol = "nrol-ao" in output
-        lines.append(f"\nClaude MCP registration: {'nrol-ao present' if has_nrol else 'nrol-ao not found'}")
-        if output:
-            lines.append(output[-2000:])
-    except Exception as e:
-        lines.append(f"\nClaude MCP registration check failed: {e}")
-
-    return JSONResponse({"status": "ok" if up else "error", "output": "\n".join(lines)})
 
 
-@app.post("/tools/nrol-topic-status")
-async def tool_nrol_topic_status():
-    """Show active NROL-AO topic freshness and governance queues."""
-    try:
-        data = _call_nrol_mcp_tool("topic_status")
-        if data.get("error"):
-            return JSONResponse({"status": "error", "output": data["error"]})
-        topics = data.get("topics", []) or []
-        lines = [f"Active topics: {len(topics)}", ""]
-        for topic in topics:
-            stale = "STALE" if topic.get("scanStale") else "fresh"
-            age = topic.get("scanAgeHours")
-            age_text = "never scanned" if age is None else f"{age}h old"
-            parked_debt = topic.get("parkedReviewDebt") or {}
-            parked_due = parked_debt.get("dueCount", 0)
-            parked_total = parked_debt.get("parkedTotal", topic.get("flaggedForIndicatorReview", 0))
-            queues = (
-                f"work: parked_due={parked_due}, "
-                f"parked_archive={parked_total}, "
-                f"schema_gaps={topic.get('flaggedSchemaGaps', 0)}, "
-                f"extensions={topic.get('proposedSchemaExtensions', 0)}"
-            )
-            lines.append(
-                f"[{stale}] {topic.get('slug')} | {topic.get('classification')} | "
-                f"{topic.get('governanceHealth') or 'unknown'} | {age_text}"
-            )
-            lines.append(f"  {topic.get('title')}")
-            lines.append(f"  updated: {topic.get('lastUpdated') or '(unknown)'} | {queues}")
-        return JSONResponse({"status": "ok", "output": "\n".join(lines).rstrip()})
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": f"NROL topic status failed: {e}"})
 
 
-@app.post("/tools/nrol-mcp-activity")
-async def tool_nrol_mcp_activity():
-    """Show recent NROL-AO MCP activity without launching operational work."""
-    try:
-        data = _call_nrol_mcp_tool("list_activity", limit=8)
-        if data.get("error"):
-            return JSONResponse({"status": "error", "output": data["error"]})
-        jobs = data.get("jobs", []) or []
-        lines = [
-            "NROL MCP activity",
-            f"updated: {data.get('updated_at') or '(unknown)'} | active: {data.get('active', 0)}",
-            "",
-        ]
-        if not jobs:
-            lines.append("No MCP jobs recorded.")
-        for job in jobs:
-            title = " | ".join(str(x) for x in [job.get("task"), job.get("slug")] if x)
-            lines.append(f"{job.get('status', 'unknown')}: {title or job.get('job_id', 'job')}")
-            if job.get("model"):
-                lines.append(f"  model: {job['model']}")
-            if job.get("summary"):
-                lines.append(f"  summary: {json.dumps(job['summary'], ensure_ascii=False)[:500]}")
-            if job.get("error"):
-                lines.append(f"  error: {job['error']}")
-        return JSONResponse({"status": "ok", "output": "\n".join(lines).rstrip()})
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": f"NROL MCP activity failed: {e}"})
 
 
-@app.post("/tools/nrol-dashboard-start")
-async def tool_nrol_dashboard_start():
-    """Launch the NROL-AO dashboard HTTP server."""
-    up, msg = await _probe_nrol_dashboard()
-    if up:
-        return JSONResponse({"status": "ok", "output": msg})
-    if not (NROL_AO_REPO / "server.py").exists():
-        return JSONResponse({
-            "status": "error",
-            "output": f"NROL-AO server.py not found at {NROL_AO_REPO / 'server.py'}",
-        })
-
-    log_path = Path(__file__).parent / "nrol_ao_admin.log"
-    env = _nrol_env()
-    try:
-        log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
-        proc = subprocess.Popen(
-            [sys.executable, "server.py"],
-            cwd=str(NROL_AO_REPO),
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
-        log_handle.close()
-        _child_procs["nrol_dashboard"] = proc
-        for i in range(15):
-            await asyncio.sleep(1)
-            up, msg = await _probe_nrol_dashboard()
-            if up:
-                return JSONResponse({
-                    "status": "ok",
-                    "output": f"{msg}\nPID: {proc.pid}\nLog: {log_path}",
-                })
-            if proc.poll() is not None:
-                return JSONResponse({
-                    "status": "error",
-                    "output": f"NROL-AO dashboard exited with {proc.returncode}. Check {log_path}",
-                })
-        return JSONResponse({
-            "status": "ok",
-            "output": f"NROL-AO dashboard launched (PID {proc.pid}) but did not answer within 15s.\nLog: {log_path}",
-        })
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": f"Failed to launch NROL-AO dashboard: {e}"})
 
 
-@app.post("/tools/nrol-dashboard-stop")
-async def tool_nrol_dashboard_stop():
-    """Stop the NROL-AO dashboard if this admin server launched it."""
-    proc = _child_procs.pop("nrol_dashboard", None)
-    if not proc:
-        up, msg = await _probe_nrol_dashboard()
-        return JSONResponse({
-            "status": "error" if up else "ok",
-            "output": (
-                "No tracked NROL-AO dashboard process. "
-                "If it is running, it was launched outside Loom admin and was not killed.\n"
-                + msg
-            ),
-        })
-    if proc.poll() is None:
-        try:
-            proc.terminate()
-            return JSONResponse({"status": "ok", "output": f"Terminated NROL-AO dashboard PID {proc.pid}"})
-        except Exception as e:
-            return JSONResponse({"status": "error", "output": f"Failed to terminate PID {proc.pid}: {e}"})
-    return JSONResponse({"status": "ok", "output": f"NROL-AO dashboard PID {proc.pid} already exited ({proc.returncode})"})
 
 
-@app.post("/tools/nrol-mcp-smoke")
-async def tool_nrol_mcp_smoke():
-    """Run a short import/status smoke test for the stdio MCP bridge."""
-    cmd = [
-        sys.executable,
-        "-c",
-        "from mcp_servers.nrol_ao import server; print(server.nrol_status())",
-    ]
-    try:
-        proc = _run_subprocess(
-            cmd,
-            cwd=str(Path(__file__).parent),
-            env=_nrol_env(),
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        output = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
-        return JSONResponse({
-            "status": "ok" if proc.returncode == 0 else "error",
-            "output": f"exit_code: {proc.returncode}\n{output}",
-        })
-    except subprocess.TimeoutExpired:
-        return JSONResponse({"status": "error", "output": "MCP smoke test timed out after 45s"})
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": f"MCP smoke test failed: {e}"})
 
 
-@app.post("/tools/nrol-mcp-register")
-async def tool_nrol_mcp_register():
-    """Register the NROL-AO stdio MCP bridge with Claude Code user config."""
-    cmd = [
-        "claude",
-        "mcp",
-        "add",
-        "--scope",
-        "user",
-        "--transport",
-        "stdio",
-        "nrol-ao",
-        "--",
-        sys.executable,
-        str(Path(__file__).parent / "nrol_ao_mcp_server.py"),
-    ]
-    try:
-        proc = _run_subprocess(
-            cmd,
-            cwd=str(Path(__file__).parent),
-            env=_nrol_env(),
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        output = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
-        return JSONResponse({
-            "status": "ok" if proc.returncode == 0 else "error",
-            "output": " ".join(cmd) + f"\n\nexit_code: {proc.returncode}\n{output}",
-        })
-    except subprocess.TimeoutExpired:
-        return JSONResponse({"status": "error", "output": "Claude MCP registration timed out after 45s"})
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": f"Claude MCP registration failed: {e}"})
 
 
 
@@ -2819,6 +2739,47 @@ async def tool_ttyd_stop():
 _ADMIN_STATIC = Path(__file__).parent / "static" / "admin"
 
 
+@app.get("/api/extensions")
+async def api_extensions():
+    return JSONResponse({"extensions": await asyncio.to_thread(_extension_registry.list)})
+
+
+@app.post("/api/extensions/register")
+async def api_extension_register(data: dict = Body(...)):
+    manifest_path = str(data.get("manifest_path") or "").strip()
+    if not manifest_path:
+        return JSONResponse({"error": "manifest_path is required"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(_extension_registry.register, manifest_path)
+        return JSONResponse({"extension": result})
+    except ExtensionError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.delete("/api/extensions/{extension_id}")
+async def api_extension_unregister(extension_id: str):
+    async with _extension_lock(extension_id):
+        try:
+            await asyncio.to_thread(_extension_registry.unregister, extension_id)
+            return JSONResponse({"ok": True})
+        except ExtensionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+
+@app.post("/api/extensions/{extension_id}/{action}")
+async def api_extension_action(extension_id: str, action: str):
+    if action not in {"start", "stop", "update"}:
+        return JSONResponse({"error": "Unknown extension action"}, status_code=404)
+    async with _extension_lock(extension_id):
+        try:
+            result = await asyncio.to_thread(getattr(_extension_registry, action), extension_id)
+            return JSONResponse({"result": result})
+        except ExtensionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except subprocess.TimeoutExpired:
+            return JSONResponse({"error": "Extension action timed out"}, status_code=504)
+
+
 @app.get("/api/meta")
 async def api_meta():
     """Ports and link targets for the dashboard. The client rebuilds links
@@ -2827,7 +2788,7 @@ async def api_meta():
     return JSONResponse({
         "admin_port": ADMIN_PORT,
         "llama_port": _get_llama_port(),
-        "nrol_port": NROL_AO_PORT,
+        
         "comfy_port": 8188,
         "main_port": INSTANCES["main"]["port"],
         "test_port": INSTANCES["test"]["port"],
@@ -2842,7 +2803,7 @@ async def api_ports_status():
         "main": INSTANCES["main"]["port"],
         "test": INSTANCES["test"]["port"],
         "llama": _get_llama_port(),
-        "nrol": NROL_AO_PORT,
+        
         "comfy": 8188,
         "ttyd": TTYD_PORT,
         "dream": _dream_port(),
@@ -2857,7 +2818,7 @@ async def api_ports_status():
 async def dashboard():
     index = _ADMIN_STATIC / "index.html"
     if not index.exists():
-        return HTMLResponse("<h1>Loom Admin</h1><p>static/admin/index.html is missing.</p>", status_code=500)
+        return HTMLResponse("<h1>EXO: Admin</h1><p>static/admin/index.html is missing.</p>", status_code=500)
     return HTMLResponse(index.read_text(encoding="utf-8"))
 
 
@@ -2927,12 +2888,63 @@ async def api_change_db(db_name: str = Body(..., embed=True)):
     return JSONResponse({"status": "success", "db": db_name, "restarted": is_running})
 
 
+def _admin_restart_status() -> dict:
+    """Read-only helper evidence; checking status never retries a restart."""
+    helper = _admin_restart_helper
+    exit_code = helper.poll() if helper is not None else None
+    return {"requested": _admin_restart_requested,
+            "requested_at": _admin_restart_requested_at,
+            "helper_pid": helper.pid if helper is not None else None,
+            "helper_exit_code": exit_code}
+
+
+@app.get("/api/admin-status")
+async def api_admin_status():
+    """Serving admin identity, independent of instance health or quota probes."""
+    return JSONResponse(
+        {"admin_port": ADMIN_PORT, "admin_pid": os.getpid(),
+         "admin_restart": _admin_restart_status()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/status")
 async def api_status():
     statuses = await asyncio.gather(
         *[check_instance(name, info) for name, info in INSTANCES.items()]
     )
-    return JSONResponse({"instances": statuses, "admin_port": ADMIN_PORT})
+    return JSONResponse(
+        {
+            "instances": statuses,
+            "admin_port": ADMIN_PORT,
+            "admin_pid": os.getpid(),
+            "admin_restart": _admin_restart_status(),
+        }
+    )
+
+
+@app.get("/api/acceptance")
+async def api_acceptance():
+    """Compare the published preflight with checkout and running Main."""
+    try:
+        checkout = await asyncio.to_thread(source_identity)
+    except Exception:
+        checkout = None
+    runtime = None
+    main = INSTANCES.get("main")
+    if main:
+        try:
+            response = await _get_instance(main["port"], "/api/build-identity")
+            if response.status_code == 200:
+                payload = response.json()
+                if isinstance(payload, dict) and isinstance(payload.get("source"), dict):
+                    runtime = payload["source"]
+        except Exception:
+            pass
+    return JSONResponse(
+        evaluate_acceptance(read_published_report(), checkout, runtime),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/generations-proxy")
@@ -2950,17 +2962,451 @@ async def api_generations_proxy():
     return JSONResponse([])
 
 
+@app.get("/api/openrouter/usage")
+async def api_openrouter_usage():
+    """Monitor Main's configured key and loaded budgets without exposing secrets."""
+    headers = {"Cache-Control": "no-store"}
+    info = INSTANCES.get("main")
+    if not info:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    try:
+        response = await _get_instance(info["port"], "/api/openrouter/usage", timeout=12.0)
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable; OpenRouter usage is unavailable."},
+                            status_code=503, headers=headers)
+    if response.status_code != 200:
+        return JSONResponse({"error": f"Main EXO usage endpoint returned HTTP {response.status_code}."},
+                            status_code=502, headers=headers)
+    try:
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("api_key_configured"), bool):
+            raise ValueError("Invalid usage snapshot")
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "Main EXO returned an invalid usage snapshot."},
+                            status_code=502, headers=headers)
+
+    def numbers(source, fields):
+        source = source if isinstance(source, dict) else {}
+        result = {}
+        for field in fields:
+            value = source.get(field)
+            result[field] = (value if isinstance(value, (int, float)) and not isinstance(value, bool)
+                             and math.isfinite(value) else None)
+        return result
+
+    # Explicit projection: no key labels/previews, user IDs, secrets, or raw errors.
+    payload = {
+        "instance": "main", "fetched_at": time.time(),
+        "api_key_configured": data["api_key_configured"],
+        "management_key_configured": data.get("management_key_configured") is True,
+        "limits": numbers(data.get("limits"), ("weekly_limit_usd", "monthly_limit_usd")),
+        "current_key": None, "account": None, "warnings": [],
+    }
+    key = data.get("current_key")
+    if data["api_key_configured"] and isinstance(key, dict) and not data.get("current_key_error"):
+        payload["current_key"] = numbers(key, (
+            "usage", "usage_daily", "usage_weekly", "usage_monthly", "limit", "limit_remaining",
+            "byok_usage_daily", "byok_usage_weekly", "byok_usage_monthly"))
+        reset = key.get("limit_reset")
+        payload["current_key"]["limit_reset"] = reset if reset in (None, "daily", "weekly", "monthly") else "unknown"
+        payload["current_key"]["include_byok_in_limit"] = key.get("include_byok_in_limit") is True
+    elif data["api_key_configured"]:
+        payload["warnings"].append("OpenRouter key usage is unavailable. Check the key in the admin OpenRouter tab.")
+    if isinstance(data.get("account"), dict) and not data.get("account_error"):
+        payload["account"] = numbers(data["account"], ("total_credits", "total_usage"))
+    elif payload["management_key_configured"]:
+        payload["warnings"].append("OpenRouter account credits are unavailable.")
+    return JSONResponse(payload, headers=headers)
+
+
+_PROVIDER_USAGE_PROXY_TIMEOUT = 25.0
+
+
+@app.get("/api/provider-usage")
+async def api_provider_usage():
+    """Use Main's single cached monitor so browser tabs do not multiply probes."""
+    headers = {"Cache-Control": "no-store"}
+    info = INSTANCES.get("main")
+    if info:
+        try:
+            # Bound both scheme attempts together, below the browser's 30s
+            # deadline. Per-request httpx timeouts alone do not bound fallback.
+            async with asyncio.timeout(_PROVIDER_USAGE_PROXY_TIMEOUT):
+                response = await _get_instance(info["port"], "/api/provider-usage",
+                                               timeout=_PROVIDER_USAGE_PROXY_TIMEOUT)
+            data = response.json()
+            if response.status_code == 200 and isinstance(data, dict) and isinstance(data.get("providers"), list):
+                return JSONResponse(data, headers=headers)
+        except Exception:
+            pass
+    return JSONResponse({"error": "Main EXO quota monitor is unavailable."}, status_code=503, headers=headers)
+
+
+# ── Usage & Activity dashboard (proxied to Main EXO) ──
+
+@app.get("/api/usage/activity")
+async def api_usage_activity():
+    """Read-only token telemetry aggregated by Main from its message store."""
+    headers = {"Cache-Control": "no-store"}
+    info = INSTANCES.get("main")
+    if info:
+        try:
+            async with asyncio.timeout(_PROVIDER_USAGE_PROXY_TIMEOUT):
+                response = await _get_instance(info["port"], "/api/usage/activity",
+                                               timeout=_PROVIDER_USAGE_PROXY_TIMEOUT)
+            data = response.json()
+            if response.status_code == 200 and isinstance(data, dict) and "periods" in data:
+                return JSONResponse(data, headers=headers)
+        except Exception:
+            pass
+    return JSONResponse({"error": "Main EXO usage aggregation is unavailable."}, status_code=503, headers=headers)
+
+
+@app.post("/api/usage/snapshots/yesterday")
+async def api_usage_yesterday():
+    return await _usage_write_proxy("/api/usage/snapshots/yesterday")
+
+
+@app.get("/api/usage/chart")
+async def api_usage_chart(request: Request):
+    info = INSTANCES.get("main")
+    if info:
+        try:
+            async with asyncio.timeout(_PROVIDER_USAGE_PROXY_TIMEOUT):
+                response = await _get_instance(info['port'], '/api/usage/chart?' + urlencode(request.query_params),
+                                               timeout=_PROVIDER_USAGE_PROXY_TIMEOUT)
+            return JSONResponse(response.json(),status_code=response.status_code,
+                                headers={'Cache-Control':'no-store'})
+        except Exception:
+            pass
+    return JSONResponse({'error':'Main EXO usage chart is unavailable.'},status_code=503)
+
+
+@app.put("/api/usage/settings")
+async def api_usage_settings(data: dict):
+    return await _usage_write_proxy("/api/usage/settings", data)
+
+
+async def _usage_write_proxy(path: str, data: dict | None = None):
+    info = INSTANCES.get("main")
+    if info:
+        try:
+            async with asyncio.timeout(_PROVIDER_USAGE_PROXY_TIMEOUT):
+                response = await (_put_instance(info['port'], path, data) if data is not None
+                                  else _post_instance(info['port'], path))
+            return JSONResponse(response.json(), status_code=response.status_code,
+                                headers={"Cache-Control": "no-store"})
+        except Exception:
+            pass
+    return JSONResponse({"error": "Main EXO usage reports are unavailable."}, status_code=503)
+
+
+# ── OpenRouter settings + model slugs (proxied to Main EXO) ──
+
+# Non-secret OpenRouter config keys editable from the admin OpenRouter tab.
+_OPENROUTER_CONFIG_KEYS = (
+    "openrouter_base_url",
+    "openrouter_weekly_limit_usd",
+    "openrouter_monthly_limit_usd",
+    "openrouter_max_prompt_price_per_mtok",
+    "openrouter_max_completion_price_per_mtok",
+)
+_OPENROUTER_NUMERIC_KEYS = {
+    "openrouter_weekly_limit_usd", "openrouter_monthly_limit_usd",
+    "openrouter_max_prompt_price_per_mtok", "openrouter_max_completion_price_per_mtok",
+}
+
+
+def _main_port() -> int | None:
+    info = INSTANCES.get("main")
+    return info.get("port") if info else None
+
+
+_machine_settings_lock = asyncio.Lock()
+
+
+@app.get("/api/visual-settings")
+async def api_visual_settings():
+    from visual_settings import load, schema
+    return JSONResponse({"values":load(),"fields":schema(),"main_port":_main_port()},headers={"Cache-Control":"no-store"})
+
+
+@app.post("/api/visual-settings")
+async def api_save_visual_settings(data: dict):
+    from visual_settings import save
+    try:
+        return {"values":save(data)}
+    except ValueError as error:
+        return JSONResponse({"error":str(error)},status_code=400)
+
+
+@app.get("/api/machine-settings")
+async def api_machine_settings():
+    from machine_settings import FIELDS, TUNING_FIELDS, schema
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503)
+    try:
+        responses = await asyncio.gather(*(_get_instance(port, path) for path in
+            ("/api/config", "/api/models-config", "/api/disk-models")))
+        if any(response.status_code != 200 for response in responses):
+            raise ValueError("Main unavailable")
+        cfg, tuning, disk = (response.json() for response in responses)
+        return JSONResponse({"fields": schema(FIELDS), "tuning_fields": schema(TUNING_FIELDS),
+                             "settings": {key: cfg.get(key) for key, *_ in FIELDS},
+                             "models": tuning.get("models", {}), "disk_models": disk.get("models", [])},
+                            headers={"Cache-Control": "no-store"})
+    except Exception:
+        return JSONResponse({"error": "Main settings unavailable."}, status_code=503)
+
+
+@app.post("/api/machine-settings")
+async def api_save_machine_settings(data: dict):
+    from machine_settings import FIELDS, TUNING_FIELDS, validate
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503)
+    try:
+        if set(data) == {"settings"}:
+            settings = validate(data["settings"], FIELDS)
+            response = await _put_instance(port, "/api/config", settings)
+            if response.status_code == 200 and "default_permission_profile" in settings:
+                check = await _get_instance(port, "/api/config")
+                saved = check.json() if check.status_code == 200 else {}
+                if "default_permission_profile" not in saved:
+                    return JSONResponse({"error": "Main has not loaded default trust support. Restart Main manually, then reload settings and save again."}, status_code=409)
+                if saved["default_permission_profile"] != settings["default_permission_profile"]:
+                    return JSONResponse({"error": "Default trust level was not persisted. Reload settings and retry."}, status_code=409)
+        elif set(data) == {"model", "tuning"} and isinstance(data["model"], str) and data["model"]:
+            tuning = validate(data["tuning"], TUNING_FIELDS)
+            async with _machine_settings_lock:
+                current = await _get_instance(port, "/api/models-config")
+                if current.status_code != 200:
+                    raise RuntimeError("Main settings unavailable")
+                models = current.json().get("models", {})
+                if data["model"] not in models:
+                    raise ValueError("Choose a model available on disk")
+                models[data["model"]] = {**models[data["model"]], **tuning}
+                response = await _put_instance(port, "/api/models-config", {"models": models})
+        else:
+            raise ValueError("Supply settings or a model and tuning")
+        if response.status_code != 200:
+            raise RuntimeError("Main could not save settings")
+        return {"ok": True}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Main could not save settings."}, status_code=503)
+
+
+@app.get("/api/openrouter/settings")
+async def api_openrouter_settings():
+    """Non-secret OpenRouter settings + saved-key status, projected from Main."""
+    headers = {"Cache-Control": "no-store"}
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    try:
+        cfg_resp = await _get_instance(port, "/api/config")
+        sec_resp = await _get_instance(port, "/api/openrouter/secrets")
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable."}, status_code=503, headers=headers)
+    cfg = cfg_resp.json() if cfg_resp.status_code == 200 and isinstance(cfg_resp.json(), dict) else {}
+    secrets = {}
+    if sec_resp.status_code == 200:
+        body = sec_resp.json()
+        if isinstance(body, dict):
+            secrets = body.get("status") if isinstance(body.get("status"), dict) else {}
+    return JSONResponse({
+        "settings": {k: cfg.get(k) for k in _OPENROUTER_CONFIG_KEYS},
+        "secrets": secrets,
+    }, headers=headers)
+
+
+@app.post("/api/openrouter/settings")
+async def api_post_openrouter_settings(data: dict = None):
+    """Update Main's OpenRouter budget/base-URL config keys only."""
+    headers = {"Cache-Control": "no-store"}
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    data = data or {}
+    payload = {}
+    for key in _OPENROUTER_CONFIG_KEYS:
+        if key not in data:
+            continue
+        value = data[key]
+        if key in _OPENROUTER_NUMERIC_KEYS:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": f"{key} must be a number."}, status_code=400, headers=headers)
+        payload[key] = value
+    if not payload:
+        return JSONResponse({"error": "No OpenRouter settings supplied."}, status_code=400, headers=headers)
+    try:
+        resp = await _put_instance(port, "/api/config", payload)
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable."}, status_code=503, headers=headers)
+    if resp.status_code != 200:
+        return JSONResponse({"error": f"Main EXO returned HTTP {resp.status_code}."}, status_code=502, headers=headers)
+    cfg = resp.json() if isinstance(resp.json(), dict) else {}
+    return JSONResponse({"ok": True, "settings": {k: cfg.get(k) for k in _OPENROUTER_CONFIG_KEYS}})
+
+
+@app.post("/api/openrouter/secrets")
+async def api_post_openrouter_secrets_proxy(data: dict = None):
+    """Store OpenRouter keys in Main's .env without echoing them back."""
+    headers = {"Cache-Control": "no-store"}
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    data = data or {}
+    payload = {}
+    if data.get("api_key"):
+        payload["api_key"] = str(data["api_key"]).strip()
+    if data.get("management_key"):
+        payload["management_key"] = str(data["management_key"]).strip()
+    if not payload:
+        return JSONResponse({"error": "Paste at least one key to save."}, status_code=400, headers=headers)
+    try:
+        resp = await _post_instance(port, "/api/openrouter/secrets", payload)
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable."}, status_code=503, headers=headers)
+    if resp.status_code != 200:
+        return JSONResponse({"error": f"Main EXO returned HTTP {resp.status_code}."}, status_code=502, headers=headers)
+    return JSONResponse({"ok": True, "secrets": (resp.json() or {}).get("status", {})})
+
+
+@app.get("/api/models/openrouter")
+async def api_get_openrouter_models():
+    """Relay Main's merged OpenRouter model list for the slugs editor."""
+    headers = {"Cache-Control": "no-store"}
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    try:
+        resp = await _get_instance(port, "/api/models/openrouter")
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable."}, status_code=503, headers=headers)
+    if resp.status_code != 200:
+        return JSONResponse({"error": f"Main EXO returned HTTP {resp.status_code}."}, status_code=502, headers=headers)
+    return JSONResponse(resp.json(), headers=headers)
+
+
+@app.post("/api/models/openrouter")
+async def api_post_openrouter_models_proxy(data: dict = None):
+    """Relay the OpenRouter slug list to Main; Main validates and hot-reloads."""
+    headers = {"Cache-Control": "no-store"}
+    port = _main_port()
+    if not port:
+        return JSONResponse({"error": "Main EXO is not configured."}, status_code=503, headers=headers)
+    data = data or {}
+    models = data.get("models")
+    if not isinstance(models, list):
+        return JSONResponse({"error": "Body must contain a 'models' list."}, status_code=400, headers=headers)
+    try:
+        resp = await _post_instance(port, "/api/models/openrouter", {"models": models})
+    except Exception:
+        return JSONResponse({"error": "Main EXO is unreachable."}, status_code=503, headers=headers)
+    if resp.status_code != 200:
+        detail = None
+        try:
+            body = resp.json()
+            detail = (body or {}).get("detail")
+        except Exception:
+            pass
+        return JSONResponse({"error": detail or f"Main EXO returned HTTP {resp.status_code}."},
+                            status_code=resp.status_code if resp.status_code >= 400 else 502, headers=headers)
+    return JSONResponse(resp.json(), headers=headers)
+
+
+_supervision_schemes: dict[str, str] = {}
+
+
+async def _supervision_snapshot(name: str, info: dict) -> dict:
+    preferred = _supervision_schemes.get(name, "https")
+    for scheme in (preferred, "http" if preferred == "https" else "https"):
+        try:
+            async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+                response = await client.get(
+                    f"{scheme}://127.0.0.1:{info['port']}/api/admin/supervision",
+                    headers=loom_auth.relay_headers())
+            if response.status_code != 200:
+                return {"instance": name, "available": False,
+                        "error": f"Supervision unavailable (HTTP {response.status_code}); instance may need updated server code."}
+            data = response.json()
+            if (not isinstance(data, dict) or not isinstance(data.get("generations"), list)
+                    or not isinstance(data.get("permissions"), list)):
+                raise ValueError("Invalid supervision response")
+            _supervision_schemes[name] = scheme
+            return {"instance": name, "label": info.get("label", name), "port": info["port"],
+                    "scheme": scheme, "available": True,
+                    "generations": data["generations"], "permissions": data["permissions"],
+                    # Missing history from an older main is not an empty inbox.
+                    "landed": data.get("landed"), "landed_limit": data.get("landed_limit")}
+        except (httpx.HTTPError, ValueError):
+            continue
+    _supervision_schemes.pop(name, None)
+    return {"instance": name, "available": False, "error": "Instance unreachable or supervision response invalid"}
+
+
+@app.get("/api/supervision")
+async def api_supervision():
+    instances = await asyncio.gather(*[_supervision_snapshot(name, info) for name, info in INSTANCES.items()])
+    return JSONResponse({"instances": instances}, headers={"Cache-Control": "no-store"})
+
+
+def _supervision_browser_authorized(request: Request) -> bool:
+    # Same privilege boundary as the admin's other controls, with an explicit
+    # non-simple header and Origin validation to reject cross-site submissions.
+    origin = request.headers.get("origin")
+    return (request.headers.get("x-loom-admin") == "1"
+            and (not origin or origin.rstrip("/") == str(request.base_url).rstrip("/")))
+
+
+async def _supervision_action(instance: str, path: str, request: Request, payload: dict | None = None,
+                              *, timeout: float = 10.0):
+    if not _supervision_browser_authorized(request):
+        return JSONResponse({"detail": "Same-origin admin action required"}, status_code=403)
+    info = INSTANCES.get(instance)
+    if not info:
+        return JSONResponse({"detail": "Unknown instance"}, status_code=404)
+    if instance not in _supervision_schemes:
+        snapshot = await _supervision_snapshot(instance, info)
+        if not snapshot["available"]:
+            return JSONResponse({"detail": snapshot["error"]}, status_code=503)
+    try:
+        # Exactly one POST, to the explicitly selected instance. Never try a
+        # second owner or replay a mutation following an ambiguous timeout.
+        scheme = _supervision_schemes[instance]
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+            response = await client.post(f"{scheme}://127.0.0.1:{info['port']}{path}",
+                                         json=payload, headers=loom_auth.relay_headers())
+        return JSONResponse(response.json(), status_code=response.status_code)
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse({"detail": "Instance response unavailable; refresh to check whether the action completed."}, status_code=502)
+
+
+@app.post("/api/supervision/{instance}/permissions/{request_id}")
+async def api_supervision_permission(instance: str, request_id: str, request: Request, payload: dict = Body(...)):
+    return await _supervision_action(instance, f"/api/admin/permissions/{quote(request_id, safe='')}", request, payload)
+
+
+@app.post("/api/supervision/{instance}/generations/{draft_id}/kill")
+async def api_supervision_kill(instance: str, draft_id: int, request: Request):
+    # Main allows 12s graceful teardown + 8s PID exit + 4s task drain.
+    # Include relay/DB overhead; a timeout is ambiguous and is never replayed.
+    return await _supervision_action(instance, f"/api/generations/{draft_id}/kill", request,
+                                     timeout=35.0)
+
+
 @app.post("/api/generations-proxy/{draft_msg_id}/kill")
 async def api_generations_kill_proxy(draft_msg_id: int):
-    """Proxy a kill request to the Loom instance that owns this draft."""
-    for name, info in INSTANCES.items():
-        try:
-            r = await _post_instance(info["port"], f"/api/generations/{draft_msg_id}/kill")
-            if r.status_code == 200:
-                return JSONResponse(r.json())
-        except Exception:
-            continue
-    return JSONResponse({"error": "no instance reachable"}, status_code=502)
+    """Retired: database-local draft IDs cannot identify a server instance."""
+    return JSONResponse({"detail": "Instance identity is required. Use the admin Activity tab "
+                         "or /api/supervision/{instance}/generations/{draft_id}/kill."},
+                        status_code=410)
 
 
 @app.get("/api/cron-help-proxy")
@@ -3016,18 +3462,20 @@ async def _post_instance(port: int, path: str) -> httpx.Response:
     """POST to an instance, trying HTTPS then HTTP."""
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=5.0, verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 return await client.post(f"{scheme}://localhost:{port}{path}")
         except Exception:
             continue
     raise ConnectionError(f"Cannot reach localhost:{port}")
 
 
-async def _get_instance(port: int, path: str) -> httpx.Response:
+async def _get_instance(port: int, path: str, *, timeout: float = 2.0) -> httpx.Response:
     """GET from an instance, trying HTTPS then HTTP."""
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=2.0), verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 return await client.get(f"{scheme}://localhost:{port}{path}")
         except Exception:
             continue
@@ -3038,7 +3486,8 @@ async def _put_instance(port: int, path: str, payload: dict) -> httpx.Response:
     """PUT JSON to an instance, trying HTTPS then HTTP."""
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=5.0, verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 return await client.put(f"{scheme}://localhost:{port}{path}", json=payload)
         except Exception:
             continue
@@ -3049,7 +3498,8 @@ async def _delete_instance(port: int, path: str) -> httpx.Response:
     """DELETE from an instance, trying HTTPS then HTTP."""
     for scheme in ("https", "http"):
         try:
-            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=5.0, verify=False,
+                                         headers=loom_auth.relay_headers()) as client:
                 return await client.delete(f"{scheme}://localhost:{port}{path}")
         except Exception:
             continue
@@ -3060,19 +3510,17 @@ async def _delete_instance(port: int, path: str) -> httpx.Response:
 async def action_shutdown(name: str):
     if name not in INSTANCES:
         return JSONResponse({"error": f"Unknown instance: {name}"}, status_code=404)
-    port = INSTANCES[name]["port"]
-    try:
-        resp = await _post_instance(port, "/shutdown")
-        return JSONResponse({"status": f"{name} shutting down", "response": resp.json()})
-    except Exception as e:
-        return JSONResponse({"error": f"Could not reach {name} on :{port}: {e}"}, status_code=502)
+    async with _instance_lifecycle_lock(name):
+        try:
+            stopped = await _stop_instance_and_verify(name)
+            return JSONResponse({"status": f"{name} stopped", **stopped})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
 
 
-@app.post("/action/{name}/start")
-async def action_start(name: str):
-    if name not in INSTANCES:
-        return JSONResponse({"error": f"Unknown instance: {name}"}, status_code=404)
-
+async def _start_instance_locked(name: str) -> JSONResponse:
+    """Start an instance while its per-instance lifecycle lock is held."""
+    _assert_safe_lifecycle_target(name)
     info = INSTANCES[name]
     port = info["port"]
 
@@ -3080,25 +3528,42 @@ async def action_start(name: str):
     proc = _child_procs.get(name)
     if proc:
         try:
-            proc.poll()
-        except Exception:
-            pass
-        if proc.returncode is not None:
+            tracked_identity = _process_identity(proc.pid, fail_closed=True)
+        except _ProcessInspectionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        if not tracked_identity and _child_procs.get(name) is proc:
             _child_procs.pop(name, None)
+    discovery = _collect_instance_processes(name)
+    if not discovery.complete:
+        return JSONResponse(
+            {
+                "error": (
+                    f"Refusing to start {name}: process ownership could not be verified: "
+                    + "; ".join(discovery.errors)
+                )
+            },
+            status_code=409,
+        )
+    if discovery.identities:
+        return JSONResponse(
+            {
+                "error": (
+                    f"Refusing to start {name}: prior process PID(s) "
+                    + ", ".join(
+                        str(identity[0]) for identity in discovery.identities
+                    )
+                    + " are still alive"
+                ),
+                "pids": [identity[0] for identity in discovery.identities],
+            },
+            status_code=409,
+        )
 
     # Wait for port to be available (old process may still be releasing it)
     for attempt in range(10):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex(("127.0.0.1", port)) != 0:
                 break  # Port is free
-        if attempt == 0:
-            # First check failed — port in use. If we have a stale handle, kill it
-            if name in _child_procs:
-                try:
-                    _child_procs[name].kill()
-                except Exception:
-                    pass
-                _child_procs.pop(name, None)
         await asyncio.sleep(1)
     else:
         return JSONResponse(
@@ -3138,33 +3603,24 @@ async def action_start(name: str):
     return JSONResponse({"status": f"{name} starting on :{port}", "pid": proc.pid})
 
 
+@app.post("/action/{name}/start")
+async def action_start(name: str):
+    if name not in INSTANCES:
+        return JSONResponse({"error": f"Unknown instance: {name}"}, status_code=404)
+    async with _instance_lifecycle_lock(name):
+        return await _start_instance_locked(name)
+
+
 @app.post("/action/{name}/restart")
 async def action_restart(name: str):
     if name not in INSTANCES:
         return JSONResponse({"error": f"Unknown instance: {name}"}, status_code=404)
-
-    port = INSTANCES[name]["port"]
-
-    # Step 1: graceful shutdown
-    try:
-        await _post_instance(port, "/shutdown")
-        # Wait for it to die
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            try:
-                await _get_instance(port, "/api/config")
-            except Exception:
-                break  # It's down
-    except Exception:
-        pass  # Already down
-
-    # Step 2: clear stale Popen handle — on Windows, detached processes
-    # leave zombie handles that make poll() return None forever
-    _child_procs.pop(name, None)
-
-    # Step 3: wait for port release, then start
-    await asyncio.sleep(2)
-    return await action_start(name)
+    async with _instance_lifecycle_lock(name):
+        try:
+            await _stop_instance_and_verify(name)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return await _start_instance_locked(name)
 
 
 @app.post("/shutdown")
@@ -3179,25 +3635,85 @@ async def admin_shutdown():
 
 @app.post("/admin/restart")
 async def admin_restart():
-    """Respawn the admin server. Client must reconnect after ~2s."""
+    """Respawn admin only after the exact current PID has exited."""
+    global _admin_restart_requested, _admin_restart_helper, _admin_restart_requested_at
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return JSONResponse(
+            {"error": "pytest may not invoke the live admin restart route"},
+            status_code=409,
+        )
+    if _admin_restart_requested:
+        state = _admin_restart_status()
+        if state["helper_exit_code"] is not None:
+            # This POST is a new, explicit user action. A failed helper must not
+            # latch the dashboard in "already requested" forever. Status polling
+            # never enters this path, and a still-live helper is never duplicated.
+            print(f"[ADMIN-RESTART] Explicit retry after helper {state['helper_pid']} exited ({state['helper_exit_code']})", flush=True)
+            _admin_restart_requested = False
+            _admin_restart_helper = None
+            _admin_restart_requested_at = None
+        else:
+            return JSONResponse(
+                {"status": f"admin restart already requested on :{ADMIN_PORT}",
+                 "old_pid": os.getpid(), **state},
+                status_code=202,
+            )
+
+    print(f"[ADMIN-RESTART] Request received for admin PID {os.getpid()}", flush=True)
+    try:
+        old_identity = _process_identity(os.getpid(), fail_closed=True)
+    except _ProcessInspectionError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not old_identity:
+        return JSONResponse(
+            {"error": "Cannot verify the current admin process identity"},
+            status_code=409,
+        )
+
     admin_dir = Path(__file__).parent
     child_log = admin_dir / "admin_server.log"
-    # Detached child must have stdout/stderr redirected — inheriting the
-    # parent's (about-to-close) console handles makes uvicorn's logger crash.
-    spawn_code = (
-        "import time, subprocess, sys;"
-        "time.sleep(2);"
-        f"log = open(r'{child_log}', 'a');"
-        "flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0);"
-        f"subprocess.Popen([sys.executable, r'{__file__}'], cwd=r'{admin_dir}', "
-        "creationflags=flags, stdout=log, stderr=log)"
-    )
-    subprocess.Popen(
-        [sys.executable, "-c", spawn_code],
-        env=os.environ.copy(),
-        cwd=str(admin_dir),
-        creationflags=0x08000000 | 0x00000200, # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-    )
+    helper_args = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--restart-admin-after-pid",
+        str(old_identity[0]),
+        repr(old_identity[1]),
+        str(ADMIN_PORT),
+    ]
+    try:
+        helper_log = open(child_log, "a", encoding="utf-8")
+    except OSError as exc:
+        error = f"Could not open admin restart log: {exc}"
+        print(f"[ADMIN-RESTART] {error}", flush=True)
+        return JSONResponse({"error": error, "old_pid": old_identity[0]}, status_code=500)
+    helper_kwargs: dict = {
+        "env": os.environ.copy(),
+        "cwd": str(admin_dir),
+        "stdout": helper_log,
+        "stderr": helper_log,
+    }
+    if sys.platform == "win32":
+        helper_kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        helper_kwargs["start_new_session"] = True
+    try:
+        helper = subprocess.Popen(helper_args, **helper_kwargs)
+    except Exception as exc:
+        helper_log.close()
+        print(f"[ADMIN-RESTART] Helper launch failed: {exc}", flush=True)
+        return JSONResponse(
+            {"error": f"Could not start admin restart helper: {exc}", "old_pid": old_identity[0]},
+            status_code=500,
+        )
+    helper_log.close()
+    _admin_restart_helper = helper
+    _admin_restart_requested_at = time.time()
+    _admin_restart_requested = True
+    print(f"[ADMIN-RESTART] Accepted: old admin PID {old_identity[0]}, helper PID {helper.pid}", flush=True)
 
     async def _exit_soon():
         await asyncio.sleep(0.5)
@@ -3207,10 +3723,16 @@ async def admin_restart():
             os.kill(os.getpid(), signal.SIGINT)
 
     asyncio.create_task(_exit_soon())
-    return JSONResponse({"status": f"admin restarting on :{ADMIN_PORT}"})
+    return JSONResponse(
+        {
+            "status": f"admin restarting on :{ADMIN_PORT}",
+            "old_pid": old_identity[0],
+            "helper_pid": helper.pid,
+        }
+    )
 
 
-if __name__ == "__main__":
+def _run_admin_server() -> None:
     base_dir = Path(__file__).resolve().parent
     ssl_cert = os.getenv("LOOM_SSL_CERT", str(base_dir / "certs" / "cert.pem"))
     ssl_key = os.getenv("LOOM_SSL_KEY", str(base_dir / "certs" / "key.pem"))
@@ -3229,8 +3751,21 @@ if __name__ == "__main__":
     uv_config = uvicorn.Config(
         app, host="0.0.0.0", port=ADMIN_PORT,
         log_level="warning",
+        ws="websockets-sansio",
+        proxy_headers=False,
         **ssl_kwargs
     )
     server = uvicorn.Server(uv_config)
     _server_ref.append(server)
     server.run()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 5 and sys.argv[1] == "--restart-admin-after-pid":
+        raise SystemExit(
+            _run_admin_restart_helper(
+                (int(sys.argv[2]), float(sys.argv[3])),
+                port=int(sys.argv[4]),
+            )
+        )
+    _run_admin_server()

@@ -9,7 +9,7 @@ def test_dream_claude_selector_is_distinct_from_dream_space():
 
     assert server.is_dream_claude_model(value)
     assert server._dream_claude_model_id(value) == server.config.dream_model
-    assert server._nrol_operator_block_reason(value) is not None
+    pass
 
     groups = {g["group"]: g["models"] for g in server.CC_MODELS}
     assert "Dream via Claude Code" in groups
@@ -262,10 +262,12 @@ def test_diffusion_gemma_server_thinking_is_request_configurable():
 
 def test_settings_max_tokens_allows_dream_context_scale():
     html = Path("static/index.html").read_text(encoding="utf-8")
+    from machine_settings import FIELDS
 
-    assert 'id="cfg-max-tokens" step="256" min="64" max="131072"' in html
+    # Machine-wide direct-local limits now live in Admin's shared schema.
+    output_limit = next(field for field in FIELDS if field[0] == "max_tokens")
+    assert output_limit[2:5] == ("integer", 64, 131072)
     assert 'id="cfg-weave-max-tokens" step="256" min="64" max="32768"' in html
-    assert 'id="cfg-dream-min-output-tokens" min="256" step="256"' in html
 
 
 def test_weave_generation_uses_separate_output_token_setting():

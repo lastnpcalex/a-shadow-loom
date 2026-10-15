@@ -2,51 +2,83 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Ex Astris Umbra</title>
-    <link rel="icon" type="image/png" href="/static/img/loom-ico-transparent.png">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+    <title>EX umbra Omnia</title>
+    <link id="loom-favicon" rel="icon" type="image/svg+xml" href="/static/exoloom/icon-16.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
-    <link rel="stylesheet" href="/static/style.css?v=121">
+    <link rel="stylesheet" href="/static/style.css?v=140">
+    <link rel="stylesheet" href="/static/admin/provider-usage.css?v=2">
+    <link rel="stylesheet" href="/static/settings.css?v=1">
+    <link rel="stylesheet" href="/static/chat-workspace.css?v=23">
+    <link rel="stylesheet" href="/static/appearance.css?v=9">
+    <script src="/static/appearance.js?v=4"></script>
 </head>
-<body>
+<body class="app-booting">
     <div id="blackhole-container"></div>
     <div id="app">
         <!-- Top bar (always visible) -->
         <header id="app-header">
             <div id="header-left">
-                <button id="btn-home" title="Return to all conversations">A Shadow Loom ◈</button>
+                <button id="btn-home" title="Open ExoHome">EX umbra Omnia</button>
+                <span id="brand-nav-separator" aria-hidden="true">/</span>
+                <button id="btn-folders" type="button" title="All conversation folders" aria-label="All conversation folders">◈</button>
                 <span id="header-separator" class="hidden">/</span>
                 <span id="conv-title" class="hidden"></span>
-                <span id="hermes-model-indicator" class="hermes-model-indicator hidden" title=""></span>
                 <span id="breadcrumb-trail" class="hidden"></span>
-                <button id="btn-to-tree" class="hidden" title="Back to tree view">⟨ Tree</button>
+                <div id="branch-nav-bar" class="hidden">
+                    <input id="branch-path-input" type="text" list="branch-path-suggestions"
+                           aria-label="Message or branch path" placeholder="Paste path" autocomplete="off">
+                    <datalist id="branch-path-suggestions"></datalist>
+                    <button id="btn-branch-paste" type="button" title="Paste copied message path">Paste</button>
+                    <button id="btn-branch-go" type="button" title="Open this exact branch path">Go</button>
+                    <span id="branch-path-status" role="status" aria-live="polite"></span>
+                    <div id="branch-pins-panel" class="hidden">
+                        <div class="branch-pins-header">
+                            <span>Branch pins</span>
+                            <button id="btn-close-branch-pins" type="button" title="Close">&times;</button>
+                        </div>
+                        <div id="branch-pin-current-path"></div>
+                        <div class="branch-pin-create-row">
+                            <input id="branch-pin-label" type="text" maxlength="120"
+                                   aria-label="Label for current branch" placeholder="Label current branch">
+                            <button id="btn-save-branch-pin" type="button">Pin current</button>
+                        </div>
+                        <div id="branch-pins-list"></div>
+                    </div>
+                </div>
             </div>
             <div id="header-right">
                 <div id="notif-bell-wrap">
-                    <button id="notif-bell" title="Background generations landed">
-                        <span class="notif-bell-icon">⑂</span>
+                    <button id="notif-bell" title="Branch activity and notifications">
+                        <span class="notif-bell-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v7a4 4 0 0 0 4 4h2v7M18 3v7a4 4 0 0 1-4 4h-2"/></svg></span>
                         <span id="notif-badge" class="notif-badge hidden">0</span>
                     </button>
                     <div id="notif-dropdown" class="hidden">
                         <div class="notif-header">
-                            <span>Landed branches</span>
-                            <button id="notif-refresh" title="Clear resolved">&#x27F3;</button>
-                            <button id="notif-clear" title="Close">&#x2715;</button>
+                            <span>Notifications</span>
+                            <button id="notif-refresh" type="button" class="popup-control" title="Refresh notifications" aria-label="Refresh notifications"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2 5"/></svg></button>
+                            <button id="notif-close" type="button" class="popup-control" title="Close notifications" aria-label="Close notifications"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
                         </div>
                         <div id="notif-list"></div>
                     </div>
                 </div>
-                <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
-                <button id="btn-settings" title="Settings">⚙</button>
+                <button id="btn-bookmarks-global" title="Bookmarks" class="hidden"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9Z"/></svg></button>
+                <button id="btn-settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="m9 3-.5 2-2 1-2-.5-2 3 1.5 1.5v3L3 14.5l2 3 2-.5 2 1 .5 2h4l.5-2 2-1 2 .5 2-3-1.5-1.5v-3L21 8.5l-2-3-2 .5-2-1-.5-2Z"/></svg></button>
             </div>
         </header>
+        <div hidden aria-hidden="true" id="legacy-branch-actions">
+            <button id="btn-new-thread" type="button">New Branch</button>
+            <button id="btn-pin-current-branch" type="button">Pin Branch</button>
+            <button id="btn-branch-pins" type="button">Pins <span id="branch-pin-count">0</span></button>
+            <button id="btn-to-tree" type="button" class="hidden">Tree View</button>
+        </div>
 
         <!-- Global bookmarks dropdown (visible from chat/tree) -->
         <div id="bookmarks-panel-global" class="hidden">
-            <div class="bookmarks-panel-header"><span>Bookmarks</span></div>
+            <div class="bookmarks-panel-header"><span>Bookmarks</span><button id="bookmarks-close" type="button" class="popup-control" title="Close saved pins" aria-label="Close saved pins"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
             <div id="bookmarks-list-global"></div>
         </div>
 
@@ -81,24 +113,42 @@
                 <!-- Conversations Section -->
                 <div class="home-section">
                     <div class="home-section-header">
-                        <span class="home-section-label">Conversations</span>
+                        <span class="home-section-label">Trees</span>
                         <div class="home-section-actions">
                             <button class="btn-small" id="btn-import-conv">Import</button>
                             <button class="btn-small" id="btn-new-conv-home">+ New</button>
                         </div>
                     </div>
                     <div id="home-search-container">
-                        <input type="text" id="home-search-input" placeholder="Search conversations..." autocomplete="off" spellcheck="false">
+                        <div class="home-search-line">
+                            <input type="text" id="home-search-input" placeholder="Search conversations..." autocomplete="off" spellcheck="false">
+                            <button type="button" class="btn-small" id="btn-search-space-open" title="Search across classified workspaces by meaning">✦ Search Space</button>
+                        </div>
                         <div id="home-search-results" class="hidden"></div>
+                        <section id="search-space-panel" class="hidden" aria-labelledby="search-space-title">
+                            <div class="search-space-head">
+                                <div><h3 id="search-space-title">Search Space</h3><p>Find a past discussion, then refine your search in conversation.</p></div>
+                                <div class="search-space-head-actions">
+                                    <button type="button" class="btn-small" id="btn-search-space-new" title="Start a fresh search">New search</button>
+                                    <button type="button" id="btn-search-space-close" title="Close">×</button>
+                                </div>
+                            </div>
+                            <details id="search-space-scope-settings"><summary>Search scope</summary><div id="search-space-workspaces"></div></details>
+                            <div id="search-space-transcript" role="log" aria-label="Search conversation" aria-live="polite"></div>
+                            <label for="search-space-question">What are you trying to remember?</label>
+                            <textarea id="search-space-question" rows="3" placeholder="The project where we fixed the migration but the queue still behaved strangely…"></textarea>
+                            <div class="search-space-actions"><span id="search-space-route"></span><button type="button" class="btn-small" id="btn-search-space-run">Send</button></div>
+                            <div id="search-space-status" role="status"></div>
+                            <div id="search-space-answer"></div>
+                            <div id="search-space-sources"></div>
+                        </section>
                     </div>
                     <div id="conv-filter-bar">
                         <button class="conv-filter-btn active" data-filter="all">All</button>
                         <button class="conv-filter-btn" data-filter="claude" title="Claude Code in the browser via Anthropic API">Loom {All Agents}</button>
-                        <button class="conv-filter-btn" data-filter="nrol" title="NROL Alpha Omega epistemic engine operator">NROL {ΑΩ}</button>
+                        
                         <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Llama model">Braid {Local Agents}</button>
-                        <button class="conv-filter-btn" data-filter="hermes" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</button>
                         <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave {Chat}</button>
-                        <button class="conv-filter-btn" data-filter="dream" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space {Agent}</button>
                     </div>
                     <div id="conv-list"></div>
                     <div id="home-empty" style="display:none;">
@@ -197,25 +247,69 @@
                 <div id="tree-state-cards-list"></div>
             </div>
             <div id="canvas-fullview" class="hidden">
-                <iframe id="canvas-fullview-iframe"></iframe>
+                <iframe id="canvas-fullview-iframe" sandbox="allow-scripts allow-same-origin allow-modals allow-downloads"></iframe>
             </div>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
             </div>
         </div>
 
+        <div id="view-search" class="view">
+            <nav class="workspace-actions"><button type="button" id="workspace-search-library">Library</button><button type="button" id="workspace-search-chat">Chat</button></nav>
+            <div id="workspace-search-host"></div>
+        </div>
+
         <!-- View: Chat -->
         <div id="view-chat" class="view">
+            <nav id="chat-workspace-toolbar" aria-label="Chat workspace">
+                <button type="button" id="workspace-toggle-left" aria-controls="workspace-left" aria-expanded="false">Branches</button>
+                <button type="button" id="workspace-projects" aria-controls="workspace-project-panel" aria-expanded="false">Trees</button>
+                <button type="button" id="workspace-library">Forest</button>
+                <button type="button" id="workspace-tree">Tree View</button>
+                <button type="button" id="workspace-search" class="hidden">Search</button>
+                <button type="button" id="workspace-toggle-canvas" aria-controls="workspace-canvas-pane" aria-expanded="false">Canvas</button>
+                <button type="button" id="workspace-toggle-pins" aria-controls="workspace-message-pins" aria-expanded="false" title="Saved messages">Leaves</button>
+                <button type="button" id="workspace-toggle-right" aria-controls="workspace-right" aria-expanded="false">Workspace</button>
+                <button type="button" id="workspace-goals" class="hidden">Goals</button>
+            </nav>
+            <div id="workspace-new-chat-settings" hidden>
+                <label for="workspace-new-model">Model</label><select id="workspace-new-model"></select>
+                <label for="workspace-new-effort">Thinking</label><select id="workspace-new-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high" selected>High</option><option value="xhigh">Extra high</option></select>
+                <span>New chat · ExoHome</span>
+            </div>
+            <div id="chat-workspace-body">
+            <aside id="workspace-left" aria-label="Current space branches" hidden>
+                <div class="workspace-actions" id="workspace-branch-tools"><button type="button" id="workspace-new-chat">New Branch</button><button type="button" id="workspace-pin-current">Pin Branch</button></div>
+                <input id="workspace-branch-filter" type="search" aria-label="Filter branches" placeholder="Find a branch">
+                <section id="workspace-project-panel" hidden>
+                <div class="workspace-actions"><button type="button" id="workspace-new-space">New Tree</button><button type="button" id="workspace-pin-tree">Pin Tree</button></div>
+                <input id="workspace-conversation-filter" type="search" aria-label="Search trees" placeholder="Find a tree">
+                <div id="workspace-conversations"></div>
+                </section>
+                <h3 id="workspace-branch-heading">Branches</h3>
+                <div id="workspace-branches"></div>
+            </aside>
+            <div id="workspace-chat-column">
             <div id="messages-container">
                 <div id="messages"></div>
-                <div id="generation-status" class="hidden">
-                    <div class="gen-status-dot"></div>
-                    <span id="gen-status-spinner" class="hidden"></span>
-                    <span id="gen-status-text">Sending...</span>
-                </div>
-                <div id="streaming-indicator" class="hidden">
-                    <span class="typing-cursor"></span>
-                </div>
+            </div>
+            </div>
+            <div id="workspace-canvas-resizer" role="separator" aria-label="Resize Canvas" aria-orientation="vertical" tabindex="0" hidden></div>
+            <aside id="workspace-canvas-pane" aria-label="Canvas working area" hidden>
+                <div class="workspace-actions"><strong>Canvas</strong><button type="button" id="workspace-canvas-pane-enable">Enable Canvas</button><button type="button" id="workspace-canvas-close">Close</button></div>
+                <iframe id="workspace-canvas-pane-iframe" title="Canvas working area" sandbox="allow-scripts allow-same-origin allow-modals allow-downloads" hidden></iframe>
+            </aside>
+            <aside id="workspace-right" aria-label="Workspace artifacts and activity" hidden>
+                <h3>Workspace</h3><p id="workspace-path"></p>
+                <div class="workspace-actions"><button type="button" id="workspace-artifacts-refresh">Refresh artifacts</button></div>
+                <p id="workspace-activity" role="status"></p>
+                <p id="workspace-usage" role="status"></p>
+                <h3>Artifacts</h3><div id="workspace-artifacts"></div>
+                <h3>Files</h3><div id="workspace-files"></div>
+                <details><summary>Git status and history</summary><button type="button" id="workspace-git-refresh">Refresh Git</button><pre id="workspace-git">Open to inspect this workspace.</pre></details>
+                <h3>Canvas</h3><button type="button" id="workspace-canvas-enable">Enable Canvas</button>
+                <iframe id="workspace-canvas-iframe" title="Workspace Canvas" sandbox="allow-scripts allow-same-origin allow-modals allow-downloads" hidden></iframe>
+            </aside>
             </div>
         </div>
 
@@ -235,6 +329,11 @@
                 </div>
             </div>
             <div id="image-preview" class="hidden"></div>
+            <div id="retired-harness-notice" class="hint hidden" role="status">
+                This harness is retired. History is preserved. Choose a replacement model in
+                <button type="button" class="btn-mini" onclick="document.getElementById('btn-settings').click()">Settings</button>
+                and save to continue.
+            </div>
             <div id="reply-quote-bar" class="hidden" title="Click to jump to the quoted message">
                 <span class="reply-quote-icon">&#x21A9;</span>
                 <div class="reply-quote-body">
@@ -243,18 +342,15 @@
                 </div>
                 <button id="btn-reply-quote-clear" title="Remove quoted excerpt">&#x2715;</button>
             </div>
-            <div id="describe-context-bar" class="hidden">
-                <label for="describe-context" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
+            <details id="describe-context-bar" class="hidden">
+                <summary>Describe focus</summary>
+                <label class="hidden" for="describe-context" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
                 <textarea id="describe-context" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false"></textarea>
-            </div>
+            </details>
             <div id="weave-inline-controls" class="hidden">
                 <select id="weave-model-inline" title="Llama Server model">
                     <option value="">Default</option>
                 </select>
-                <label class="incognito-toggle" title="Incognito — route through Prometheus (always-warm, cloud fallback, no soul). Otherwise the ensouled attendant refuses if its model is down.">
-                    <input type="checkbox" id="incognito-toggle-weave">
-                    <span class="incognito-toggle-label">Incognito</span>
-                </label>
                 <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
                     <input type="checkbox" id="ooda-toggle-inline">
                     <span class="ooda-toggle-label">OODA</span>
@@ -266,13 +362,6 @@
                     <span class="branch-count-value" id="branch-count-value">1</span>
                 </div>
             </div>
-            <div id="dream-inline-controls" class="hidden">
-                <select id="dream-model-inline" title="Dream Engine DiffusionGemma model"></select>
-                <label class="incognito-toggle" title="Incognito — route through Prometheus (always-warm, cloud fallback, no soul). Otherwise the ensouled attendant refuses if its model is down.">
-                    <input type="checkbox" id="incognito-toggle-dream">
-                    <span class="incognito-toggle-label">Incognito</span>
-                </label>
-            </div>
             <div id="cc-inline-controls" class="hidden">
                 <select id="cc-model-inline" title="Model"></select>
                 <select id="cc-effort-inline" title="Thinking effort">
@@ -282,12 +371,29 @@
                     <option value="xhigh">Extra High</option>
                     <option value="max">Max</option>
                 </select>
-                <select id="cc-permission-mode-inline" title="Permission mode">
-                    <option value="default">Act</option>
-                    <option value="plan">Plan</option>
-                </select>
                 <button id="btn-canvas-toggle" class="hidden" title="Toggle Canvas view">Canvas</button>
                 <span id="canvas-slug-pill" class="canvas-slug-pill hidden" title="Click to copy direct canvas URL"></span>
+                <div id="agent-manager-anchor" class="agent-manager-anchor hidden">
+                    <button type="button" id="btn-agent-manager" class="agent-manager-toggle" title="Manage Loom subagents" aria-expanded="false" aria-controls="agent-manager-panel">
+                        <span>Agents</span>
+                        <span id="agent-dock-status">No active tasks</span>
+                        <span id="agent-manager-count" class="agent-manager-count hidden" aria-label="Active subagents"></span>
+                    </button>
+                    <button type="button" id="agent-dock-attention" class="hidden" aria-controls="agent-manager-panel"></button>
+                    <section id="agent-manager-panel" class="agent-manager-panel hidden" aria-label="Subagent manager" aria-live="polite">
+                        <div class="agent-manager-header">
+                            <div>
+                                <strong>Subagents</strong>
+                                <span>Durable Loom-managed runs</span>
+                            </div>
+                            <div class="agent-manager-header-actions">
+                                <button type="button" id="agent-activity-refresh" title="Refresh subagents">↻</button>
+                                <button type="button" id="agent-manager-close" title="Close subagent manager">&times;</button>
+                            </div>
+                        </div>
+                        <div id="agent-activity-list" class="agent-manager-list"></div>
+                    </section>
+                </div>
             </div>
             <div id="input-row">
                 <label id="btn-attach" title="Attach file">
@@ -310,10 +416,8 @@
                 <div id="mode-toggle" class="toggle-group">
                     <button class="toggle-btn active" data-value="claude">Loom</button>
                     <button class="toggle-btn" data-value="local">Braid</button>
-                    <button class="toggle-btn" data-value="hermes">Hermes</button>
                     <button class="toggle-btn" data-value="weave">Weave</button>
-                    <button class="toggle-btn" data-value="dream" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space</button>
-                    <button class="toggle-btn" data-value="nrol" title="NROL-AO epistemic engine operator — file/shell tools stripped, typed transitions only">NROL-AO</button>
+                    
                 </div>
             </div>
             <div class="form-group hidden" id="local-model-group">
@@ -408,50 +512,16 @@
         <div class="modal-content">
             <h2>Settings</h2>
             <div id="settings-tabs" class="toggle-group settings-toggle">
-                <button class="toggle-btn active" data-settings-tab="model">Model &amp; Generation</button>
-                <button class="toggle-btn" data-settings-tab="servers">Servers</button>
-                <button class="toggle-btn" data-settings-tab="display">Display</button>
-                <button class="toggle-btn" data-settings-tab="openrouter">OpenRouter</button>
-                <button class="toggle-btn" data-settings-tab="advanced">Advanced</button>
+                <button class="toggle-btn active" data-settings-tab="model">Conversation</button>
+                <button class="toggle-btn" data-settings-tab="permissions">Permissions</button>
+                <button class="toggle-btn" data-settings-tab="display">Appearance</button>
+                                <button class="toggle-btn" data-settings-tab="usage">Usage</button>
             </div>
             <div id="settings-loading-status" class="settings-loading-status hidden">Loading settings...</div>
 
             <!-- Model & Generation -->
             <div id="settings-model" class="settings-section">
-                <div class="settings-divider"><span>Generation defaults</span></div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-temp">Temperature <span class="field-help" tabindex="0" aria-label="Temperature help" data-tip="Default randomness for direct local llama calls. Higher is looser and more surprising; lower is steadier. Weave uses it through llama_client. Braid/Hermes provider CLIs may ignore it if their adapter controls sampling.">?</span></label>
-                        <input type="number" id="cfg-temp" step="0.05" min="0" max="2">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-top-p">Top P <span class="field-help" tabindex="0" aria-label="Top P help" data-tip="Nucleus sampling cutoff for direct local llama calls. Lower narrows word choice; higher allows more variety. Usually leave near 0.9 unless a local model rambles or gets flat.">?</span></label>
-                        <input type="number" id="cfg-top-p" step="0.01" min="0" max="1">
-                    </div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-max-tokens">Max Tokens <span class="field-help" tabindex="0" aria-label="Max Tokens help" data-tip="Default output cap for direct local calls and helper passes. Weave has its own output-token override below. Claude, Codex, Gemini, Goose, and similar provider modes use their own caps.">?</span></label>
-                        <input type="number" id="cfg-max-tokens" step="256" min="64" max="131072">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-repeat-penalty">Repeat Penalty <span class="field-help" tabindex="0" aria-label="Repeat Penalty help" data-tip="Local llama anti-loop pressure. Higher discourages repeated phrases and scenes; too high can make wording brittle. Mainly affects direct llama generation such as Weave.">?</span></label>
-                        <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
-                    </div>
-                </div>
-
-                <div class="settings-divider"><span>Conversation Context</span></div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-context">Max Context Tokens <span class="hint">(weave/braid context budget)</span> <span class="field-help" tabindex="0" aria-label="Max Context Tokens help" data-tip="Budget before Loom summarizes older branch history. Weave and Braid/local context prep use this most. Higher preserves more branch history but costs memory and prompt time.">?</span></label>
-                        <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-verbatim">Verbatim Window <span class="hint">(turns kept word-for-word)</span> <span class="field-help" tabindex="0" aria-label="Verbatim Window help" data-tip="Number of newest branch messages kept exact when context is compacted. Higher preserves recent detail; lower leaves more room for older summarized context.">?</span></label>
-                        <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
-                    </div>
-                </div>
-
+                <p class="hint">Model and response options for the open conversation. Shared local generation defaults are in Admin Settings.</p>
                 <div class="settings-divider" id="cfg-conv-overrides-divider"><span>This conversation <span class="hint" id="cfg-overrides-divider-hint"></span></span></div>
                 <div class="form-group toggle-row" id="cfg-parallel-agents-group">
                     <label for="cfg-parallel-agents-enabled">
@@ -461,16 +531,27 @@
                     </label>
                 </div>
                 <!-- Loom (claude) overrides -->
+                <div class="form-group" id="cfg-permission-policy-group">
+                    <label for="cfg-permission-profile">Tool approvals for this conversation</label>
+                    <select id="cfg-permission-profile" class="form-select" aria-describedby="cfg-permission-profile-hint">
+                        <option value="strict">Strict — workspace reads; ask for edits and commands</option>
+                        <option value="balanced">Balanced — workspace reads and edits; ask for commands</option>
+                        <option value="trusted">Trusted — allow workspace reads, edits, and commands</option>
+                        <option value="trust_review">Full Trust</option>
+                    </select>
+                    <span class="hint" id="cfg-permission-profile-hint">Applies to requests sent to Loom, not native auto-approved tools. Native safeguards and role restrictions still apply. Strict/Balanced/Trusted ask for outside-path, network, and unknown requests. Trust — destructive review only automatically allows those too; only recognized destructive operations ask, always one-time. Unrecognized destructive scripts can pass. Existing branch rules expire on revocation or server restart.</span>
+                    <div id="cfg-permission-rules" aria-live="polite"></div>
+                </div>
                 <div class="settings-overrides" id="cfg-overrides-loom">
                     <div class="form-group">
-                        <label for="cfg-cc-model">Loom Model <span class="field-help" tabindex="0" aria-label="Loom Model help" data-tip="Per-conversation provider model for Loom agent spaces: Claude, Codex, Gemini, Goose, OpenRouter, and related entries. This does not change the model loaded in llama-server.">?</span></label>
+                        <label for="cfg-cc-model">Model <span class="field-help" tabindex="0" aria-label="Loom Model help" data-tip="Per-conversation provider model for Loom agent spaces: Claude, Codex, Gemini, Goose, OpenRouter, and related entries. This does not change the model loaded in llama-server.">?</span></label>
                         <div class="label-with-action">
-                            <button type="button" class="btn-mini" id="btn-refresh-cc-models" title="Query Anthropic API to refresh model version labels">↻ Refresh</button>
+                            <button type="button" class="btn-mini" id="btn-refresh-cc-models" title="Refresh cloud & agent models (Claude, Antigravity, Codex)">↻ Refresh</button>
                         </div>
                         <select id="cfg-cc-model" class="form-select"></select>
                     </div>
                     <div class="form-group" id="cfg-cc-effort-group">
-                        <label for="cfg-cc-effort">Thinking Effort <span class="field-help" tabindex="0" aria-label="Thinking Effort help" data-tip="Provider-side reasoning budget where supported. Higher can help hard coding or planning tasks but takes longer and can cost more tokens. Local llama selectors do not use this knob.">?</span></label>
+                        <label for="cfg-cc-effort">Reasoning effort <span class="field-help" tabindex="0" aria-label="Thinking Effort help" data-tip="Provider-side reasoning budget where supported. Higher can help hard coding or planning tasks but takes longer and can cost more tokens. Local llama selectors do not use this knob.">?</span></label>
                         <select id="cfg-cc-effort" class="form-select">
                             <option value="low">Low</option>
                             <option value="medium">Medium</option>
@@ -479,36 +560,22 @@
                             <option value="max">Max (Opus only)</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label for="cfg-cc-permission">Permission Mode <span class="field-help" tabindex="0" aria-label="Permission Mode help" data-tip="Act lets supported agents request and run tools through Loom approvals. Plan keeps supported agents in planning mode until you switch back. Codex and Gemini hide this when it does not apply.">?</span></label>
-                        <select id="cfg-cc-permission" class="form-select">
-                            <option value="default">Act</option>
-                            <option value="plan">Plan</option>
-                        </select>
-                    </div>
                 </div>
                 <!-- Braid (local CC) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-braid">
                     <div class="form-group">
-                        <label for="cfg-braid-model">Braid Local Model <span class="field-help" tabindex="0" aria-label="Braid Local Model help" data-tip="Per-conversation local model for Braid, the Claude Code-style agent routed through llama-server. Choosing a llama model here can restart llama-server with that model.">?</span></label>
+                        <label for="cfg-braid-model">Braid model <span class="field-help" tabindex="0" aria-label="Braid Local Model help" data-tip="Per-conversation local model for Braid, the Claude Code-style agent routed through llama-server. Choosing a llama model here can restart llama-server with that model.">?</span></label>
                         <select id="cfg-braid-model" class="form-select"></select>
-                    </div>
-                </div>
-                <!-- Hermes (ACP agent) overrides -->
-                <div class="settings-overrides" id="cfg-overrides-hermes">
-                    <div class="form-group">
-                        <label for="cfg-hermes-model">Hermes Local Model <span class="field-help" tabindex="0" aria-label="Hermes Local Model help" data-tip="Per-conversation llama model for the Hermes ACP agent. It uses the live llama attendant, so the selected model must be running unless Incognito routes through Prometheus.">?</span></label>
-                        <select id="cfg-hermes-model" class="form-select"></select>
                     </div>
                 </div>
                 <!-- Weave overrides -->
                 <div class="settings-overrides" id="cfg-overrides-weave">
                     <div class="form-group">
-                        <label for="cfg-weave-model">Weave Local Model <span class="field-help" tabindex="0" aria-label="Weave Local Model help" data-tip="Per-conversation model for Weave chat. It can use the loaded llama-server model, Dream when the Dream sidecar is up, or OpenRouter entries when enabled.">?</span></label>
+                        <label for="cfg-weave-model">Weave model <span class="field-help" tabindex="0" aria-label="Weave Local Model help" data-tip="Per-conversation model for Weave chat. It can use the loaded llama-server model, Dream when the Dream sidecar is up, or OpenRouter entries when enabled.">?</span></label>
                         <select id="cfg-weave-model" class="form-select"></select>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-weave-max-tokens">Weave Output Tokens <span class="field-help" tabindex="0" aria-label="Weave Output Tokens help" data-tip="Caps Weave and OODA generation length. Lower keeps turns compact; higher allows long RP or repair passes. This does not change provider-agent output caps.">?</span></label>
+                        <label for="cfg-weave-max-tokens">Weave response limit <span class="field-help" tabindex="0" aria-label="Weave Output Tokens help" data-tip="Caps Weave and OODA generation length. Lower keeps turns compact; higher allows long RP or repair passes. This does not change provider-agent output caps.">?</span></label>
                         <input type="number" id="cfg-weave-max-tokens" step="256" min="64" max="32768" placeholder="2048">
                     </div>
                     <div class="form-group hidden" id="cfg-weave-system-prompt-group">
@@ -524,50 +591,54 @@
                 <!-- Dream Engine (DiffusionGemma) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-dream">
                     <div class="form-group">
-                        <label for="cfg-dream-model">Dream Engine Model <span class="field-help" tabindex="0" aria-label="Dream Engine Model help" data-tip="Dream Space uses Hermes ACP pointed at the Dream DiffusionGemma sidecar. This is separate from llama-server and only works when Dream is up.">?</span></label>
-                        <select id="cfg-dream-model" class="form-select"></select>
-                    </div>
-                    <div class="form-group">
                         <label for="cfg-dream-min-output-tokens">Minimum Output Tokens <span class="hint">(256-token canvas blocks)</span> <span class="field-help" tabindex="0" aria-label="Dream minimum output help" data-tip="Dream-only floor for generation length. Helps diffusion canvas blocks complete, but can make short replies slow or verbose.">?</span></label>
                         <input type="number" id="cfg-dream-min-output-tokens" min="256" step="256" placeholder="2048">
                     </div>
                 </div>
             </div>
 
-            <!-- Servers -->
-            <div id="settings-servers" class="settings-section hidden">
-                <div class="hint" style="margin-bottom:0.5rem">Status updates every 5s.</div>
-                <div class="server-grid" id="cfg-server-grid">
-                    <div class="server-row" data-server="admin">
-                        <span class="server-light" data-state="unknown"></span>
-                        <a href="https://localhost:3002" target="_blank" rel="noopener" class="server-link">Admin Dashboard</a>
-                        <span class="server-port">:3002</span>
-                    </div>
-                    <div class="server-row" data-server="llama">
-                        <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:11434" target="_blank" rel="noopener" class="server-link">Llama Server</a>
-                        <span class="server-port">:11434</span>
-                    </div>
-                    <div class="server-row" data-server="nrol">
-                        <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:8098" target="_blank" rel="noopener" class="server-link">NROL-AO Dashboard</a>
-                        <span class="server-port">:8098</span>
-                    </div>
-                    <div class="server-row" data-server="comfyui">
-                        <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:8188" target="_blank" rel="noopener" class="server-link">ComfyUI</a>
-                        <span class="server-port">:8188</span>
-                    </div>
-                </div>
+            <div id="settings-permissions" class="settings-section hidden">
+                <p class="hint">New conversations use the default trust level in Admin Settings. Existing conversations keep their saved profile. Pending approvals appear in the notification bell for every profile.</p>
+            </div>
+            <div id="settings-usage" class="settings-section hidden">
+                <p class="hint">Account quotas and OpenRouter spending. Refreshing usage starts no model turns.</p>
+                <section id="provider-usage-monitor">
+                    <div class="settings-divider"><span>Subscription quotas</span></div>
+                    <button type="button" class="btn-mini" id="btn-provider-usage-refresh">Refresh quotas</button>
+                    <div id="provider-usage-cards"></div>
+                    <p id="provider-usage-status" class="hint" role="status">Usage has not been loaded.</p>
+                </section>
+                <section id="settings-openrouter-monitor">
+                    <div class="settings-divider"><span>OpenRouter spending</span></div>
+                    <button type="button" class="btn-mini" id="btn-settings-openrouter-refresh">Refresh spending</button>
+                    <div id="settings-openrouter-periods" class="settings-usage-grid"></div>
+                    <p id="settings-openrouter-status" class="hint" role="status">Usage has not been loaded.</p>
+                    <p id="settings-openrouter-account" class="hint"></p>
+                </section>
             </div>
 
             <!-- Display -->
             <div id="settings-display" class="settings-section hidden">
+                <fieldset id="appearance-controls">
+                    <legend>Loom visual style</legend>
+                    <div class="appearance-fields">
+                        <label>Style<select id="appearance-theme"><option value="legacy">Legacy Loom</option><option value="exoloom">Exoloom</option></select></label>
+                        <label>Text font<select id="appearance-font"><option value="readable">Space Grotesk · readable</option><option value="orbitron">Orbitron · portal lettering</option><option value="mono">Monospace</option></select></label>
+                        <label>Exoloom background<select id="appearance-scene"><option value="reference">Supplied artwork (exact)</option><option value="animated">Live portal renderer</option><option value="video">Video loop (30 fps)</option></select></label>
+                        <label>Black-hole palette<select id="appearance-color"><option value="reference">Portal preset (unaltered)</option><option value="original">Original spectrum</option><option value="cyan">Neon cyan</option><option value="violet">Violet</option><option value="ember">Ember</option><option value="crimson">Crimson</option><option value="mint">Mint</option></select></label>
+                        <label>Animation frame limit<select id="appearance-fps"><option value="20">20 fps · battery saver</option><option value="30">30 fps</option><option value="60">60 fps</option></select></label>
+                    </div>
+                    <div class="appearance-toggles">
+                        <label><input type="checkbox" id="appearance-stationary">Pause camera orbit</label>
+                    </div>
+                    <button type="button" class="btn-secondary" id="appearance-reset">Reset appearance</button>
+                    <p class="hint">Animation is the Exoloom default. These options apply to this browser. Configure orbits, camera, disk, nebula and floor in Admin → Settings → Background studio. Video loops have a fixed palette and camera at 30 fps; renderer controls apply to Live mode. Reduced motion uses a still image.</p>
+                </fieldset>
                 <div class="form-group toggle-row">
                     <label for="cfg-blackhole">
                         <input type="checkbox" id="cfg-blackhole" checked>
                         Blackhole background
-                        <span class="hint">(WebGL Schwarzschild raytracer — disable for less GPU/CPU load)</span>
+                        <span class="hint">(still artwork or animated black hole — disable to hide the background)</span>
                     </label>
                 </div>
                 <div class="form-group toggle-row">
@@ -577,167 +648,8 @@
                         <span class="hint">(live streaming diagnostics — off by default; the overlay still surfaces a warning automatically when chunks are dropped or the stream is stuck)</span>
                     </label>
                 </div>
-                <div class="form-group toggle-row">
-                    <label for="cfg-enable-umans-models">
-                        <input type="checkbox" id="cfg-enable-umans-models">
-                        Show deprecated Umans models
-                        <span class="hint">(off by default; OpenRouter replaces these)</span>
-                    </label>
-                </div>
-                <div class="hint" style="margin-top:0.5rem">Tree node glow controls will land here next.</div>
             </div>
-
-            <!-- OpenRouter -->
-            <div id="settings-openrouter" class="settings-section hidden">
-                <div class="settings-divider"><span>Secrets</span></div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-openrouter-api-key">Inference API Key</label>
-                        <input type="password" id="cfg-openrouter-api-key" autocomplete="off" placeholder="Leave blank to keep current key">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-openrouter-management-key">Management Key</label>
-                        <input type="password" id="cfg-openrouter-management-key" autocomplete="off" placeholder="Leave blank to keep current key">
-                    </div>
-                </div>
-                <div class="label-with-action">
-                    <span class="settings-subhead">Saved key status is shown below; raw keys are never displayed again.</span>
-                    <button type="button" class="btn-mini" id="btn-save-openrouter-secrets">Save Keys</button>
-                </div>
-                <div id="openrouter-secrets-error" class="settings-warning hidden"></div>
-
-                <div class="settings-divider"><span>Budget guardrails</span></div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-openrouter-weekly-limit">Weekly Limit USD</label>
-                        <input type="number" id="cfg-openrouter-weekly-limit" step="0.50" min="0">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-openrouter-monthly-limit">Monthly Limit USD</label>
-                        <input type="number" id="cfg-openrouter-monthly-limit" step="1" min="0">
-                    </div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-openrouter-prompt-price">Max Prompt $/1M</label>
-                        <input type="number" id="cfg-openrouter-prompt-price" step="0.01" min="0">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-openrouter-completion-price">Max Output $/1M</label>
-                        <input type="number" id="cfg-openrouter-completion-price" step="0.01" min="0">
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label for="cfg-openrouter-base-url">OpenRouter Base URL</label>
-                    <input type="text" id="cfg-openrouter-base-url" placeholder="https://openrouter.ai/api/v1">
-                </div>
-                <div class="label-with-action">
-                    <span class="settings-subhead">Usage</span>
-                    <button type="button" class="btn-mini" id="btn-refresh-openrouter-usage">Refresh</button>
-                </div>
-                <div class="openrouter-usage-grid" id="openrouter-usage-grid">
-                    <div><span>Inference key</span><strong id="or-api-key-status">unknown</strong></div>
-                    <div><span>Management key</span><strong id="or-management-key-status">unknown</strong></div>
-                    <div><span>Weekly spend</span><strong id="or-weekly-usage">unknown</strong></div>
-                    <div><span>Monthly spend</span><strong id="or-monthly-usage">unknown</strong></div>
-                    <div><span>Account used</span><strong id="or-account-used">unknown</strong></div>
-                    <div><span>Credits left</span><strong id="or-credits-left">unknown</strong></div>
-                </div>
-                <div id="openrouter-usage-error" class="settings-warning hidden"></div>
-            </div>
-
- <!-- Advanced -->
-            <div id="settings-advanced" class="settings-section hidden">
-                <div class="form-group">
-                    <label for="cfg-host">Llama Server Host <span class="field-help" tabindex="0" aria-label="Llama Server Host help" data-tip="OpenAI-compatible llama endpoint Loom calls. Weave uses it directly; Braid and Hermes route local-agent traffic through it. Changing this only helps if a server is listening there.">?</span></label>
-                    <input type="text" id="cfg-host" placeholder="http://localhost:11434">
-                </div>
-                <div class="form-group">
-                    <div class="label-with-action">
-                        <label for="cfg-llama-model-select">Model (from models folder) <span class="field-help" tabindex="0" aria-label="Llama model file help" data-tip="Saved default GGUF for llama-server. Braid, Hermes, and Weave use this when the conversation has no override. Use Apply & Restart to actually load it.">?</span></label>
-                        <button type="button" class="btn-mini" id="btn-refresh-models" title="Re-scan disk and re-fetch the loaded-model list">↻ Refresh</button>
-                    </div>
-                    <select id="cfg-llama-model-select" class="form-select"></select>
-                </div>
-                <div id="llama-runtime-status" class="llama-runtime-status">
-                    <div><span>Server</span><strong id="llama-runtime-state">unknown</strong></div>
-                    <div><span>Loaded</span><strong id="llama-runtime-loaded">unknown</strong></div>
-                    <div><span>Saved config</span><strong id="llama-runtime-configured">unknown</strong></div>
-                    <div><span>Runtime ctx</span><strong id="llama-runtime-ctx">unknown</strong></div>
-                    <div class="llama-runtime-wide"><span>Selected settings</span><strong id="llama-runtime-saved-settings">unknown</strong></div>
-                </div>
-                <div class="form-group">
-                    <div class="label-with-action">
-                        <label for="cfg-llama-server-exe">Llama Server Path <span class="field-help" tabindex="0" aria-label="Llama Server Path help" data-tip="Executable used by the admin restart button. This does not change an already-running llama-server until you apply and restart.">?</span></label>
-                        <button type="button" class="btn-mini" id="btn-llama-restart" title="Save settings, then stop and restart Llama Server with the selected model.">↻ Apply &amp; Restart</button>
-                    </div>
-                    <input type="text" id="cfg-llama-server-exe" placeholder="e.g. C:\LlamaServer\bin\llama-server.exe">
-                </div>
-
-                <!-- Per-model tuning panel -->
-                <div id="model-tuning-panel" class="tuning-card" style="margin-top:1rem">
-                    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;font-weight:600" onclick="const f=document.getElementById('model-tuning-fields');f.classList.toggle('hidden')">
-                        <span style="font-size:0.95rem">Model Settings <span class="hint" id="model-tuning-model-name">(select a model)</span></span>
-                        <span class="hint">▼</span>
-                    </div>
-                    <div id="model-tuning-fields" class="hidden">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="cfg-mc-ctx-size">Context Size <span class="field-help" tabindex="0" aria-label="Context Size help" data-tip="llama-server context window for this GGUF at launch. Higher lets Weave, Braid, and Hermes fit more prompt but uses much more KV-cache memory. Runtime ctx above shows what is actually loaded.">?</span></label>
-                                <input type="number" id="cfg-mc-ctx-size" step="2048" min="2048" max="1048576">
-                            </div>
-                            <div class="form-group">
-                                <label for="cfg-mc-ngl">GPU Layers <span class="hint">(999 = all that fits)</span> <span class="field-help" tabindex="0" aria-label="GPU Layers help" data-tip="How many model layers llama-server offloads to GPU. More is usually faster and uses more VRAM. If launch fails or VRAM is tight, lower this.">?</span></label>
-                                <input type="number" id="cfg-mc-ngl" min="0" max="999" placeholder="999">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="cfg-mc-kv-quant">KV Cache Quant <span class="hint">(saves VRAM)</span> <span class="field-help" tabindex="0" aria-label="KV Cache Quant help" data-tip="Quantizes the attention cache used by long context. K8_0 saves VRAM with modest quality risk; none uses more memory. This affects local llama-backed modes after restart.">?</span></label>
-                                <select id="cfg-mc-kv-quant" class="form-select"></select>
-                            </div>
-                            <div class="form-group">
-                                <label for="cfg-mc-threads">Threads <span class="field-help" tabindex="0" aria-label="Threads help" data-tip="CPU worker threads for llama-server. Auto is usually fine. Set manually when CPU-side layers or prompt ingestion are slow or unstable.">?</span></label>
-                                <input type="number" id="cfg-mc-threads" min="1" max="64" placeholder="auto">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="cfg-mc-batch">Batch Size <span class="field-help" tabindex="0" aria-label="Batch Size help" data-tip="Prompt-processing batch size for llama-server. Larger can ingest context faster but uses more memory. Lower it if startup or long prompts fail.">?</span></label>
-                                <input type="number" id="cfg-mc-batch" min="1" max="32768" placeholder="auto">
-                            </div>
-                            <div class="form-group">
-                                <label for="cfg-mc-ubatch">Upload Batch <span class="field-help" tabindex="0" aria-label="Upload Batch help" data-tip="Microbatch size for splitting llama-server work. Smaller values reduce memory spikes; larger values can improve throughput on a stable GPU setup.">?</span></label>
-                                <input type="number" id="cfg-mc-ubatch" min="1" max="32768" placeholder="auto">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group toggle-row">
-                                <label for="cfg-mc-flash-attn">
-                                    <input type="checkbox" id="cfg-mc-flash-attn" checked>
-                                    Flash Attention
-                                </label>
-                                <span class="field-help" tabindex="0" aria-label="Flash Attention help" data-tip="Faster, lower-memory attention path when the model and server build support it. Usually keep on; turn off if the selected GGUF or backend errors.">?</span>
-                            </div>
-                            <div class="form-group toggle-row">
-                                <label for="cfg-mc-mlock">
-                                    <input type="checkbox" id="cfg-mc-mlock">
-                                    Lock memory (no swap)
-                                </label>
-                                <span class="field-help" tabindex="0" aria-label="Lock Memory help" data-tip="Asks the OS to keep llama weights/cache out of swap. Can reduce stalls, but reserves RAM and may fail on memory-constrained systems.">?</span>
-                            </div>
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-mc-mmproj">Vision MMProj <span class="hint">(separate projector for multimodal models)</span> <span class="field-help" tabindex="0" aria-label="Vision MMProj help" data-tip="Projector file needed for compatible multimodal GGUFs. It enables image inputs for local llama vision paths; it is not a standalone chat model.">?</span></label>
-                            <select id="cfg-mc-mmproj" class="form-select"></select>
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-mc-extra">Extra args <span class="hint">(appended verbatim)</span> <span class="field-help" tabindex="0" aria-label="Extra Args help" data-tip="Raw llama-server CLI flags appended on restart. Powerful but easy to break; use for backend flags not represented by the form.">?</span></label>
-                            <input type="text" id="cfg-mc-extra" placeholder="--no-mmap">
-                        </div>
-                    </div>
-                </div>
-            </div>
+            <p class="settings-admin-note hint">Server connections, local sampling, model tuning, and provider configuration: <a id="settings-admin-link" target="_blank" rel="noopener">Admin Settings</a>.</p>
             <div class="modal-actions">
                 <button class="btn-secondary" data-close-modal>Cancel</button>
                 <button class="btn-primary" id="btn-save-settings">Save</button>
@@ -907,9 +819,24 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
-    <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=101"></script>
-    <script src="/static/chat.js?v=137"></script>
-    <script src="/static/tree.js?v=39"></script>
+    <script src="/static/exoloom/background.js?v=4"></script>
+    <script src="/static/exoloom/lettering.js?v=1"></script>
+    <script src="/static/exoloom/branding.js?v=4"></script>
+    <script src="/static/blackhole.js?v=16"></script>
+    <script src="/static/model-registry.js?v=1"></script>
+    <script src="/api/model-registry.js"></script>
+    <script src="/static/app.js?v=133"></script>
+    <script src="/static/coordination.js?v=2"></script>
+    <script src="/static/chat.js?v=201"></script>
+    <script src="/static/tree.js?v=42"></script>
+    <script src="/static/chat-workspace.js?v=19"></script>
+    <script src="/static/admin/provider-usage.js?v=5"></script>
+    <script src="/static/settings-usage.js?v=2"></script>
+    <link rel="stylesheet" href="/static/message-pins.css?v=4">
+    <link rel="stylesheet" href="/static/header-icons.css?v=1">
+    <link rel="stylesheet" href="/static/workspace-navigation.css?v=4">
+    <script src="/static/message-pins.js?v=4"></script>
+    <link rel="stylesheet" href="/static/usage-panel.css?v=2">
+    <script src="/static/usage-panel.js?v=1"></script>
 </body>
 </html>

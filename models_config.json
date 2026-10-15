@@ -12,18 +12,6 @@
     "extra_args": "",
     "server_model_id": null
   },
-  "AxionML-Qwen3.5-9B-NVFP4.gguf": {
-    "ctx_size": 262144,
-    "ngl": 999,
-    "kv_quant": "K8_0",
-    "threads": null,
-    "batch": null,
-    "ubatch": null,
-    "flash_attn": true,
-    "mlock": false,
-    "mmproj": "mmproj-BF16.gguf",
-    "extra_args": ""
-  },
   "mmproj-27B-BF16.gguf": {
     "ctx_size": 80000,
     "ngl": 999,
@@ -37,34 +25,8 @@
     "extra_args": "",
     "server_model_id": null
   },
-  "qwen3.5-4b-nvfp4.gguf": {
-    "ctx_size": 100000,
-    "ngl": 999,
-    "kv_quant": "K8_0",
-    "threads": null,
-    "batch": null,
-    "ubatch": null,
-    "flash_attn": true,
-    "mlock": false,
-    "mmproj": "mmproj-qwen3.5-4b-nvfp4-f16.gguf",
-    "extra_args": "",
-    "server_model_id": "qwen3.5-4b-nvfp4.gguf"
-  },
-  "mmproj-qwen3.5-4b-nvfp4-f16.gguf": {
-    "ctx_size": 80000,
-    "ngl": 999,
-    "flash_attn": true,
-    "kv_quant": "none",
-    "threads": null,
-    "batch": null,
-    "ubatch": null,
-    "mlock": false,
-    "mmproj": null,
-    "extra_args": "",
-    "server_model_id": null
-  },
   "Qwen3.8-27B-NVFP4-MTP-Q8attn.gguf": {
-    "ctx_size": 80000,
+    "ctx_size": 250000,
     "ngl": 999,
     "kv_quant": "K8_0",
     "threads": null,
@@ -73,7 +35,7 @@
     "flash_attn": true,
     "mlock": false,
     "mmproj": "mmproj-Qwen3.8-27B-NVFP4-BF16.gguf",
-    "extra_args": "--spec-type draft-mtp --cache-type-k-draft q8_0 --cache-type-v-draft q8_0",
+    "extra_args": "--spec-type draft-mtp --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 --spec-draft-n-max 2 --timeout 3600",
     "server_model_id": "Qwen3.8-27B-NVFP4-MTP-Q8attn.gguf"
   },
   "mmproj-Qwen3.8-27B-NVFP4-BF16.gguf": {

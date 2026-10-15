@@ -26,7 +26,7 @@ This document compiles the critical architectural and behavioral knowledge acqui
 ### Process Tree Terminations on Windows
 * Calling `proc.kill()` or `proc.terminate()` in Python on Windows only terminates the root process, leaving the child process tree running.
 * **Orphan Processes**: Stale background processes of `server.py` or `agy` hold locks on files and bind to ports (like port 3000), preventing new sessions from starting.
-* **OneDrive File Locks**: When the database file (e.g. `loom-Chester.db`) resides in a OneDrive folder, orphaned processes holding database connections trigger `WinError 395` (sync/locking errors), causing SQLite `unable to open database file` failures.
+* **OneDrive File Locks**: When the database file (e.g. `loom-the host.db`) resides in a OneDrive folder, orphaned processes holding database connections trigger `WinError 395` (sync/locking errors), causing SQLite `unable to open database file` failures.
 * **Mitigation**: Terminate the entire process tree using Windows taskkill commands (e.g., `taskkill /F /T /PID <pid>`) or send graceful shutdown commands via the API rather than hard-killing the parent process.
 
 ---
