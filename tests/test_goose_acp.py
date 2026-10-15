@@ -7,6 +7,22 @@ from contextlib import closing
 import pytest
 
 
+@pytest.fixture(autouse=True)
+async def drain_adapter_background_tasks(tmp_database):
+    """Finish this fixture's idle/queue callbacks before its database closes."""
+    import server
+    existing = set(server._background_tasks)
+    try:
+        yield
+    finally:
+        # Completed generation tasks enqueue their idle/queue callbacks on the
+        # next loop tick, after an adapter test's awaited task has returned.
+        await asyncio.sleep(0)
+        pending = [task for task in server._background_tasks - existing if not task.done()]
+        if pending:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=10)
+
+
 async def _create_goose_adapter_test_conversation(db, title, **kwargs):
     """Direct adapter tests opt out of the production serial-lane wrapper."""
     conv = await db.create_conversation(title, **kwargs)
