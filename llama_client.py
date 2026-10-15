@@ -415,7 +415,7 @@ def _build_messages(messages: list[dict], verbatim_window: Optional[int] = None)
 
     out: list[dict] = []
     for i, msg in enumerate(messages):
-        text = msg.get("content") or ""
+        text = (msg.get("content") or "").replace("\x00", "")
         img_paths = _parse_image_paths(msg.get("image_path"))
         inline_images = msg.get("images") or []
         is_recent = (i >= cutoff_idx)

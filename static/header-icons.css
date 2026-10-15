@@ -1,0 +1,8 @@
+#header-right { align-items: center; gap: 4px; }
+#header-right > button, #header-right > a, #header-right > div > button { display: inline-grid; place-items: center; width: 36px; height: 36px; min-width: 36px; min-height: 36px; box-sizing: border-box; padding: 0; line-height: 1; font-size: 20px; vertical-align: middle; }
+#header-right > button svg, #header-right > a svg, #header-right > div > button svg { display: block; width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+#header-right .notif-bell-icon { display: inline-grid; place-items: center; font-size: 20px; line-height: 1; }
+#header-right #notif-bell-wrap { display: flex; align-items: center; }
+#header-right .notif-badge { top: 0; right: 0; }
+html.true-mobile #header-right > button, html.true-mobile #header-right > a, html.true-mobile #header-right > div > button { width: 32px; height: 44px; min-width: 32px; min-height: 44px; }
+html.true-mobile #header-right { gap: 2px; }

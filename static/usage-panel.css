@@ -1,0 +1,30 @@
+#btn-usage { background: none; border: none; color: var(--text-secondary); padding: 4px; cursor: pointer; }
+#btn-usage svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; vertical-align: middle; }
+#btn-usage:hover, #btn-usage:focus-visible { color: var(--cyan); filter: drop-shadow(0 0 5px var(--cyan)); }
+#modal-usage { position: fixed; z-index: 1200; width: min(420px, calc(100vw - 16px)); box-sizing: border-box; max-height: min(560px, 65dvh); overflow-y: auto; overscroll-behavior: contain; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+#modal-usage .usage-content { color: var(--text-primary); font: 12px/1.4 var(--font-main); }
+.usage-heading { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1; background: var(--bg-secondary); }
+#usage-summary { padding: 10px; }
+#modal-usage .usage-heading h2 { margin: 0; flex: 1; font-family: var(--font-main); }
+#modal-usage #provider-usage-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+#modal-usage .quota-provider { padding: 10px; max-height: none; overflow: visible; background: var(--bg-secondary); }
+#modal-usage .quota-window small { font-size: 11px; line-height: 1.35; margin-top: 4px; }
+#modal-usage .quota-provider h3 { font-family: var(--font-main); font-size: 12px; }
+#modal-usage #usage-summary > section > h3 { font: 600 12px/1.4 var(--font-main); }
+#modal-usage .quota-window { padding: 4px 0; }
+#modal-usage .quota-window { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; align-items: baseline; }
+#modal-usage .quota-window span { text-align: right; margin: 0; }
+#modal-usage .quota-window progress, #modal-usage .quota-window small { grid-column: 1 / -1; }
+#modal-usage .quota-window progress { margin: 4px 0; }
+#modal-usage .quota-window small { margin-top: 0; }
+#modal-usage #provider-usage-status.quota-ready { display: none; }
+#modal-usage .quota-details { display: none; }
+#modal-usage .hint { font-size: 12px; margin: 6px 0; color: var(--text-secondary); }
+#modal-usage .settings-divider { margin: 10px 0; }
+#modal-usage #settings-openrouter-periods { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+#modal-usage #settings-openrouter-periods p { margin: 4px 0; }
+#modal-usage #settings-openrouter-periods h3 { font: 600 12px/1.4 var(--font-main); margin: 0 0 6px; }
+#modal-usage #btn-provider-usage-refresh, #modal-usage #btn-settings-openrouter-refresh { display: none; }
+@media (max-width: 650px) {
+    #modal-usage #provider-usage-cards, #modal-usage #settings-openrouter-periods { grid-template-columns: minmax(0, 1fr); }
+}

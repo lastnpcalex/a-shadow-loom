@@ -68,12 +68,29 @@ def test_registered_slugs_have_explicit_handoff_thresholds():
         )
 
 
+def test_glm_53_flash_routes_through_openrouter_and_goose():
+    import goose_client
+    import server
+
+    slug = "z-ai/glm-5.3-flash"
+    assert server._mode_for_cc_model(f"openrouter:{slug}") == "openrouter"
+    assert server._goose_selector_for_model(f"openrouter:{slug}") == (
+        f"goose:openrouter:{slug}"
+    )
+    assert goose_client.split_goose_model(f"goose:openrouter:{slug}") == (
+        "openrouter",
+        slug,
+    )
+
+
 @pytest.mark.parametrize("script", ["app.js", "chat.js"])
 def test_frontend_knows_every_registered_slug(script):
-    """The bare slug aliases in the JS classifiers must match the Python registry."""
-    source = (REPO / "static" / script).read_text(encoding="utf-8", errors="replace")
-    for slug in _registered_slugs():
-        assert slug in source, f"{slug} missing from static/{script}"
+    """Run the consumer, not a check demanding duplicated model lists in JS."""
+    import json
+    from tests.js_model_registry import evaluate
+    slugs = sorted(_registered_slugs())
+    function = "_isOpenRouterModel(m)" if script == "app.js" else "_agentKindForModel(m, {mode: 'goose'}) === 'openrouter'"
+    assert evaluate(json.dumps(slugs) + ".map(m => " + function + ")") == [True] * len(slugs)
 
 
 def test_openrouter_stream_sends_reasoning_on_the_thinking_channel(monkeypatch):

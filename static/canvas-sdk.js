@@ -22,41 +22,55 @@
     'use strict';
 
     const _pending = {};
-    let _reqId = 0;
 
     // Listen for responses from Loom host
     window.addEventListener('message', (e) => {
-        if (!e.data || e.data.source !== 'loom-host') return;
-        // Resolve any pending promises
-        for (const [id, p] of Object.entries(_pending)) {
-            if (e.data.type === p.waitFor) {
-                p.resolve(e.data);
-                delete _pending[id];
-                return;
-            }
-            if (e.data.type === 'error') {
-                p.reject(new Error(e.data.error));
-                delete _pending[id];
+        if (!e.data || e.data.source !== 'loom-host'
+            || e.source !== window.parent || e.origin !== location.origin) return;
+        let id = e.data.request_id;
+        if (id == null) {
+            // An already-open Loom tab may still have the old bridge while
+            // its refreshed iframe loads this SDK. Never guess between sends.
+            const candidates = Object.entries(_pending).filter(([, p]) =>
+                e.data.type === p.waitFor || e.data.type === 'error');
+            if (candidates.length === 1) id = candidates[0][0];
+            else if (candidates.length > 1) {
+                for (const [key, pending] of candidates) {
+                    clearTimeout(pending.timer);
+                    delete _pending[key];
+                    pending.reject(new Error('The older Loom tab cannot match concurrent Canvas replies. Reload the Loom tab and check saved messages before sending again.'));
+                }
                 return;
             }
         }
-        // Fire custom events for unmatched messages
+        const p = _pending[id];
+        if (p && (e.data.type === p.waitFor || e.data.type === 'error')) {
+            clearTimeout(p.timer);
+            delete _pending[id];
+            if (e.data.type === 'error') p.reject(new Error(e.data.error));
+            else p.resolve(e.data);
+        }
+        // Promise users and event listeners both receive their corresponding reply.
         window.dispatchEvent(new CustomEvent('loom:' + e.data.type, { detail: e.data }));
     });
 
     function _post(data, waitFor) {
         return new Promise((resolve, reject) => {
-            const id = ++_reqId;
-            if (waitFor) _pending[id] = { resolve, reject, waitFor };
-            window.parent.postMessage({ source: 'loom-canvas', ...data }, '*');
-            if (!waitFor) resolve();
-            // Timeout after 60s
-            setTimeout(() => {
-                if (_pending[id]) {
+            if (window.parent === window) {
+                reject(new Error('Open Canvas inside Loom to use the message bridge.'));
+                return;
+            }
+            const id = globalThis.crypto?.randomUUID
+                ? crypto.randomUUID() : `canvas-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            if (waitFor) {
+                const timer = setTimeout(() => {
                     delete _pending[id];
                     reject(new Error('Loom request timed out'));
-                }
-            }, 60000);
+                }, 60000);
+                _pending[id] = { resolve, reject, waitFor, timer };
+            }
+            window.parent.postMessage({ source: 'loom-canvas', ...data, request_id: id }, location.origin);
+            if (!waitFor) resolve();
         });
     }
 

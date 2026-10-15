@@ -16,6 +16,7 @@ def _envbool(name: str, default: bool) -> bool:
 # Keys persisted to config.json. Centralized so to_dict / update_from_dict /
 # load all stay in sync without three places to edit.
 _PERSISTED_KEYS = (
+    "default_permission_profile",
     "llama_host", "llama_model", "llama_server_exe", "llama_models_dir",
     "llama_chat_template_file",
     "vision_model",
@@ -24,10 +25,10 @@ _PERSISTED_KEYS = (
     "openrouter_base_url", "openrouter_weekly_limit_usd",
     "openrouter_monthly_limit_usd", "openrouter_max_prompt_price_per_mtok",
     "openrouter_max_completion_price_per_mtok",
-    "max_context_tokens", "verbatim_window",
+    "max_context_tokens", "verbatim_window", "context_preparation_max_calls", "context_preparation_timeout_seconds",
     "temperature", "top_p", "max_tokens", "weave_max_tokens", "repeat_penalty",
     "db_path",
-    # Dream Hermes — DiffusionGemma GPU orchestrator sidecar (nuspy OpenAI server).
+    # Dream — DiffusionGemma GPU sidecar, shared by Claude Code/Goose/Weave.
     # dream_host is the OpenAI-compatible endpoint; dream_cwd is the nuspy repo dir
     # (holds config.json + models/ + .temp/). dream_idle_timeout_min is disabled
     # by default; manual unload is safer than killing long cold-start jobs.
@@ -53,6 +54,7 @@ def _normalize_host(val: str) -> str:
 
 @dataclass
 class Config:
+    default_permission_profile: str = "trusted"
     # Llama Server connection
     llama_host: str = os.getenv("LLAMA_HOST", "http://localhost:8000")
     llama_model: str = os.getenv("LLAMA_MODEL", "Qwen3.6-27B-NVFP4.gguf")
@@ -70,6 +72,12 @@ class Config:
     goose_model: str = os.getenv("GOOSE_MODEL_LOOM", "goose:openrouter:z-ai/glm-5.2")
     goose_mode: str = os.getenv("LOOM_GOOSE_MODE", "approve")
     goose_builtins: str = os.getenv("LOOM_GOOSE_BUILTINS", "developer")
+    # Bound silent ACP/model stalls without imposing a wall-clock limit on a
+    # turn that is still emitting thinking, text, or tool events. Set to 0 to
+    # disable. Kept env-only because this is a host integration safeguard.
+    goose_progress_timeout_seconds: int = int(
+        os.getenv("LOOM_GOOSE_PROGRESS_TIMEOUT_SECONDS", "900")
+    )
     enable_goose: bool = _envbool("LOOM_ENABLE_GOOSE", True)
 
     # OpenRouter connection. API keys are deliberately env/.env-only:
@@ -82,17 +90,6 @@ class Config:
     openrouter_monthly_limit_usd: float = float(os.getenv("OPENROUTER_MONTHLY_LIMIT_USD", "50"))
     openrouter_max_prompt_price_per_mtok: float = float(os.getenv("OPENROUTER_MAX_PROMPT_PRICE_PER_MTOK", "1"))
     openrouter_max_completion_price_per_mtok: float = float(os.getenv("OPENROUTER_MAX_COMPLETION_PRICE_PER_MTOK", "4"))
-
-    # Prometheus cloud fallback — the always-warm incognito Hermes runtime falls
-    # back to the Umans OpenAI-compatible endpoint when no local model is up. These
-    # are env-only (install-specific, like hermes_home) so they stay out of the
-    # persisted config.json. The key env var is UMANS_API_KEY (same one claude_client
-    # reads at :893 for the Anthropic-format path); Prometheus uses the OpenAI path.
-    prometheus_cloud_base_url: str = os.getenv(
-        "UMANS_BASE_URL", "https://api.code.umans.ai/v1"
-    )
-    prometheus_cloud_model: str = os.getenv("UMANS_MODEL", "umans-glm-5.2")
-    prometheus_cloud_context: int = int(os.getenv("PROMETHEUS_CLOUD_CONTEXT", "200000"))
 
     # Llama Server binary and models directory
     llama_server_exe: str = os.getenv(
@@ -111,6 +108,8 @@ class Config:
 
     # Context budget
     max_context_tokens: int = 32768
+    context_preparation_max_calls: int = 32
+    context_preparation_timeout_seconds: int = 120
     verbatim_window: int = 6  # last N turns kept verbatim
     summary_target_tokens: int = 800
     summary_temperature: float = 0.3
@@ -143,23 +142,10 @@ class Config:
     weave_max_tokens: int = int(os.getenv("WEAVE_MAX_TOKENS", "2048"))
     repeat_penalty: float = 1.08
 
-    # --- Hermes Agent (ACP mode) — native Windows install ---
-    # NousResearch's install.ps1 (and our manual `uv pip install -e .[acp]`)
-    # puts Hermes under %LOCALAPPDATA%\hermes; config.yaml / .env live there.
-    # Not persisted to config.json — these are install-specific, set via env.
-    hermes_home: str = os.getenv(
-        "HERMES_HOME",
-        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
-    )
-    # Explicit path to the `hermes` CLI executable. Empty -> derive from hermes_home.
-    hermes_exe: str = os.getenv("HERMES_EXE", "")
-    # Master switch for Hermes mode. The Phase-4 UI stays hidden until this is on.
-    enable_hermes: bool = _envbool("LOOM_ENABLE_HERMES", False)
-
-    # --- Dream Hermes (DiffusionGemma GPU orchestrator sidecar) ---
+    # --- Dream (DiffusionGemma GPU sidecar) ---
     # Runs the nuspy OpenAI adapter (agent.openai_server) on a diffusion-capable
     # llama.cpp fork (PR #24423). The sidecar JIT-loads the NVFP4 GGUF into VRAM on
-    # first request. enable_dream is env-only like enable_hermes. Automatic idle
+    # first request. enable_dream is env-only. Automatic idle
     # unload is disabled by default because it can surprise chat generations.
     # Default 127.0.0.1 (IPv4) + 8787 (the live sidecar port). The legacy
     # "http://localhost:18081" default was wrong on both axes: 18081 is a dead
@@ -180,7 +166,7 @@ class Config:
     )
     dream_model_path: str = os.getenv(
         "DREAM_MODEL_PATH",
-        r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion\models\diffusiongemma-26b-a4b-it-nvfp4.gguf",
+        os.path.join(os.path.expanduser("~"), "models", "diffusiongemma-26b-a4b-it-nvfp4.gguf"),
     )
     dream_context_size: int = int(os.getenv("DREAM_CONTEXT_SIZE", "131072"))
     dream_min_output_tokens: int = int(os.getenv("DREAM_MIN_OUTPUT_TOKENS", "2048"))
@@ -198,18 +184,6 @@ class Config:
     dream_idle_timeout_min: int = int(os.getenv("DREAM_IDLE_TIMEOUT_MIN", "0"))
     enable_dream: bool = _envbool("LOOM_ENABLE_DREAM", False)
 
-    def hermes_executable(self) -> str:
-        """Resolve the `hermes` CLI path: explicit HERMES_EXE if set, else the
-        venv Scripts binary under hermes_home, else bare 'hermes' on PATH."""
-        if self.hermes_exe:
-            return self.hermes_exe
-        exe_name = "hermes.exe" if os.name == "nt" else "hermes"
-        cand = os.path.join(
-            self.hermes_home, "hermes-agent", ".venv",
-            "Scripts" if os.name == "nt" else "bin", exe_name,
-        )
-        return cand if os.path.exists(cand) else "hermes"
-
     def llama_host_url(self) -> str:
         """Return the Llama Server host URL with http:// prefix."""
         return _normalize_host(self.llama_host)
@@ -218,6 +192,9 @@ class Config:
         return {k: getattr(self, k) for k in _PERSISTED_KEYS}
 
     def update_from_dict(self, d: dict):
+        if "default_permission_profile" in d:
+            from permission_policy import PermissionProfile
+            PermissionProfile(d["default_permission_profile"])
         for key in _PERSISTED_KEYS:
             if key in d:
                 cur = getattr(self, key)
@@ -253,6 +230,12 @@ class Config:
             for key in _PERSISTED_KEYS:
                 if key not in saved:
                     continue
+                if key == "default_permission_profile":
+                    from permission_policy import PermissionProfile
+                    try:
+                        PermissionProfile(saved[key])
+                    except (ValueError, TypeError):
+                        continue
                 cur = getattr(self, key)
                 if isinstance(cur, bool):
                     val = saved[key]

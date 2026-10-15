@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="disk" x1="3" y1="0" x2="61" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9a6bff" stop-opacity=".2"/>
+      <stop offset=".18" stop-color="#7ff9ff"/>
+      <stop offset=".34" stop-color="#ecffff"/>
+      <stop offset=".62" stop-color="#3fe6ff"/>
+      <stop offset=".88" stop-color="#8f6bff"/>
+      <stop offset="1" stop-color="#8f6bff" stop-opacity=".15"/>
+    </linearGradient>
+    <linearGradient id="halo" x1="0" y1="14" x2="0" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e6ffff"/>
+      <stop offset=".45" stop-color="#00f0ff"/>
+      <stop offset="1" stop-color="#7a5cff"/>
+    </linearGradient>
+    <radialGradient id="hole" cx="46%" cy="42%" r="60%">
+      <stop offset="0" stop-color="#0d1a24"/>
+      <stop offset="1" stop-color="#010104"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="18" x2="0" y2="45" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f2ffff"/>
+      <stop offset=".6" stop-color="#7ff9ff" stop-opacity=".7"/>
+      <stop offset="1" stop-color="#b778ff" stop-opacity=".35"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.2"/>
+    </filter>
+    <clipPath id="front"><rect x="0" y="32" width="64" height="32"/></clipPath>
+  </defs>
+  <g>
+    <!-- back of the disk and its glow -->
+    <g transform="translate(0 -2)">
+      <ellipse cx="32" cy="32" rx="28" ry="5" fill="#00ffff" opacity=".35" filter="url(#glow)"/>
+      <path d="M3 32a29 5.6 0 1 0 58 0a29 5.6 0 1 0-58 0ZM15 32a17 2.6 0 1 1 34 0a17 2.6 0 1 1-34 0Z"
+            fill="url(#disk)" fill-rule="evenodd" opacity=".85" stroke="#07050f" stroke-width="1" paint-order="stroke"/>
+    </g>
+    <!-- lensed image of the far disk, wrapped over and under the shadow -->
+    <circle cx="32" cy="31.3" r="14" fill="none" stroke="#00ffff" stroke-width="3.6" opacity=".55" filter="url(#glow)"/>
+    <path d="M17.7 31.5A14.3 14.3 0 0 1 46.3 31.5" fill="none" stroke="#07050f" stroke-width="3.8" stroke-linecap="round"/>
+    <path d="M17.7 31.5A14.3 14.3 0 0 1 46.3 31.5" fill="none" stroke="url(#halo)" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M18.5 33.5A13.5 13.5 0 0 0 45.5 33.5" fill="none" stroke="#07050f" stroke-width="2.2" stroke-linecap="round" opacity=".8"/>
+    <path d="M18.5 33.5A13.5 13.5 0 0 0 45.5 33.5" fill="none" stroke="url(#halo)" stroke-width="1.2" stroke-linecap="round" opacity=".8"/>
+    <!-- shadow and photon ring -->
+    <circle cx="32" cy="31.5" r="12.6" fill="url(#hole)"/>
+    <circle cx="32" cy="31.5" r="13.1" fill="none" stroke="#07050f" stroke-width="1.8"/>
+    <circle cx="32" cy="31.5" r="13.1" fill="none" stroke="url(#ring)" stroke-width=".8"/>
+    <!-- near side of the disk crosses in front -->
+    <g clip-path="url(#front)" transform="translate(0 -2)">
+      <ellipse cx="32" cy="32" rx="27" ry="4" fill="#00ffff" opacity=".5" filter="url(#glow)"/>
+      <path d="M3 32a29 5.6 0 1 0 58 0a29 5.6 0 1 0-58 0ZM15 32a17 2.6 0 1 1 34 0a17 2.6 0 1 1-34 0Z"
+            fill="url(#disk)" fill-rule="evenodd" stroke="#07050f" stroke-width="1" paint-order="stroke"/>
+    </g>
+  </g>
+</svg>

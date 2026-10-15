@@ -17,41 +17,12 @@ from typing import Any
 import httpx
 
 from config import config
+import model_registry
 
 
 MODEL_PREFIX = "openrouter:"
-DEFAULT_MODELS = [
-    {
-        "name": f"{MODEL_PREFIX}z-ai/glm-5.2",
-        "label": "OpenRouter GLM 5.2",
-        "backend": "openrouter",
-        "context_length": 1_000_000,
-    },
-    {
-        "name": f"{MODEL_PREFIX}moonshotai/kimi-k2.7-code",
-        "label": "OpenRouter Kimi K2.7 Code",
-        "backend": "openrouter",
-        "context_length": 262_144,
-    },
-    {
-        "name": f"{MODEL_PREFIX}openai/gpt-5.6-luna",
-        "label": "OpenRouter GPT 5.6 Luna",
-        "backend": "openrouter",
-        "context_length": 1_050_000,
-    },
-    {
-        "name": f"{MODEL_PREFIX}deepseek/deepseek-v4-flash-0731",
-        "label": "OpenRouter DeepSeek V4 Flash 0731",
-        "backend": "openrouter",
-        "context_length": 1_048_576,
-    },
-]
-_KNOWN_MODEL_SLUGS = {
-    "z-ai/glm-5.2",
-    "moonshotai/kimi-k2.7-code",
-    "openai/gpt-5.6-luna",
-    "deepseek/deepseek-v4-flash-0731",
-}
+# Compatibility export for integrations; production reads the shared registry.
+DEFAULT_MODELS = model_registry.openrouter_models()
 _SECRET_NAMES = {
     "OPENROUTER_API_KEY",
     "OPENROUTER_MANAGEMENT_KEY",
@@ -69,19 +40,12 @@ class OpenRouterBudgetError(RuntimeError):
 
 
 def is_openrouter_model(model: str | None) -> bool:
-    value = (model or "").strip().lower()
-    if not value:
-        return False
-    if value.startswith(MODEL_PREFIX):
-        return True
-    return value in _KNOWN_MODEL_SLUGS
+    # Goose is a distinct harness route, not a direct OpenRouter selection.
+    return model_registry.resolve(model).get("mode") == "openrouter"
 
 
 def model_slug(model: str | None) -> str:
-    value = (model or "").strip()
-    if value.lower().startswith(MODEL_PREFIX):
-        return value.split(":", 1)[1].strip()
-    return value
+    return model_registry.openrouter_slug(model)
 
 
 def base_url() -> str:
@@ -246,13 +210,13 @@ def request_headers(key: str | None = None) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://localhost:3000",
-        "X-Title": "A Shadow Loom",
+        "X-Title": "EX umbra Omnia",
     }
     return headers
 
 
 def public_models() -> list[dict[str, Any]]:
-    return [dict(m) for m in DEFAULT_MODELS]
+    return model_registry.openrouter_models()
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -437,7 +401,7 @@ def provider_price_guard() -> dict[str, Any]:
 
 async def create_limited_key(
     *,
-    name: str = "A Shadow Loom",
+    name: str = "EX umbra Omnia",
     limit: float = 12.5,
     limit_reset: str = "weekly",
     include_byok_in_limit: bool = True,

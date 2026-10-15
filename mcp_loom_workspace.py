@@ -7,6 +7,7 @@ reads. Every mutating or sensitive operation asks Loom first.
 """
 
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from workspace_integrity import checked_path, live_version, patch_mutations
 
 mcp = FastMCP("loom-workspace")
 
@@ -77,6 +79,18 @@ def _ask_permission(tool_name: str, tool_input: dict) -> str | None:
         "tool_id": tool_id,
         "tool_input": tool_input,
     }
+    # Preserve the provider's exact run identity through the permission
+    # bridge.  A conversation can have several windows and child agents; the
+    # conversation id alone is not an ownership key.
+    for env_name, payload_name in (
+        ("LOOM_PERMISSION_SCOPE", "permission_scope"),
+        ("LOOM_AGENT_RUN_ID", "agent_run_id"),
+        ("LOOM_PARENT_RUN_ID", "parent_run_id"),
+        ("LOOM_CLIENT_INSTANCE_ID", "client_instance_id"),
+    ):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            payload[payload_name] = value
     try:
         _post_json(port, "/api/cc-tool-start", payload, timeout=3)
     except Exception:
@@ -86,7 +100,7 @@ def _ask_permission(tool_name: str, tool_input: dict) -> str | None:
     except Exception as e:
         return f"Loom permission request failed: {e}"
     if not response.get("allow"):
-        return response.get("message") or "Denied by user in Loom UI"
+        return response.get("message") or "Loom did not authorize this request; no user decision was identified."
     return None
 
 
@@ -104,6 +118,38 @@ def _output_limit(max_chars: int) -> int:
         return _DEFAULT_OUTPUT_CHARS
 
 
+def _write_if_current(root: Path, target: Path, expected: str | None, content: str):
+    """Recheck after approval; exclusive creation and atomic publication.
+
+    The last comparison/publication is not an OS-wide compare-and-swap against
+    arbitrary third-party writers. Never advertise it as such.
+    """
+    target = checked_path(root, str(target))
+    actual, _ = live_version(target)
+    if actual != expected:
+        raise ValueError("File changed while approval was pending; read it again before editing")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if expected is None:
+        with target.open("xb") as handle:
+            handle.write(content.encode("utf-8"))
+        return
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=target.parent, prefix=".loom-edit-", delete=False) as handle:
+            temp = Path(handle.name)
+            handle.write(content.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        target = checked_path(root, str(target))
+        if live_version(target)[0] != expected:
+            raise ValueError("File changed before publication; read it again before editing")
+        shutil.copymode(target, temp, follow_symlinks=False)
+        os.replace(temp, target)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
 @mcp.tool()
 def write_file(file_path: str, content: str) -> str:
     """Create or replace a UTF-8 text file after Loom approval.
@@ -116,7 +162,8 @@ def write_file(file_path: str, content: str) -> str:
         return cfg
     root, _port, _conv_id = cfg
     try:
-        target = _resolve_inside(root, file_path)
+        target = checked_path(root, file_path)
+        expected, _ = live_version(target)
     except Exception as e:
         return f"Error: {e}"
 
@@ -124,8 +171,7 @@ def write_file(file_path: str, content: str) -> str:
     if denied:
         return f"Denied: {denied}"
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        _write_if_current(root, target, expected, content)
         return f"Wrote {target}"
     except Exception as e:
         return f"Error writing {target}: {e}"
@@ -139,8 +185,9 @@ def replace_in_file(file_path: str, old_string: str, new_string: str) -> str:
         return cfg
     root, _port, _conv_id = cfg
     try:
-        target = _resolve_inside(root, file_path)
-        text = target.read_text(encoding="utf-8")
+        target = checked_path(root, file_path)
+        expected, raw = live_version(target)
+        text = raw.decode("utf-8")
     except Exception as e:
         return f"Error: {e}"
     count = text.count(old_string)
@@ -154,7 +201,7 @@ def replace_in_file(file_path: str, old_string: str, new_string: str) -> str:
     if denied:
         return f"Denied: {denied}"
     try:
-        target.write_text(text.replace(old_string, new_string), encoding="utf-8")
+        _write_if_current(root, target, expected, text.replace(old_string, new_string))
         return f"Updated {target}"
     except Exception as e:
         return f"Error writing {target}: {e}"
@@ -170,11 +217,23 @@ def apply_unified_patch(patch: str) -> str:
     if isinstance(cfg, str):
         return cfg
     root, _port, _conv_id = cfg
+    try:
+        targets = patch_mutations(patch)
+        if not targets:
+            return "Error: patch has no supported file headers; no write was authorized."
+        versions = {checked_path(root, mutation.path): None for mutation in targets}
+        versions = {path: live_version(path)[0] for path in versions}
+    except (ValueError, OSError) as exc:
+        return f"Error inspecting patch targets: {exc}"
     denied = _ask_permission("apply_patch", {"command": patch})
     if denied:
         return f"Denied: {denied}"
 
     try:
+        for path, expected in versions.items():
+            path = checked_path(root, str(path))
+            if live_version(path)[0] != expected:
+                return "Error: patch target changed while approval was pending; read it again."
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".patch") as f:
             f.write(patch)
             patch_path = f.name

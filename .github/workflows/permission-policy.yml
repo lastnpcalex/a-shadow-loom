@@ -1,0 +1,122 @@
+name: Permission policy proofs
+
+on:
+  push:
+    paths:
+      - ".github/workflows/permission-policy.yml"
+      - "formal/permission_policy/**"
+      - "permission_policy.py"
+      - "permission_risk.py"
+      - "tests/test_permission_trust_review.py"
+      - "static/index.html"
+      - "permission_rules.py"
+      - "permission_commands.py"
+      - "acp_permissions.py"
+      - "codex_client.py"
+      - "tests/test_permission_payloads.py"
+      - "tests/test_permission_transport_acceptance.py"
+      - "tests/test_live_permission_acceptance.py"
+      - "tests/test_permission_ui.py"
+      - "static/chat.js"
+      - "cc_permission_hook.py"
+      - "goose_client.py"
+      - "admin_server.py"
+      - "static/admin/**"
+      - "tests/test_admin_supervision*.py"
+      - "tests/test_permission_enforcement.py"
+      - "database.py"
+      - "server.py"
+      - "tests/test_codex_permissions.py"
+      - "tests/test_goose_acp.py"
+      - "tests/test_plan_approval_hook.py"
+      - "tests/test_permission_policy.py"
+      - "tools/permission_preflight.py"
+      - "tests/test_permission_preflight.py"
+      - "tests/test_permission_workflows.py"
+      - "tests/permission_acceptance_metrics.py"
+      - "tests/test_native_harness_permissions.py"
+      - "tools/lifecycle_preflight.py"
+      - "tests/lifecycle_metrics.py"
+      - "tests/test_lifecycle_preflight.py"
+  pull_request:
+    paths:
+      - ".github/workflows/permission-policy.yml"
+      - "formal/permission_policy/**"
+      - "permission_policy.py"
+      - "permission_risk.py"
+      - "tests/test_permission_trust_review.py"
+      - "static/index.html"
+      - "permission_rules.py"
+      - "permission_commands.py"
+      - "acp_permissions.py"
+      - "codex_client.py"
+      - "tests/test_permission_payloads.py"
+      - "tests/test_permission_transport_acceptance.py"
+      - "tests/test_live_permission_acceptance.py"
+      - "tests/test_permission_ui.py"
+      - "static/chat.js"
+      - "cc_permission_hook.py"
+      - "goose_client.py"
+      - "admin_server.py"
+      - "static/admin/**"
+      - "tests/test_admin_supervision*.py"
+      - "tests/test_permission_enforcement.py"
+      - "database.py"
+      - "server.py"
+      - "tests/test_codex_permissions.py"
+      - "tests/test_goose_acp.py"
+      - "tests/test_plan_approval_hook.py"
+      - "tests/test_permission_policy.py"
+      - "tools/permission_preflight.py"
+      - "tests/test_permission_preflight.py"
+      - "tests/test_permission_workflows.py"
+      - "tests/permission_acceptance_metrics.py"
+      - "tests/test_native_harness_permissions.py"
+      - "tools/lifecycle_preflight.py"
+      - "tests/lifecycle_metrics.py"
+      - "tests/test_lifecycle_preflight.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove-and-compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile Lean policy and proofs
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal/permission_policy
+          auto-config: false
+          build: true
+          test: false
+          lint: false
+          use-mathlib-cache: false
+
+      - name: Verify checked-in Lean fixture
+        working-directory: formal/permission_policy
+        run: |
+          lake exe loom_permission_fixtures /tmp/permission_cases.json
+          diff -u generated/permission_cases.json /tmp/permission_cases.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify Python runtime and provider normalization
+        run: |
+          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil
+          python -m pytest tests/test_permission_policy.py tests/test_permission_enforcement.py tests/test_permission_payloads.py tests/test_plan_approval_hook.py -q
+          python -m pytest tests/test_codex_permissions.py tests/test_goose_acp.py -k "permission_bridge or permission_uses_direct_handler or permission_hook_posts" -q
+
+      - name: Verify browser and hook permission transports without model usage
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+          python -m pytest tests/test_permission_ui.py tests/test_permission_trust_review.py tests/test_permission_transport_acceptance.py tests/test_admin_supervision.py tests/test_admin_supervision_http.py -q
+
+      - name: Verify pre-deployment permission workflow counts
+        run: python -m pytest tests/test_permission_workflows.py tests/test_permission_preflight.py tests/test_lifecycle_preflight.py -q

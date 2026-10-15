@@ -1,10 +1,14 @@
 # Loom Canvas — Developer Guide
 
-This guide explains how to build interactive canvas pages for A Shadow Loom. Pass this to any AI agent that has a canvas-enabled conversation.
+This guide explains how to build interactive canvas pages for EX umbra Omnia (EXO/Loom), regardless of the agent harness.
 
 ## What is the Canvas?
 
-The canvas is a live website (HTML/CSS/JS) rendered in an iframe within the Loom UI. When you write files to the `canvas/` directory in your project, they appear in the user's browser immediately. The entry point is always `canvas/index.html`.
+Canvas is persistent user-owned work shared by every branch using the same workspace. Its files may be gitignored; that does not make them disposable. Before editing, inspect the actual directory, read the current entry page and its imports, and preserve existing tools, data and navigation. Put an unrelated prototype on a separate page. Replace the entry page only when the human explicitly asks for that replacement. A successful syntax check is not proof that existing workflows survived.
+
+The canvas is a live website (HTML/CSS/JS) rendered in an iframe within the Loom UI. Write the page to `<workspace>/canvas/index.html`; no separate app server is needed. Other assets belong alongside it, with relative URLs.
+
+Enabling Canvas creates missing starter files, `CLAUDE.md`, and this guide. Existing files are never overwritten. Tool-capable harnesses (including Goose) receive a short notice identifying the absolute entry and guide paths, including on native resumes. Previously enabled workspaces are backfilled on the next turn. The full guide is not repeated in each prompt; Weave's chat-completion interface is unchanged.
 
 The canvas appears as a glowing meta-root node in the conversation's tree view. Clicking it opens a fullscreen view with the chat bar still visible, so the user can keep talking to you while viewing the canvas.
 
@@ -19,11 +23,13 @@ canvas/
     analyze.md
     summarize.md
   CLAUDE.md           # Auto-generated instructions (you can read but don't need to edit)
+  CANVAS_GUIDE.md     # This harness-neutral guide
 ```
 
 ## Basic Canvas
 
-Just write HTML to `canvas/index.html`:
+For a new, empty Canvas, start with HTML like this in `canvas/index.html`.
+For an existing Canvas, read it first and make scoped changes instead of replacing it with this example:
 
 ```html
 <!DOCTYPE html>
@@ -42,7 +48,9 @@ Just write HTML to `canvas/index.html`:
 </html>
 ```
 
-Every time you write or edit files in `canvas/`, the iframe auto-refreshes via WebSocket.
+While a Canvas iframe is visible in Loom and its browser tab is foregrounded, Loom checks file names, modification times, and sizes roughly every three seconds. This works with any writer: Goose, shell tools, patches, and durable children. Existing tool-event refresh hints can update it sooner. A changed Canvas reloads the iframe, so persist interactive state if it must survive reloads.
+
+The scan reads no file contents, does not follow symlinks/junctions, and is capped at 2,048 entries. Larger trees, unavailable scans, and edits that preserve both file size and modification time require a manual Canvas reopen/refresh. The standalone slug is a viewer: refresh that page to see updates.
 
 ## Canvas SDK — Making It Interactive
 
@@ -56,7 +64,9 @@ This gives you the global `Loom` object.
 
 ### Loom.send(prompt, opts?)
 
-Send a chat message and trigger AI generation. The AI response will appear as a new branch in the conversation.
+Send a chat message through the conversation's normal queue and permission rules. By default it continues the selected branch; during a running turn it queues after that assistant draft, rather than becoming its sibling. An explicit `parentId` chooses the message to continue from. This does not implicitly enable parallel agents. The response includes `{id, queued}`; queued does not mean launched.
+
+Use the Canvas inside an open Loom conversation for sends. The standalone slug has no selected branch and returns an immediate explanation instead of launching work. `getConvId()` and template loading still work there.
 
 ```javascript
 // Simple prompt
@@ -158,7 +168,7 @@ Analyze the uploaded file "{{filename}}" and update the canvas:
 
 1. Parse the file contents
 2. Extract key metrics
-3. Write an updated canvas/index.html with:
+3. Read the existing Canvas, then add a scoped panel or separate page without removing current tools or data:
    - A summary section showing the metrics
    - A table of the raw data
    - Use a dark theme matching Loom's aesthetic (#1a1a2e background, #0ff and #bf00ff accents)
@@ -167,7 +177,8 @@ Analyze the uploaded file "{{filename}}" and update the canvas:
 **`canvas/triggers/summarize.md`**
 ```
 Read through {{filename}} and create a visual summary on the canvas.
-Focus on the most important {{count}} points. Write results to canvas/index.html.
+Focus on the most important {{count}} points. Read the current Canvas first;
+add a scoped panel or separate page while preserving the entry point and existing tools.
 ```
 
 ## Example: File Analysis Dashboard
@@ -242,7 +253,7 @@ Focus on the most important {{count}} points. Write results to canvas/index.html
 
 - **Dark theme**: Match Loom's aesthetic — `#0a0a19` background, `#0ff` (cyan) and `#bf00ff` (purple) accents
 - **Progressive building**: Start with static HTML, add SDK interactivity in later turns
-- **Self-updating**: Your AI responses can rewrite `canvas/index.html` — the iframe auto-refreshes
+- **Self-updating**: Scoped edits auto-refresh the iframe. This does not authorize replacing existing functionality.
 - **State in the canvas**: Use localStorage, hidden elements, or data attributes to persist state across refreshes
-- **Multiple pages**: You can have multiple HTML files, but `index.html` is always the iframe entry point. Use JS to swap content rather than separate pages
-- **The canvas is sandboxed**: `allow-scripts allow-same-origin` — you can run JS and make same-origin API calls, but no popups or top-level navigation
+- **Multiple pages**: `index.html` is the iframe entry point. Keep existing navigation intact; add scoped panels or linked pages for new tools instead of replacing unrelated tools.
+- **Trusted project code**: the iframe uses `allow-scripts allow-same-origin` and can call Loom's API. It is not an isolation boundary for untrusted HTML. The SDK bridge checks the actual parent/iframe and origin and correlates each response with its request.

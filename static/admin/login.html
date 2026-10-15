@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EXO Admin · Sign in</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#090c15;color:#dce8f4}body{margin:0;min-height:100vh;display:grid;place-items:center}main{width:min(90vw,430px);padding:2rem;border:1px solid #26324c;border-radius:18px;background:#101726}h1{font-size:1.5rem;color:#7bdff5}p{line-height:1.5;color:#adbdd0}label{display:block;margin-top:1rem}input,button{box-sizing:border-box;width:100%;padding:.8rem;margin-top:.5rem;border-radius:8px;border:1px solid #364460;background:#0c1220;color:inherit;font:inherit}button{background:#173647;cursor:pointer}button:disabled{opacity:.5}img{width:230px;max-width:100%;background:white}pre{white-space:pre-wrap;overflow-wrap:anywhere}#message{color:#f6c98d}a{color:#7bdff5}[hidden]{display:none!important}
+</style>
+<main><h1>EXO Admin</h1><p id="description">Checking access…</p>
+<form id="login" hidden>
+ <input name="username" autocomplete="username" value="owner" hidden>
+ <label>Password<input id="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+ <label>Authy code or recovery code<input id="code" autocomplete="one-time-code" required maxlength="100" autocapitalize="off" spellcheck="false"></label>
+ <button>Sign in</button>
+</form>
+<form id="setup" hidden>
+ <label>New Admin password<input id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+ <label>Repeat password<input id="repeat-password" type="password" autocomplete="new-password" required></label>
+ <button>Set up Authy</button>
+</form>
+<form id="confirm" hidden><p>In Authy, add an account and scan this QR code. You can also enter the setup key manually.</p>
+ <img id="qr" alt="Authy enrollment QR code"><pre id="seed"></pre>
+ <label>Six-digit Authy code<input id="setup-code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" required></label><button>Verify Authy</button>
+</form>
+<div id="recovery" hidden><p>Save these one-use codes in your password manager or offline before traveling. Each replaces Authy at sign-in, alongside your password. They are shown only once.</p><pre id="codes"></pre><label><input id="saved" type="checkbox" style="width:auto"> I saved my recovery codes</label><button id="activate" disabled>Enable Admin login</button></div>
+<p id="message" role="status" aria-live="polite"></p></main>
+<script>
+const $=id=>document.getElementById(id);let busy=false;
+async function post(path,data){const r=await fetch('/api/admin-auth/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store'});const j=await r.json();if(!r.ok)throw Error(j.error||j.detail||'Request failed');return j;}
+async function action(fn){if(busy)return;busy=true;$('message').textContent='';try{await fn();}catch(e){$('message').textContent=e.message;}finally{busy=false;}}
+$('login').onsubmit=e=>{e.preventDefault();action(async()=>{await post('login',{password:$('password').value,code:$('code').value});$('password').value='';location.replace('/');});};
+$('setup').onsubmit=e=>{e.preventDefault();action(async()=>{if($('new-password').value!==$('repeat-password').value)throw Error('Passwords do not match');const j=await post('setup/start',{password:$('new-password').value});$('new-password').value='';$('repeat-password').value='';$('qr').src=j.qr;$('seed').textContent=j.seed;$('setup').hidden=true;$('confirm').hidden=false;});};
+$('confirm').onsubmit=e=>{e.preventDefault();action(async()=>{const j=await post('setup/confirm',{code:$('setup-code').value});$('setup-code').value='';$('qr').removeAttribute('src');$('seed').textContent='';$('confirm').hidden=true;$('codes').textContent=j.codes.join('\n');$('recovery').hidden=false;});};
+$('saved').onchange=()=>{$('activate').disabled=!$('saved').checked;};
+$('activate').onclick=()=>action(async()=>{if(!$('saved').checked)return;await post('setup/activate',{});$('codes').textContent='';location.replace('/');});
+fetch('/api/admin-auth/status',{cache:'no-store'}).then(r=>r.json()).then(s=>{if(s.authenticated){location.replace('/');return;}if(s.configured){$('description').textContent='Direct Tailscale access. Sign in with your Admin password and Authy code. A saved recovery code works if Authy is unavailable.';$('login').hidden=false;}else if(s.local){$('description').textContent='Set up your independent Admin password and Authy here on the host. Remote Admin access stays blocked until setup is complete.';$('setup').hidden=false;}else{$('description').textContent='Admin has not been enrolled yet. Complete initial setup once on the host at https://localhost:3002/login.';}}).catch(()=>{$('message').textContent='Could not check access. Open Admin directly through Tailscale or localhost.';});
+</script></html>

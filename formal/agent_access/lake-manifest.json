@@ -1,0 +1,6 @@
+{"version": "1.2.0",
+ "packagesDir": ".lake/packages",
+ "packages": [],
+ "name": "loomAgentAccess",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}

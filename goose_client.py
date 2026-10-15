@@ -12,9 +12,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shlex
 import shutil
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any, AsyncGenerator
 from urllib.parse import urlsplit, urlunsplit
@@ -22,14 +24,94 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from loom_agent_prompt import prepend_loom_agent_context
+from permission_policy import once_option
+from acp_permissions import permission_action, remember_tool_call, tool_input_json
 
 log = logging.getLogger(__name__)
 
 MODEL_PREFIX = "goose:"
 _MODE_MARKERS = {"auto", "subagents", "approve", "smart-approve", "chat"}
-_PERMISSION_HTTP_TIMEOUT = 900.0
+# The Loom endpoint itself owns the approval deadline (currently 24 hours).
+# A shorter client timeout turns "still awaiting the user" into a synthetic
+# provider rejection, which Goose then incorrectly describes as user-declined.
+_PERMISSION_HTTP_TIMEOUT = (24 * 60 * 60) + 60.0
 _STREAM_LIMIT = 16 * 1024 * 1024
 _OPENROUTER_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max", "none"}
+_DEFAULT_OPENROUTER_FAST_MODEL = "z-ai/glm-5.3-flash"
+_GOOSE_TERMINAL_ERROR_RE = re.compile(
+    r"Ran into this error:\s*(?P<detail>.*?)\s*"
+    r"Please retry if you think this is a transient or recoverable error\.\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_GOOSE_COMPACT_ERROR_RE = re.compile(
+    r"Ran into this error trying to compact:\s*(?P<detail>.*?)\s*"
+    r"Please try again or create a new session\s*[.!]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Newer Goose builds report dropped provider streams in this shape instead of
+# the "Ran into this error" footer. The trailing resend sentence is distinctive
+# enough to avoid misclassifying ordinary model prose, and the detail must
+# carry a "Network error:" prefix so only transport failures match.
+_GOOSE_NETWORK_ERROR_RE = re.compile(
+    r"Network error:\s*(?P<detail>.*?)\s*"
+    r"Please resend your message to try again\.\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_GOOSE_RETRYABLE_ERROR_MARKERS = (
+    "upstream idle timeout",
+    "stream decode error",
+    "connection reset",
+    "connection closed",
+    "temporarily unavailable",
+    "service unavailable",
+    "gateway timeout",
+    "rate limit",
+    "too many requests",
+)
+
+
+def split_goose_terminal_failure(text: str) -> tuple[str, str]:
+    """Split Goose's canonical provider-error footer from useful partial text.
+
+    Goose ACP currently emits some provider failures as a normal
+    ``agent_message_chunk`` followed by a successful-looking prompt response.
+    The exact footer is stable and deliberately includes the retry sentence;
+    requiring both phrases avoids treating ordinary model prose as a failure.
+    """
+    value = str(text or "")
+    match = (
+        _GOOSE_TERMINAL_ERROR_RE.search(value)
+        or _GOOSE_COMPACT_ERROR_RE.search(value)
+        or _GOOSE_NETWORK_ERROR_RE.search(value)
+    )
+    if not match:
+        return value, ""
+    detail = match.group("detail").strip()
+    return value[: match.start()].rstrip(), detail
+
+
+def is_retryable_goose_failure(detail: str) -> bool:
+    """Whether an independently retried turn is reasonable for this failure."""
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in _GOOSE_RETRYABLE_ERROR_MARKERS)
+
+
+async def _readline_with_progress_timeout(
+    stream,
+    timeout_seconds: float,
+    *,
+    phase: str,
+):
+    """Read one ACP line, failing boundedly when the provider goes silent."""
+    timeout = max(float(timeout_seconds or 0), 0.0)
+    if timeout <= 0:
+        return await stream.readline()
+    try:
+        return await asyncio.wait_for(stream.readline(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise asyncio.TimeoutError(
+            f"Goose produced no ACP activity for {timeout:g}s during {phase}"
+        ) from exc
 
 
 class _RpcConn:
@@ -273,6 +355,60 @@ def _llama_context_limit(model_id: str | None) -> int:
         return int(os.environ.get("LLAMA_CONTEXT_SIZE", "32768"))
 
 
+def _find_goose_sessions_db() -> Path | None:
+    candidates = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "Block" / "Goose" / "data" / "sessions" / "sessions.db")
+        candidates.append(Path(appdata) / "Goose" / "data" / "sessions" / "sessions.db")
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        candidates.append(Path(localappdata) / "Block" / "Goose" / "data" / "sessions" / "sessions.db")
+        candidates.append(Path(localappdata) / "Goose" / "data" / "sessions" / "sessions.db")
+    home = Path.home()
+    candidates.extend([
+        home / ".local" / "share" / "goose" / "sessions" / "sessions.db",
+        home / ".config" / "goose" / "sessions" / "sessions.db",
+        home / "Library" / "Application Support" / "Block" / "Goose" / "data" / "sessions" / "sessions.db",
+        home / "Library" / "Application Support" / "Goose" / "data" / "sessions" / "sessions.db",
+    ])
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _sync_goose_session_context_limit(session_id: str, capacity: int) -> bool:
+    """Ensure a resumed or newly created Goose session reflects the running model's context capacity.
+
+    Goose persists session model configs in its SQLite database and reuses that
+    saved context_limit on session/load and session/fork, ignoring GOOSE_CONTEXT_LIMIT
+    environment overrides. Updating the stored session record allows resumed sessions
+    to expand to the live model's capacity instead of prematurely triggering compaction.
+    """
+    if not session_id or not capacity or capacity <= 0:
+        return False
+    db_path = _find_goose_sessions_db()
+    if not db_path:
+        return False
+    try:
+        import sqlite3
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            row = conn.execute("SELECT model_config_json FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if not row or not row[0]:
+                return False
+            cfg = json.loads(row[0])
+            current_limit = cfg.get("context_limit")
+            if current_limit is None or current_limit < capacity:
+                cfg["context_limit"] = capacity
+                conn.execute("UPDATE sessions SET model_config_json = ? WHERE id = ?", (json.dumps(cfg), session_id))
+                conn.commit()
+                return True
+    except Exception as exc:
+        log.debug("Failed to sync Goose session context limit for %s: %s", session_id, exc)
+    return False
+
+
 def _normalize_reasoning_effort(effort: str | None) -> str | None:
     value = (effort or "").strip().lower().replace("-", "")
     aliases = {
@@ -307,6 +443,9 @@ def _merge_openrouter_parameters(raw: str | None, effort: str | None) -> str | N
 
 def _goose_env(model: str | None, permission_mode: str | None = None, effort: str | None = None) -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+    # Loom owns conversation titles and resumes Goose by session ID. Avoid
+    # an unused title inference competing with the answer on local models.
+    env["GOOSE_DISABLE_SESSION_NAMING"] = "true"
     provider, model_id = split_goose_model(model)
     mode = (permission_mode or os.environ.get("LOOM_GOOSE_MODE") or "approve").strip().lower()
     mode = mode.replace("-", "_")
@@ -314,7 +453,9 @@ def _goose_env(model: str | None, permission_mode: str | None = None, effort: st
         mode = "approve"
     if mode not in {"smart_approve", "approve", "chat"}:
         mode = "approve"
-    env["GOOSE_MODE"] = mode
+    # Keep legacy selectors, but Loom (not Goose's smart classifier) now
+    # decides approvals. Chat intentionally remains tool-free.
+    env["GOOSE_MODE"] = "chat" if mode == "chat" else "approve"
     if _truthy(os.environ.get("LOOM_GOOSE_DISABLE_KEYRING")):
         env["GOOSE_DISABLE_KEYRING"] = "true"
 
@@ -362,6 +503,14 @@ def _goose_env(model: str | None, permission_mode: str | None = None, effort: st
     elif provider == "openrouter":
         env["GOOSE_PROVIDER"] = "openrouter"
         env["GOOSE_MODEL"] = model_id
+        # Goose uses a separate fast-model slot for auxiliary requests such as
+        # session naming, classification, and tool-call summaries. Pin that
+        # slot explicitly so its provider default cannot send hidden Gemini
+        # requests through Loom's OpenRouter key.
+        env["GOOSE_FAST_MODEL"] = (
+            os.environ.get("LOOM_GOOSE_FAST_MODEL", "").strip()
+            or _DEFAULT_OPENROUTER_FAST_MODEL
+        )
         merged_params = _merge_openrouter_parameters(env.get("OPENROUTER_PARAMETERS"), effort)
         if merged_params:
             env["OPENROUTER_PARAMETERS"] = merged_params
@@ -394,16 +543,65 @@ def _openrouter_host_for_goose(base_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
-def _loom_mcp_servers() -> list[dict]:
+def _assert_acp_tool_free(init_result, session_result) -> None:
+    """Preparation must abort before evidence is sent if the provider
+    advertises ANY callable tool surface in its ACP handshake."""
+    def _surfaces(result) -> list[str]:
+        if not isinstance(result, dict):
+            return []
+        found = []
+        caps = result.get("agentCapabilities") or result.get("capabilities") or {}
+        for key in ("mcpServers", "tools", "extensions", "commands"):
+            value = caps.get(key) if isinstance(caps, dict) else None
+            if value:
+                found.append(f"capabilities.{key}")
+            value = result.get(key)
+            if value:
+                found.append(key)
+        return found
+
+    surfaces = _surfaces(init_result) + _surfaces(session_result)
+    if surfaces:
+        from preparation_errors import PreparationTransportError
+        raise PreparationTransportError(
+            "Goose preparation handshake advertised tool surfaces "
+            f"({', '.join(sorted(set(surfaces)))}); preparation aborted before "
+            "any evidence was sent")
+
+
+def _loom_mcp_servers(
+    conv_id: int = 0,
+    loom_port: int = 3000,
+    *,
+    agent_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    workspace_root: str | None = None,
+    local_search: bool = False,
+    client_instance_id: str | None = None,
+) -> list[dict]:
+    """Return the portable Loom child-run surface plus keyless web tools."""
     web_tools = Path(__file__).resolve().parent / "mcp_web_tools.py"
-    if not web_tools.is_file():
-        return []
-    return [{
-        "name": "web-tools",
-        "command": sys.executable,
-        "args": [str(web_tools)],
-        "env": [],
-    }]
+    servers = []
+    if web_tools.is_file():
+        servers.append({
+            "name": "web-tools",
+            "command": sys.executable,
+            "args": [str(web_tools)],
+            "env": [],
+        })
+    control = Path(__file__).resolve().parent / "mcp_loom_agents.py"
+    if control.is_file():
+        from codex_client import _agent_control_mcp_config
+        cfg = _agent_control_mcp_config(conv_id, loom_port, agent_run_id=agent_run_id,
+                                       parent_run_id=parent_run_id, workspace_root=workspace_root,
+                                       local_search=local_search, client_instance_id=client_instance_id)
+        servers.append({
+            "name": "loom-agent-control",
+            "command": sys.executable,
+            "args": [str(control)],
+            "env": [{"name": key, "value": value} for key, value in cfg.get("env", {}).items()],
+        })
+    return servers
 
 
 def _goose_work_dir(cwd: str | None) -> str:
@@ -483,21 +681,24 @@ def dispatch_session_update(update: dict, state: dict | None = None) -> list[dic
     if kind in {"agent_message_chunk", "agentMessageChunk", "message_delta", "messageDelta"}:
         text = _content_to_text(update.get("content") if isinstance(update, dict) else update)
         if text:
+            state["assistant_text"] = str(state.get("assistant_text") or "") + text
             events.append({"type": "text_delta", "text": text})
     elif kind in {"agent_thought_chunk", "agentThoughtChunk", "thought_delta", "thoughtDelta"}:
         text = _content_to_text(update.get("content") if isinstance(update, dict) else update)
         if text:
             events.append({"type": "thinking_delta", "text": text})
     elif kind in {"tool_call", "toolCall"}:
+        remember_tool_call(state, update)
         tc_id = str(update.get("toolCallId") or update.get("tool_call_id") or update.get("id") or "")
         seen = state.setdefault("tool_calls", set())
         seen.add(tc_id)
+        state.setdefault("active_tool_calls", set()).add(tc_id)
         events.append({
             "type": "tool_start",
             "name": update.get("title") or update.get("name") or update.get("kind") or "goose_tool",
             "tool_id": tc_id,
         })
-        body = _content_to_text(update.get("content") or update.get("input") or update.get("arguments"))
+        body = tool_input_json(update) or _content_to_text(update.get("content"))
         if body:
             events.append({"type": "tool_input_delta", "json": body, "tool_id": tc_id})
     elif kind in {"tool_call_update", "toolCallUpdate"}:
@@ -518,7 +719,11 @@ def dispatch_session_update(update: dict, state: dict | None = None) -> list[dic
                 "content": body,
                 "tool_id": tc_id,
                 "is_error": status in {"failed", "error"},
+                "outcome_recorded": status in {"completed", "failed", "error"},
             })
+        if status in {"completed", "failed", "error"} or (status is None and body):
+            state.setdefault("active_tool_calls", set()).discard(tc_id)
+            state.setdefault("permission_tool_calls", {}).pop(tc_id, None)
     elif kind in {"usage_update", "usageUpdate"}:
         events.append({
             "type": "usage",
@@ -556,26 +761,27 @@ async def _bridge_permission(
     conv_id: int,
     loom_port: int,
     permission_scope: str = "",
+    *,
+    state: dict | None = None,
+    cwd: str = "",
 ) -> None:
-    tool_call = params.get("toolCall") or params.get("tool_call") or params.get("tool") or {}
-    tool_name = (
-        tool_call.get("title")
-        or tool_call.get("name")
-        or params.get("title")
-        or params.get("name")
-        or "GooseTool"
-    )
+    tool_name, tool_input = permission_action(params, state=state, cwd=cwd)
     body = {
         "loom_conv_id": conv_id,
         "tool_name": tool_name,
-        "tool_input": {"toolCall": tool_call, "params": params},
+        "tool_input": tool_input,
         "hook_event_name": "PreToolUse",
+        "source": "goose_acp",
     }
     if permission_scope:
         body["permission_scope"] = permission_scope
+        if permission_scope.startswith("agent:"):
+            body["agent_run_id"] = permission_scope.split(":", 1)[1]
     certs_dir = Path(__file__).parent / "certs"
     protocol = "https" if (certs_dir / "cert.pem").exists() and (certs_dir / "key.pem").exists() else "http"
     allow = False
+    feedback = ""
+    decision_source = "bridge_error"
     try:
         async with httpx.AsyncClient(verify=False) as client:
             resp = await client.post(
@@ -585,23 +791,41 @@ async def _bridge_permission(
             )
             payload = resp.json()
         allow = bool(payload.get("allow"))
+        feedback = str(payload.get("feedback") or payload.get("message") or "").strip()
+        decision_source = str(payload.get("decision_source") or "loom_unknown")
     except Exception as exc:  # noqa: BLE001
-        log.warning("[Goose] permission bridge failed for conv %s: %s", conv_id, exc)
+        feedback = (
+            "Loom permission bridge failed before a user decision "
+            f"({type(exc).__name__}: {exc or 'no detail'})."
+        )
+        log.warning("[Goose] permission bridge failed for conv %s: %s", conv_id, feedback)
 
     options = params.get("options") or []
     if allow:
-        opt_id = _pick_option(options, "allow_once") or _pick_option(options, "allow")
+        opt_id = once_option(options, True)
+    elif decision_source == "user":
+        opt_id = once_option(options, False)
     else:
-        opt_id = _pick_option(options, "reject_once") or _pick_option(options, "deny") or _pick_option(options, "reject")
+        opt_id = None
     result = {"outcome": {"outcome": "selected", "optionId": opt_id}} if opt_id else {"outcome": {"outcome": "cancelled"}}
     try:
         await rpc.respond(req_id, result=result)
+        if feedback:
+            log.info(
+                "[Goose] Loom permission feedback retained for branch continuation: %s",
+                decision_source,
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("[Goose] permission reply failed for conv %s: %s", conv_id, exc)
 
 
-def _prepare_goose_prompt(prompt: str, *, nrol_operator: bool = False) -> str:
-    if nrol_operator:
+def _prepare_goose_prompt(
+    prompt: str,
+    *,
+    
+    is_first_turn: bool = True,
+) -> str:
+    if not is_first_turn:
         return prompt
     return prepend_loom_agent_context(prompt, "goose")
 
@@ -699,13 +923,27 @@ async def run_goose(
     branch: list[dict] | None = None,
     resume_session_id: str | None = None,
     fork_session: bool = False,
-    nrol_operator: bool = False,
+    
     builtins: str | list[str] | None = None,
     effort: str | None = None,
     image_paths: list[str | Path] | None = None,
+    is_first_turn: bool = True,
+    permission_scope: str = "",
+    agent_run_id: str | None = None,
+    parent_run_id: str | None = None,
+    client_instance_id: str | None = None,
+    progress_timeout_seconds: float = 900.0,
+    context_replay_history: str = "",
+    preparation: bool = False,
 ) -> tuple[asyncio.subprocess.Process, AsyncGenerator[dict, None]]:
+    # preparation=True forces GOOSE_MODE=chat (no tool registry advertised)
+    # with no builtins and no Loom agent contract. The initialization
+    # handshake must confirm that zero tools were advertised.
     del branch  # reserved for parity; server owns history rendering.
     exe = goose_exe or default_goose_exe()
+    if preparation:
+        permission_mode = "chat"
+        builtins = []
     builtin_names = builtins if builtins is not None else os.environ.get("LOOM_GOOSE_BUILTINS", "developer")
     if isinstance(builtin_names, str):
         builtin_list = [b.strip() for b in builtin_names.split(",") if b.strip()]
@@ -717,24 +955,87 @@ async def run_goose(
 
     work_dir = _goose_work_dir(cwd)
     acp_cwd = work_dir.replace("\\", "/")
+    task = asyncio.current_task()
+    gen_key = getattr(task, "_gen_key", None)
+    effective_scope = permission_scope or (f"gen:{gen_key[2]}" if gen_key else "")
+    client_instance_id = client_instance_id or getattr(task, "_client_instance_id", None)
+    effective_parent_run_id = parent_run_id or getattr(task, "_parent_run_id", None) or (
+        effective_scope if not agent_run_id else None
+    )
     env = _goose_env(model, permission_mode, effort)
-    prompt = _prepare_goose_prompt(prompt, nrol_operator=nrol_operator)
+    if preparation:
+        # Child-scoped preparation lockdown; never process-global os.environ.
+        env["LOOM_PREPARATION"] = "1"
+    env["LOOM_CONV_ID"] = str(conv_id)
+    env["LOOM_PORT"] = str(loom_port)
+    env["LOOM_WORKSPACE_ROOT"] = work_dir
+    if effective_scope:
+        env["LOOM_PERMISSION_SCOPE"] = str(effective_scope)
+    if client_instance_id:
+        env["LOOM_CLIENT_INSTANCE_ID"] = str(client_instance_id)
+    if agent_run_id:
+        env["LOOM_AGENT_RUN_ID"] = str(agent_run_id)
+    if effective_parent_run_id:
+        env["LOOM_PARENT_RUN_ID"] = str(effective_parent_run_id)
+    prompt = _prepare_goose_prompt(
+        prompt,
+        
+        is_first_turn=(False if preparation else is_first_turn),
+    )
+
+    local_backend = split_goose_model(model)[0] == "llama"
+    from context_runtime import admit_rendered
+    prompt = await admit_rendered(
+        prompt, model=model, harness="goose", resume_session_id=resume_session_id,
+        image_count=len(image_paths or []),
+        backend=split_goose_model(model)[0],
+    )
 
     kwargs = {}
     if sys.platform == "win32":
         import subprocess
 
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=work_dir,
-        env=env,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=_STREAM_LIMIT,
-        **kwargs,
-    )
+    context_guard = None
+    capacity: int | None = None
+    if local_backend:
+        from local_context_guard import LocalContextGuard
+        context_guard = LocalContextGuard(_llama_openai_base_url(), api_key=env.get("OPENAI_API_KEY", ""),
+                                          replay_history=context_replay_history)
+        try:
+            capacity = await context_guard.capacity(split_goose_model(model)[1])
+            base = await context_guard.start()
+            # Apply the live per-slot limit even when a stale environment value
+            # or a resumed Goose model config would otherwise overstate it.
+            env["GOOSE_CONTEXT_LIMIT"] = str(capacity)
+            env["GOOSE_AUTO_COMPACT_THRESHOLD"] = "0.7"
+            env["GOOSE_CONTEXT_STRATEGY"] = "summarize"
+            env["GOOSE_FAST_MODEL"] = split_goose_model(model)[1] or env["GOOSE_MODEL"]
+            if resume_session_id:
+                _sync_goose_session_context_limit(resume_session_id, capacity)
+            for key in ("OPENAI_HOST", "OPENAI_BASE_URL", "GOOSE_PROVIDER__HOST"):
+                env[key] = base
+            for key in ("OPENAI_API_KEY", "GOOSE_PROVIDER__API_KEY"):
+                env[key] = context_guard.secret
+        except BaseException:
+            await context_guard.close()
+            raise
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=work_dir,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+            **kwargs,
+        )
+    except BaseException:
+        if context_guard:
+            await context_guard.close()
+        raise
+    proc._loom_context_guard = context_guard
 
     stderr_tail: list[str] = []
 
@@ -751,12 +1052,12 @@ async def run_goose(
     rpc = _RpcConn(proc)
     state: dict = {}
     pending_tasks: set[asyncio.Task] = set()
-    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-    permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
+    permission_scope = effective_scope
 
     def _spawn_bridge(req_id: Any, params: dict) -> None:
         task = asyncio.create_task(
-            _bridge_permission(rpc, req_id, params, conv_id, loom_port, permission_scope)
+            _bridge_permission(rpc, req_id, params, conv_id, loom_port, permission_scope,
+                               state=state, cwd=work_dir)
         )
         pending_tasks.add(task)
         task.add_done_callback(pending_tasks.discard)
@@ -770,6 +1071,7 @@ async def run_goose(
         prompt_fut: asyncio.Future | None = None
         prompt_req_id: int | None = None
         finished = False
+        phase = "initialization"
         try:
             init_result = await _rpc_request_via_reader(
                 rpc,
@@ -784,13 +1086,24 @@ async def run_goose(
             )
             yield {"type": "status", "text": f"Goose ACP connected: {_content_to_text((init_result or {}).get('agentInfo') or {}).strip() or 'ready'}"}
 
+            # Native resumes must receive this turn's live capabilities too;
+            # the preceding turn's history token has already been revoked.
+            mcp_servers = [] if preparation else _loom_mcp_servers(
+                conv_id, loom_port, agent_run_id=agent_run_id,
+                parent_run_id=effective_parent_run_id, workspace_root=work_dir,
+                local_search=split_goose_model(model)[0] in {"llama", "dream"},
+                client_instance_id=client_instance_id,
+            )
             if resume_session_id:
                 try:
+                    phase = "session resume"
                     method = "session/fork" if fork_session else "session/load"
-                    params = {"sessionId": resume_session_id, "cwd": acp_cwd}
+                    params = {"sessionId": resume_session_id, "cwd": acp_cwd, "mcpServers": mcp_servers}
                     res = await _rpc_request_via_reader(rpc, method, params, proc, state)
                     session_id = (res or {}).get("sessionId") or (res or {}).get("session_id") or resume_session_id
                     models_info = (res or {}).get("models") or {}
+                    if local_backend and session_id and capacity:
+                        _sync_goose_session_context_limit(session_id, capacity)
                 except Exception as exc:
                     try:
                         await cancel_goose(proc)
@@ -800,15 +1113,30 @@ async def run_goose(
                     raise RuntimeError(f"Goose session resume/fork failed: {detail}") from exc
 
             if not session_id:
+                phase = "session creation"
+                if preparation:
+                    # Tool-free preparation: no MCP servers of any kind. The
+                    # handshake response is inspected below before any
+                    # evidence is sent.
+                    session_params: dict = {"cwd": acp_cwd, "mcpServers": []}
+                else:
+                    session_params = {
+                        "cwd": acp_cwd,
+                        "mcpServers": mcp_servers,
+                    }
                 res = await _rpc_request_via_reader(
                     rpc,
                     "session/new",
-                    {"cwd": acp_cwd, "mcpServers": _loom_mcp_servers()},
+                    session_params,
                     proc,
                     state,
                 )
                 session_id = (res or {}).get("sessionId") or (res or {}).get("session_id") or ""
                 models_info = (res or {}).get("models") or {}
+                if local_backend and session_id and capacity:
+                    _sync_goose_session_context_limit(session_id, capacity)
+                if preparation:
+                    _assert_acp_tool_free(init_result, res)
 
             effective_model = (
                 models_info.get("currentModelId")
@@ -843,7 +1171,19 @@ async def run_goose(
             })
 
             assert proc.stdout is not None
-            async for raw in proc.stdout:
+            phase = "generation"
+            while True:
+                # Permission requests intentionally wait for the human. Tool
+                # execution has separate provider/tool lifetime semantics. The
+                # watchdog targets otherwise-unbounded silent model intervals.
+                watchdog_enabled = not pending_tasks and not state.get("active_tool_calls")
+                raw = await _readline_with_progress_timeout(
+                    proc.stdout,
+                    progress_timeout_seconds if watchdog_enabled else 0,
+                    phase=phase,
+                )
+                if not raw:
+                    break
                 line = raw.rstrip(b"\r\n")
                 if not line:
                     continue
@@ -863,6 +1203,18 @@ async def run_goose(
                             yield {"type": "error", "error": f"Goose prompt failed: {detail}"}
                             result = {}
                             prompt_failed = True
+                        wrapped_error = split_goose_terminal_failure(
+                            str(state.get("assistant_text") or "")
+                        )[1]
+                        if wrapped_error and not prompt_failed:
+                            yield {
+                                "type": "error",
+                                "error": wrapped_error,
+                                "stage": "provider_response",
+                                "source": "goose_terminal_error_envelope",
+                                "retryable": is_retryable_goose_failure(wrapped_error),
+                            }
+                            prompt_failed = True
                         usage = (result or {}).get("usage") or {}
                         if usage:
                             yield {
@@ -873,7 +1225,16 @@ async def run_goose(
                         yield {
                             "type": "result",
                             "session_id": session_id,
-                            "stop_reason": (result or {}).get("stopReason") or (result or {}).get("stop_reason") or ("error" if prompt_failed else "end_turn"),
+                            "terminal_confirmed": True,
+                            "stop_reason": (
+                                "error"
+                                if prompt_failed
+                                else (
+                                    (result or {}).get("stopReason")
+                                    or (result or {}).get("stop_reason")
+                                    or "end_turn"
+                                )
+                            ),
                             "duration_ms": int((_time.time() - t0) * 1000),
                             "num_turns": 1,
                         }
@@ -918,9 +1279,13 @@ async def run_goose(
                     "num_turns": 1,
                 }
         except Exception as exc:  # noqa: BLE001
+            detail = _with_stderr_tail(_exception_text(exc), stderr_tail)
             yield {
                 "type": "error",
-                "error": _with_stderr_tail(_exception_text(exc), stderr_tail),
+                "error": detail,
+                "stage": phase,
+                "retryable": is_retryable_goose_failure(detail)
+                or isinstance(exc, (asyncio.TimeoutError, TimeoutError)),
             }
             yield {
                 "type": "result",
@@ -940,10 +1305,14 @@ async def run_goose(
             except Exception:
                 pass
 
-    return proc, _event_stream()
+    stream = _event_stream()
+    return proc, context_guard.wrap_stream(stream) if context_guard else stream
 
 
 async def cancel_goose(proc: asyncio.subprocess.Process) -> None:
+    guard = getattr(proc, "_loom_context_guard", None)
+    if guard:
+        await guard.close()
     if proc.returncode is not None:
         return
     if sys.platform == "win32":

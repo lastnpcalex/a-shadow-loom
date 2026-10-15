@@ -10,6 +10,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,10 @@ import time
 import time as _time  # alias used by generation_ms timing in CC/OODA/Weave handlers
 import uuid
 from pathlib import Path
+
+from asyncio_compat import install_windows_transport_cleanup
+
+install_windows_transport_cleanup()
 
 from fastapi import (
     Body,
@@ -33,13 +38,17 @@ from fastapi import (
     Request,
 )
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.websockets import WebSocketState
 
 from canvas_slug import generate_canvas_slug, is_valid_slug
+from canvas_workspace import add_canvas_notice, canvas_revision, canvas_root, ensure_canvas_workspace
 
 import httpx
 import database as db
+import coordination
+import agent_access
+import chat_presentations
 from config import config
 from character_loader import (
     load_all_characters,
@@ -73,27 +82,57 @@ from prompt_engine import (
 from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
-try:
-    import hermes_client
-    _HERMES_IMPORT_ERROR: ModuleNotFoundError | None = None
-except ModuleNotFoundError as e:
-    if e.name != "hermes_client":
-        raise
-    hermes_client = None
-    _HERMES_IMPORT_ERROR = e
-    print(f"[STARTUP] Hermes adapter unavailable; Hermes/Dream modes disabled: {e}")
 import codex_client
 import goose_client
 import model_context
-from provider_contract import select_resume_session
+import model_registry
+import permission_policy as permission_policy_model
+import permission_rules
+import turn_recovery
+from dataclasses import replace as dataclass_replace
+from provider_contract import (
+    ResumeDecision,
+    add_continuity_notice,
+    add_permission_feedback_notice,
+    recovery_evidence,
+    partial_replay_text,
+    resume_rejected,
+    context_exhausted,
+    select_resume_session,
+)
 from workspace_safety import (
     capture_workspace_snapshot,
     default_recovery_root,
     finalize_workspace_snapshot,
 )
+from workspace_integrity import prepare_integrity_check, revalidate_integrity
+from event_router import (
+    canonical_run_id,
+    EventSequencer,
+    GLOBAL_NOTIFICATION_KINDS,
+    LoomEventEnvelope,
+    SubscriptionRouter,
+    content_free_notification,
+)
 import local_summary
 import openrouter_client
+from search_space import (
+    SearchBackendUnavailable,
+    SearchIndex,
+    SearchOperator,
+    SearchPolicyError,
+    canonical_workspace,
+    workspace_key,
+)
+from search_space.service import SearchService
+from search_space.chat import SearchChat
+from search_space.scopes import resolve_scope
+from search_space.policy import Policy, may_read
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
+from agent_supervisor import AgentSupervisor, AgentTeardownError
+import image_generation
+import loom_auth
+from acceptance_status import source_identity as acceptance_source_identity
 
 from contextlib import asynccontextmanager
 
@@ -115,9 +154,21 @@ CRON_DENY_PATTERNS = (
     "diskpart",
 )
 _cron_scheduler_task: asyncio.Task | None = None
-_hermes_state_task: asyncio.Task | None = None
+_queued_generation_scheduler_task: asyncio.Task | None = None
+_agent_supervisor: AgentSupervisor | None = None
+_shutdown_requested = False
+_generation_admission_lock = asyncio.Lock()
+_background_tasks: set[asyncio.Task] = set()
 _cron_running: set[int] = set()
 _dream_shim_proc: subprocess.Popen | None = None
+_search_index = SearchIndex()
+_CASUAL_CHAT_ROOT = Path(__file__).parent / "ExoHome"
+
+
+def _search_source_id() -> str:
+    """Keep identical message IDs from switchable Loom databases separate."""
+    identity = str(Path(db.DB_PATH).expanduser().resolve())
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _truthy_setting(value) -> bool:
@@ -128,7 +179,7 @@ def _truthy_setting(value) -> bool:
 
 
 _AGENT_WORKSPACE_MODES = frozenset({
-    "claude", "local", "hermes", "dream", "gemini",
+    "claude", "local", "gemini",
     "codex", "goose", "umans", "openrouter",
 })
 
@@ -140,21 +191,10 @@ def _minimal_ooda_enabled(conv: dict | None) -> bool:
 
 
 def _mode_for_cc_model(cc_model: str | None) -> str | None:
-    cc_model = cc_model or ""
-    is_gemini = is_gemini_model(cc_model)
-    is_codex = is_codex_model(cc_model)
-    is_openrouter = openrouter_client.is_openrouter_model(cc_model)
-    is_goose = goose_client.is_goose_model(cc_model)
-    is_umans = is_umans_model(cc_model)
-    return (
-        "gemini" if is_gemini
-        else "codex" if is_codex
-        else "goose" if is_goose
-        else "openrouter" if is_openrouter
-        else "umans" if is_umans
-        else "claude" if model_context.is_anthropic(cc_model) or is_dream_claude_model(cc_model)
-        else None
-    )
+    route = model_registry.resolve(cc_model)
+    mode = route.get("mode")
+    # Local/Weave keep their explicit conversation-mode selection.
+    return mode if mode in {"claude", "gemini", "codex", "goose", "openrouter", "umans"} else ("claude" if is_dream_claude_model(cc_model) else None)
 
 
 def _minimal_weave_system_prompt(conv: dict | None) -> str:
@@ -177,8 +217,12 @@ CANVAS_CLAUDE_MD = """\
 # Interactive Canvas
 
 This directory is a live canvas rendered in the user's browser as an iframe.
-Everything you write here is immediately visible — the iframe auto-refreshes
-when you save files.
+Write the page to index.html; no separate app server is needed. While visible
+inside Loom, the iframe checks for saved changes roughly every three seconds.
+See CANVAS_GUIDE.md for refresh limits and SDK behavior.
+Existing Canvas files are persistent shared user work, even when gitignored.
+Read the existing entry page and imports before editing. Preserve tools and data;
+put unrelated prototypes on separate pages rather than replacing index.html.
 
 ## Structure
 
@@ -214,7 +258,8 @@ placeholders that get interpolated by `Loom.loadTrigger()`.
 Example `triggers/analyze.md`:
 ```
 Analyze the uploaded file "{{filename}}" and update the canvas with a visualization.
-Write your results to canvas/index.html.
+Read the current Canvas first. Add results in a scoped panel or separate page;
+preserve the existing entry point, tools, data, and navigation.
 ```
 
 ### Drop zone pattern
@@ -245,61 +290,602 @@ document.getElementById('run-btn').addEventListener('click', () => {
 - Keep index.html self-contained or use relative imports
 - The user sees the canvas in tree view as a thumbnail and can click to fullview
 - Build progressively — start simple, layer in interactivity
-- When using the SDK, the AI response creates a new branch in the conversation tree
+- SDK sends continue the current branch and use normal queue/permission rules; they do not implicitly request parallel work
+- Open the conversation in Loom for SDK sends; the standalone slug is a viewer without a selected chat branch
 """
 
 
-async def _hermes_model_state_loop():
-    """Periodically broadcast Hermes model-server liveness to all WS clients.
+def _resolve_agent_target(run: dict, conv: dict | None) -> tuple[str, str]:
+    """Resolve a child request without silently changing its model."""
+    requested_harness = str(run.get("requested_harness") or "").strip().lower()
+    profile = str(run.get("model_profile") or "").strip().lower()
+    harness = requested_harness
+    if profile == "local":
+        harness = "local"
+    if not harness:
+        harness = str((conv or {}).get("mode") or "claude").strip().lower()
+    aliases = {
+        "agy": "gemini",
+        "antigravity": "gemini",
+        "cc": "claude",
+        "dream_claude": "dream-claude",
+    }
+    harness = aliases.get(harness, harness)
 
-    Feeds the chat-space header indicator (server.py:4031 _ws_broadcast_all).
-    Probes llama (/v1/models) + dream (/health) every ~15s and broadcasts a
-    hermes_model_state event per backend when the state changes (or on the first
-    tick after startup). The indicator only renders for Hermes-class, non-incognito
-    convs (handled client-side in updateHermesModelIndicator).
-    """
-    last = {"llama": None, "dream": None}
-    while True:
+    model = str(run.get("requested_model") or "").strip()
+    inherited_harness = not requested_harness and profile != "local"
+    if not model and inherited_harness and conv:
+        if harness in {"claude", "codex", "gemini", "goose", "openrouter", "umans", "dream-claude"}:
+            model = str(conv.get("cc_model") or "").strip()
+        elif harness == "local":
+            model = str(conv.get("local_model") or "").strip()
+    if inherited_harness and model and harness in {"claude", "openrouter", "umans"}:
+        routed = _mode_for_cc_model(model)
+        if is_dream_claude_model(model):
+            harness = "dream-claude"
+        elif routed:
+            harness = routed
+    if reason := model_registry.retirement_reason(harness, model):
+        raise ValueError(reason)
+    if harness not in {
+        "claude", "codex", "gemini", "goose", "local",
+        "openrouter", "umans", "dream-claude",
+    }:
+        raise ValueError(f"Unsupported child harness: {harness}")
+    if not model and profile == "local":
+        model = (
+            str((conv or {}).get("local_model") or "")
+            if (conv or {}).get("mode") == "local" else ""
+        ) or config.llama_model
+    if not model:
+        defaults = {
+            "claude": "sonnet",
+            "codex": "Codex (GPT-4o)",
+            "gemini": "Gemini 3.7 Flash (High)",
+            "goose": config.goose_model,
+            "local": config.llama_model,
+            "dream-claude": (
+                f"dream:{config.dream_model}" if getattr(config, "dream_model", None) else ""
+            ),
+            "openrouter": "",
+            "umans": "",
+        }
+        model = str(defaults[harness] or "").strip()
+    if not model:
+        raise ValueError(f"No model configured for child harness: {harness}")
+    if harness == "local" and is_dream_claude_model(model):
+        harness = "dream-claude"
+    return harness, model
+
+
+async def _resolve_parent_run_context(conv_id: int, parent_run_id: str | None) -> dict | None:
+    if not parent_run_id:
+        return None
+    parent_id = str(parent_run_id).removeprefix("agent:")
+    if not parent_id.startswith("gen:"):
+        return await db.get_agent_run(parent_id)
+
+    try:
+        gen_seq = int(parent_id.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return None
+
+    for key, snapshot in _generation_snapshots.items():
+        if int(key[0]) == int(conv_id) and int(key[2]) == gen_seq:
+            model = snapshot.get("cc_model")
+            harness = snapshot.get("harness") or (_mode_for_cc_model(model) if model else None)
+            draft_msg_id = snapshot.get("draft_msg_id")
+            parent_msg_id = draft_msg_id or snapshot.get("parent_id") or key[1]
+            return {
+                "run_id": f"gen:{gen_seq}",
+                "conversation_id": conv_id,
+                "effective_model": model,
+                "requested_model": model,
+                "effective_harness": harness,
+                "requested_harness": harness,
+                "parent_message_id": parent_msg_id,
+                "project_dir": snapshot.get("project_dir"),
+                "loom_thread_id": snapshot.get("loom_thread_id"),
+            }
+
+    recent = _recent_generations.get((int(conv_id), gen_seq))
+    if recent:
+        model = recent.get("cc_model")
+        harness = recent.get("harness") or (_mode_for_cc_model(model) if model else None)
+        draft_msg_id = recent.get("draft_msg_id")
+        parent_msg_id = draft_msg_id or recent.get("parent_id")
+        return {
+            "run_id": f"gen:{gen_seq}",
+            "conversation_id": conv_id,
+            "effective_model": model,
+            "requested_model": model,
+            "effective_harness": harness,
+            "requested_harness": harness,
+            "parent_message_id": parent_msg_id,
+            "project_dir": recent.get("project_dir"),
+            "loom_thread_id": recent.get("loom_thread_id"),
+        }
+
+    return None
+
+
+def _agent_inheritance_context(conv: dict | None, parent: dict | None) -> dict:
+    """Nested defaults come from the caller, not mutable conversation settings."""
+    context = dict(conv or {})
+    if parent:
+        harness = parent.get("effective_harness") or parent.get("requested_harness")
+        model = parent.get("effective_model") or parent.get("requested_model")
+        if harness:
+            context["mode"] = harness
+        if model:
+            context.update(cc_model=model, local_model=model)
+    return context
+
+
+async def _publish_agent_event(run: dict, stored_event: dict) -> None:
+    """Publish a child event only to sockets subscribed to that run."""
+    await _publish_agent_events(run, [stored_event])
+
+
+def _agent_event_envelope(run: dict, stored_event: dict):
+    payload = dict(stored_event.get("payload") or {})
+    kind = stored_event.get("event_kind") or payload.get("type") or "agent_event"
+    return LoomEventEnvelope.from_payload(
+        {**payload, "type": kind},
+        conversation_id=run.get("conversation_id"),
+        loom_thread_id=run.get("loom_thread_id"),
+        run_id=run.get("run_id"),
+        parent_id=run.get("parent_message_id"),
+        sequence=stored_event.get("sequence") or 0,
+        event_id=stored_event.get("event_id"),
+        scope="run",
+    )
+
+
+async def _publish_agent_events(run: dict, stored_events: list[dict]) -> None:
+    if not stored_events:
+        return
+    events = [_agent_event_envelope(run, event) for event in stored_events]
+    event = events[-1]
+    frames = [_scrub_surrogates(item.as_dict()) for item in events]
+    batch = _agent_event_envelope(run, {
+        "event_kind": "agent_event_batch", "payload": {"events": frames},
+        "sequence": event.sequence,
+    }).as_dict()
+    conv_id = int(run["conversation_id"])
+    recipients = _event_router.recipients(event, _active_websockets.get(conv_id, set()))
+    for websocket in list(recipients):
         try:
-            if hermes_client is not None:
-                llama_up = await _probe_llama_live()
-                # Dream probe uses a SHORT timeout (0.5s): the sidecar is
-                # single-GPU-serialized, so /health can block behind an active
-                # generation or cold-load. A long timeout here competes with
-                # user turns for the GPU lock's attention and stalls TTFT.
-                # 0.5s is enough to catch "sidecar process is up" without
-                # queueing behind GPU work; a busy sidecar just reports down
-                # transiently, which is fine for the indicator.
-                dream_up = await _probe_dream_live(timeout=0.5)
-                if last["llama"] is None or last["llama"] != llama_up:
-                    last["llama"] = llama_up
-                    await _ws_broadcast_all({"type": "hermes_model_state",
-                                            "backend": "llama", "up": llama_up})
-                if last["dream"] is None or last["dream"] != dream_up:
-                    last["dream"] = dream_up
-                    await _ws_broadcast_all({"type": "hermes_model_state",
-                                            "backend": "dream", "up": dream_up})
-        except asyncio.CancelledError:
-            raise
+            if agent_access.sensitive(run) and not loom_auth.credential(getattr(websocket, "scope", {})):
+                # No raw deltas, error strings, tool inputs or artifact paths.
+                safe_events = [{**stored, "payload": agent_access.event_status(stored.get("payload") or {})}
+                               for stored in stored_events]
+                for safe in safe_events:
+                    await websocket.send_json(_agent_event_envelope(run, safe).as_dict())
+                continue
+            if len(frames) > 1 and getattr(websocket, "_agent_event_batches", False):
+                await websocket.send_json(batch)
+            else:
+                # Long-lived tabs with the previous bundle keep receiving the
+                # original wire format until they refresh.
+                for frame in frames:
+                    await websocket.send_json(frame)
         except Exception:
-            pass  # never let the loop die on a probe hiccup
-        await asyncio.sleep(15)
+            _active_websockets.get(conv_id, set()).discard(websocket)
+            _event_router.unregister(websocket)
+
+
+async def _teardown_child_provider(proc, harness: str) -> None:
+    """Use the provider's tree cleanup and await exit before releasing a child."""
+    cancel = {
+        "codex": codex_client.cancel_codex,
+        "gemini": gemini_client.cancel_gemini,
+        "goose": goose_client.cancel_goose,
+        "claude": claude_client.cancel_claude,
+        "local": claude_client.cancel_claude,
+        "openrouter": claude_client.cancel_claude,
+        "umans": claude_client.cancel_claude,
+        "dream-claude": claude_client.cancel_claude,
+    }.get(harness)
+    descendants = []
+    try:
+        if getattr(proc, "returncode", None) is None:
+            if getattr(proc, "pid", None):
+                import psutil
+                try:
+                    descendants = await asyncio.to_thread(
+                        lambda: psutil.Process(proc.pid).children(recursive=True)
+                    )
+                except psutil.NoSuchProcess:
+                    pass
+            if cancel is None:
+                raise RuntimeError(f"No child cleanup routine for {harness}")
+            await cancel(proc)
+        # Adapters that already reaped their process need no second wait.
+        if getattr(proc, "returncode", None) is None:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        if getattr(proc, "returncode", None) is None:
+            raise RuntimeError("Provider still has no exit status")
+        if descendants:
+            import psutil
+            _gone, alive = await asyncio.to_thread(psutil.wait_procs, descendants, timeout=5)
+            if alive:
+                raise RuntimeError("Provider descendants are still alive")
+    except Exception as exc:
+        raise AgentTeardownError(
+            f"{harness} child cleanup could not confirm process-tree exit; scope retained: {exc}"
+        ) from exc
+
+
+def _child_terminal_error(item: dict) -> str:
+    """Normalize provider terminal failures without mistaking tool errors for failures."""
+    kind = item.get("type")
+    reason = str(item.get("stop_reason") or item.get("stopReason") or "").lower()
+    if kind != "error" and not (
+        kind == "result" and (item.get("is_error") or reason in {
+            "error", "failed", "incomplete", "cancelled", "canceled", "interrupted",
+        })
+    ):
+        return ""
+    detail = item.get("error") or item.get("message") or reason or "Provider failed"
+    if isinstance(detail, dict):
+        detail = detail.get("message") or json.dumps(detail)
+    return str(detail)
+
+
+async def _launch_agent_run(
+    run: dict,
+    emit,
+) -> dict:
+    """Run one child provider turn without creating a conversation message."""
+    conv = await db.get_conversation(int(run["conversation_id"]))
+    # Provider adapters read these attributes when constructing MCP/hook
+    # configuration.  They live on the supervisor task, never on the parent
+    # conversation generation task.
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        current_task._client_instance_id = run.get("client_instance_id")
+        current_task._agent_run_id = run.get("run_id")
+        current_task._parent_run_id = run.get("parent_run_id")
+        current_task._context_plan = None
+        current_task._context_replay_region = ""
+    parent = await _resolve_parent_run_context(int(run["conversation_id"]), run.get("parent_run_id"))
+    harness, model = _resolve_agent_target(run, _agent_inheritance_context(conv, parent))
+    cwd = run.get("project_dir") or (conv or {}).get("project_dir") or "."
+    cwd = str(Path(cwd).resolve())
+    scope = run.get("path_scope") or []
+    if agent_access.sensitive(run) and harness != "local":
+        raise ValueError("Sensitive children require local inference")
+    image_request = run.get("image_request")
+    if image_request is not None:
+        if harness != "gemini":
+            raise ValueError("Image jobs require the Antigravity harness")
+        image_request = await asyncio.to_thread(
+            image_generation.prepare_image_request, cwd, image_request,
+        )
+        if image_request != run["image_request"]:
+            raise ValueError("Image request paths changed since admission")
+    bounded_task = image_generation.image_task(image_request) if image_request else run["task"]
+    scope_note = (
+        "\n\nLoom child-run scope: work only within these relative paths: "
+        + ", ".join(str(item) for item in scope)
+        + ". Do not modify files outside this scope."
+        if scope else ""
+    )
+    child_task = (
+        "You are a Loom-managed durable child run. Complete only the bounded "
+        "task below and return a concise result for the parent agent. Your "
+        "parent may finish before you; Loom persists your result independently. "
+        "Do not assume you received the parent conversation transcript.\n\n"
+        f"Task:\n{bounded_task}{scope_note}"
+    )
+    if run.get("access") is not None:
+        child_task += "\nDeclared access: " + json.dumps(run["access"])
+        if agent_access.sensitive(run):
+            child_task += "\nSensitive local task: keep raw information in this child. The human releases any parent handoff."
+    child_task = add_canvas_notice(child_task, conv)
+    if image_request is None:
+        from child_context import prepare as prepare_child_context
+        async def context_status(text):
+            await emit("status", {"text": text})
+        backend = "llama" if harness == "local" else None
+        if harness == "goose":
+            backend = goose_client.split_goose_model(model)[0]
+        child_task = await prepare_child_context(
+            run, child_task, model=model, harness=harness,
+            backend=backend, status=context_status,
+        )
+    port = int(config.port)
+    await emit(
+        "agent_launch_info",
+        {
+            "requested_harness": run.get("requested_harness"),
+            "requested_model": run.get("requested_model"),
+            "effective_harness": harness,
+            "effective_model": model,
+            "profile": run.get("model_profile"),
+            "cwd": cwd,
+            "path_scope": scope,
+            "context_plan": getattr(current_task, "_context_plan", None),
+        },
+    )
+    await db.update_agent_run(
+        run["run_id"], effective_harness=harness, effective_model=model
+    )
+
+    permission_scope = f"agent:{run['run_id']}"
+    common = {
+        "conv_id": int(run["conversation_id"]),
+        "server_port": port,
+        "permission_mode": "default",
+        "permission_scope": permission_scope,
+    }
+    client_instance_id = run.get("client_instance_id")
+    proc = None
+    stream = None
+    if harness == "codex":
+        proc, stream = await codex_client.run_codex(
+            child_task, cwd, model=model, **common,
+            agent_run_id=run["run_id"],
+            permission_request_handler=handle_cc_permission,
+        )
+    elif harness == "gemini":
+        proc, stream = await gemini_client.run_gemini(
+            child_task, cwd, model=model, **common,
+            agent_run_id=run["run_id"],
+        )
+    elif harness == "goose":
+        proc, stream = await goose_client.run_goose(
+            child_task, conv_id=int(run["conversation_id"]), cwd=cwd, model=model, loom_port=port,
+            permission_mode="default", permission_scope=permission_scope,
+            agent_run_id=run["run_id"], parent_run_id=run.get("parent_run_id"),
+            client_instance_id=client_instance_id,
+            context_replay_history=getattr(current_task, "_context_replay_region", ""),
+        )
+    elif harness in {"claude", "local", "openrouter", "umans", "dream-claude"}:
+        requested_model = model
+        provider_model = model
+        route_options = {}
+        if harness == "local":
+            # Local mode is Claude Code backed by llama-server, with the same
+            # tools, contract, permission hook and nested-control MCP as its parent.
+            route_options["use_llama"] = True
+        elif harness == "openrouter":
+            provider_model = openrouter_client.model_slug(model)
+            route_options["use_openrouter"] = True
+        elif harness == "umans":
+            route_options["use_umans"] = True
+        elif harness == "dream-claude":
+            provider_model = _dream_claude_model_id(model)
+            route_options["use_dream"] = True
+        proc, stream = await claude_client.run_claude(
+            child_task, cwd, model=provider_model, requested_model=requested_model,
+            **common, **route_options,
+            context_replay_history=getattr(current_task, "_context_replay_region", ""),
+            extra_env={
+                "LOOM_AGENT_RUN_ID": run["run_id"],
+                "LOOM_PARENT_RUN_ID": run.get("parent_run_id"),
+            },
+            extra_disallowed_tools=(["Agent", "Task", "Bash", "PowerShell", "KillShell", "WebSearch", "WebFetch"]
+                                    if agent_access.sensitive(run) else
+                                    ["Agent", "Task", "Bash", "PowerShell", "Write", "Edit", "NotebookEdit"]
+                                    if run.get("access") is not None and not run["access"]["write"] else None),
+        )
+    else:
+        raise ValueError(f"Unsupported child harness: {harness}")
+
+    full_text = ""
+    final: dict = {}
+    failure = ""
+    saw_result = False
+    image_evidence = image_generation.NativeImageEvidence()
+    try:
+        if proc is not None and getattr(proc, "pid", None):
+            await db.update_agent_run(run["run_id"], pid=int(proc.pid))
+        async for item in stream:
+            item = dict(item or {})
+            if image_request is not None:
+                image_evidence.observe(item)
+            kind = item.get("type") or "status"
+            # ACP adapters also expose their native numeric approval request.
+            # Only the Loom bridge owns the actionable UUID and resolution.
+            if kind == "permission_request":
+                continue
+            failure = failure or _child_terminal_error(item)
+            if kind in {"text_delta", "stream_chunk"}:
+                full_text += item.get("text") or item.get("content") or ""
+            if kind in {"session_info", "result"}:
+                if item.get("session_id"):
+                    await db.update_agent_run(
+                        run["run_id"], provider_session_id=str(item["session_id"])
+                    )
+                effective = item.get("model") or item.get("effective_model")
+                if effective:
+                    await db.update_agent_run(run["run_id"], effective_model=str(effective))
+            if kind == "result":
+                final = item
+                saw_result = True
+                if not full_text:
+                    full_text = str(item.get("result_text") or item.get("text") or "")
+            await emit(kind, item)
+    finally:
+        async def finish_child():
+            try:
+                if proc is not None:
+                    await _teardown_child_provider(proc, harness)
+                    await db.update_agent_run(run["run_id"], pid=None)
+            finally:
+                await _resolve_pending_permissions_for_scope(
+                    int(run["conversation_id"]), permission_scope,
+                    message="Loom child run ended before a permission decision; this was not a user denial.",
+                )
+                _auto_approve_permissions.pop((int(run["conversation_id"]), permission_scope), None)
+
+        # Repeated stop clicks cannot detach teardown or permission retirement.
+        cleanup = asyncio.create_task(finish_child())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+    error = failure or ("Provider stream ended without a terminal result" if not saw_result else "")
+    image_result = {}
+    if image_request is not None and not error:
+        if not image_evidence.succeeded:
+            error = "No successful native generate_image tool call was observed"
+        else:
+            try:
+                artifact = await asyncio.to_thread(
+                    image_generation.image_artifact, cwd, image_request, int(run["conversation_id"]),
+                )
+                image_result = {"artifacts": [artifact]}
+            except (ValueError, OSError) as exc:
+                error = f"Image artifact validation failed: {exc}"
+    return {
+        "text": full_text,
+        "result": final,
+        "harness": harness,
+        "model": model,
+        "error": error,
+        **image_result,
+    }
+
+
+async def _cancel_background_task(task: asyncio.Task | None, label: str) -> None:
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print(f"[SHUTDOWN] {label} cleanup failed: {exc}")
+
+
+def _spawn_background_task(
+    coroutine,
+    label: str,
+    *,
+    allow_during_shutdown: bool = False,
+) -> asyncio.Task | None:
+    """Own a background coroutine so shutdown can cancel and drain it."""
+    if _shutdown_requested and not allow_during_shutdown:
+        close = getattr(coroutine, "close", None)
+        if close:
+            close()
+        return None
+    task = asyncio.create_task(coroutine, name=f"loom:{label}")
+    _background_tasks.add(task)
+
+    def _finished(done: asyncio.Task) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        try:
+            error = done.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            print(f"[BACKGROUND] {label} failed: {error}")
+
+    task.add_done_callback(_finished)
+    return task
+
+
+async def _drain_tracked_background_tasks_for_shutdown() -> None:
+    """Cancel every Loom-owned auxiliary task before closing SQLite."""
+    while True:
+        tasks = [task for task in _background_tasks if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _request_generation_shutdown() -> None:
+    """Reject new launch admissions without waiting on an in-flight launch."""
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+async def _close_generation_admission() -> None:
+    """Reject new launches, then wait until earlier admission is registered."""
+    _request_generation_shutdown()
+    async with _generation_admission_lock:
+        pass
+
+
+async def _drain_active_generations_for_shutdown() -> None:
+    """Interrupt active turns and wait for provider process-tree teardown."""
+    tasks = list({
+        task for task in _active_generations.values() if not task.done()
+    })
+    if not tasks:
+        return
+    print(f"[SHUTDOWN] Interrupting {len(tasks)} active generation(s)")
+    for task in tasks:
+        _request_generation_stop(task, "interrupt")
+    done, pending = await asyncio.wait(tasks, timeout=20.0)
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    if not pending:
+        return
+
+    # Adapter teardown normally owns its subprocess. If a task remains after
+    # the grace period, force only the exact persisted provider process trees.
+    rows = await db.list_active_generations()
+    async def _reap_provider(row: dict) -> None:
+        pid = row.get("pid")
+        if pid and _pid_alive(int(pid)):
+            _kill_pid(int(pid))
+            await _wait_for_pid_exit(int(pid), timeout=8.0)
+
+    # One bounded reap window for all providers; N providers must not turn an
+    # 8-second phase into N*8 seconds and outrun the admin's outer deadline.
+    await asyncio.gather(*(_reap_provider(row) for row in rows))
+    for task in pending:
+        task.cancel()
+    done_after_kill, pending = await asyncio.wait(pending, timeout=5.0)
+    if done_after_kill:
+        await asyncio.gather(*done_after_kill, return_exceptions=True)
+    if pending:
+        print(
+            f"[SHUTDOWN] {len(pending)} generation task(s) resisted teardown; "
+            "database reopen is now disabled"
+        )
 
 
 @asynccontextmanager
 async def lifespan(app):
     global _cron_scheduler_task
-    global _hermes_state_task
+    global _queued_generation_scheduler_task
+    global _agent_supervisor
+    global _shutdown_requested
+    _shutdown_requested = False
     await db.init_db()
     await _cron_init_db()
-    # Clean up stale draft messages (empty assistant msgs older than 30 min)
-    await _cleanup_stale_drafts()
+    from usage_activity import activity
+    _spawn_background_task(activity.run(), "usage activity snapshots")
     # Reap orphan CC/LLM subprocesses from prior server instances.
     await _reap_orphan_generations()
+    # Clean up stale draft messages (empty assistant msgs older than 30 min)
+    await _cleanup_stale_drafts()
+    # Release only leases whose provider rows were successfully reaped. A
+    # process tree that resisted termination keeps its row and serial lane.
+    await db.release_stale_generation_leases()
+    # Any launch claim belonged to the previous process. The durable queued
+    # message remains canonical and will be picked up by the new scheduler.
+    await db.reset_launching_queued_generations()
     # Re-broadcast pending permission requests from DB (server restart)
     await _reload_pending_permissions()
     # Ensure Llama Server is reachable (warns if not)
-    asyncio.create_task(_ensure_llama())
+    _spawn_background_task(_ensure_llama(), "ensure llama")
     # Warm the local-model caches once Llama Server is up so the settings panel
     # opens instantly. Runs as a background task so we don't block startup
     # while waiting on a slow Llama Server probe.
@@ -312,9 +898,9 @@ async def lifespan(app):
             print(f"[CACHE] Warmed model caches: {len((_LOCAL_MODELS_CACHE or {}).get('models', []))} models, {len((_VISION_MODELS_CACHE or {}).get('models', []))} vision-capable, {len((_ALL_ENGINES_CACHE or {}).get('models', []))} cross-engine")
         except Exception as e:
             print(f"[CACHE] Initial warm failed (will fetch on demand): {e}")
-    asyncio.create_task(_warm_model_caches())
+    _spawn_background_task(_warm_model_caches(), "warm model caches")
     # Sync model IDs from the running Llama Server into config
-    asyncio.create_task(_update_model_ids_on_startup())
+    _spawn_background_task(_update_model_ids_on_startup(), "sync model ids")
 
     async def _refresh_remote_models_on_startup():
         await asyncio.sleep(3)
@@ -349,28 +935,54 @@ async def lifespan(app):
         except Exception as e:
             print(f"[STARTUP] Gemini model refresh failed: {e}")
 
-    asyncio.create_task(_refresh_remote_models_on_startup())
+    _spawn_background_task(
+        _refresh_remote_models_on_startup(), "refresh remote models"
+    )
     _cron_scheduler_task = asyncio.create_task(_cron_scheduler_loop())
-    _hermes_state_task = asyncio.create_task(_hermes_model_state_loop())
-    yield
-    if _cron_scheduler_task:
-        _cron_scheduler_task.cancel()
+    _queued_generation_scheduler_task = asyncio.create_task(
+        _queued_generation_scheduler_loop()
+    )
+    _agent_supervisor = AgentSupervisor(
+        launcher=_launch_agent_run,
+        event_sink=_publish_agent_event,
+        batch_sink=_publish_agent_events,
+        target_resolver=_resolve_agent_target,
+    )
+    await _agent_supervisor.start()
+    try:
+        yield
+    finally:
+        # Share an admission barrier with _launch_generation_task. Once this
+        # lock is released every launch that began earlier is registered in
+        # _active_generations, and every later launch sees shutdown=True.
+        await _close_generation_admission()
+        # Stop schedulers first so teardown cannot claim queued work or create
+        # another generation while the existing providers are being drained.
+        await _cancel_background_task(_cron_scheduler_task, "cron scheduler")
+        await _cancel_background_task(
+            _queued_generation_scheduler_task, "generation queue scheduler"
+        )
+        if _agent_supervisor:
+            try:
+                await _agent_supervisor.stop()
+            except Exception as exc:
+                print(f"[SHUTDOWN] Agent supervisor cleanup failed: {exc}")
+            _agent_supervisor = None
+        await _drain_tracked_background_tasks_for_shutdown()
         try:
-            await _cron_scheduler_task
-        except asyncio.CancelledError:
-            pass
-    if _hermes_state_task:
-        _hermes_state_task.cancel()
+            await _drain_active_generations_for_shutdown()
+        except Exception as exc:
+            print(f"[SHUTDOWN] Generation drain failed: {exc}")
+        # Generation finalizers can schedule cancellation-safe lease releases;
+        # drain that final wave before disabling database access.
+        await _drain_tracked_background_tasks_for_shutdown()
+        # Nothing may open/reopen the process-global SQLite connection after
+        # this point. The close and WAL checkpoint are the final lifecycle act.
+        db.begin_shutdown()
         try:
-            await _hermes_state_task
-        except asyncio.CancelledError:
-            pass
-    if hermes_client is not None:
-        try:
-            await hermes_client.shutdown_hermes_runtimes()
-        except Exception as e:
-            print(f"[SHUTDOWN] Hermes runtime cleanup failed: {e}")
-    await db.close_db()
+            await db.close_db()
+        except Exception as exc:
+            print(f"[SHUTDOWN] Database close failed: {exc}")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -423,6 +1035,18 @@ def _kill_pid(pid: int) -> bool:
         return False
 
 
+async def _wait_for_pid_exit(pid: int | None, timeout: float = 10.0) -> bool:
+    """Wait until an exact provider PID is gone without blocking the event loop."""
+    if not pid:
+        return True
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    while _pid_alive(pid):
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
 async def _reap_orphan_generations():
     """On server startup, any row in active_generations came from a prior
     server instance that didn't finalize before shutdown. Kill the subprocess
@@ -437,11 +1061,23 @@ async def _reap_orphan_generations():
         draft_msg_id = row.get("draft_msg_id")
         conv_id = row.get("conv_id")
         alive = _pid_alive(pid) if pid else False
+        killed = False
         if alive:
             killed = _kill_pid(pid)
             print(f"[REAP] conv={conv_id} draft={draft_msg_id} pid={pid} alive — killed={killed}")
         else:
             print(f"[REAP] conv={conv_id} draft={draft_msg_id} pid={pid} already dead")
+        if alive and killed:
+            alive = not await _wait_for_pid_exit(pid, timeout=8.0)
+        if alive:
+            # Fail closed. Keep both the active-generation row and its
+            # database lease so the scheduler cannot launch another provider
+            # beside a process tree that resisted startup reaping.
+            print(
+                f"[REAP] conv={conv_id} draft={draft_msg_id} pid={pid} "
+                "still alive; retaining serial lane"
+            )
+            continue
         # Mark draft as errored if it's still an empty draft (don't clobber
         # finalized content).
         try:
@@ -458,7 +1094,10 @@ async def _reap_orphan_generations():
 
 
 async def _cleanup_stale_drafts():
-    """Remove empty assistant draft messages older than 30 minutes on startup."""
+    """Retain and repair empty assistant draft messages older than 30 minutes on startup.
+
+    Does not delete branches, queued descendants, or parent links.
+    """
     import time
 
     cutoff = time.time() - 1800  # 30 minutes
@@ -469,60 +1108,42 @@ async def _cleanup_stale_drafts():
     )
     if rows:
         ids = [r["id"] for r in rows]
-        print(f"[STARTUP] Cleaning up {len(ids)} stale draft(s): {ids}")
+        print(f"[STARTUP] Repairing {len(ids)} stale draft(s): {ids}")
         for msg_id in ids:
-            await db.delete_branch(msg_id)
+            await db.update_message_content(
+                msg_id,
+                content="[Generation interrupted by server restart]",
+                turn_lifecycle_state="interrupted",
+            )
     await conn.close()
 
 
 async def _reload_pending_permissions():
-    """Load pending permissions from DB and re-broadcast to WebSockets."""
+    """Keep pending permissions durable; route them on the owning socket.
+
+    This used to broadcast one permission from every conversation to every
+    connected WebSocket and then delete the durable row.  Reconnect is now a
+    read of the row, filtered by the explicit run subscription.
+    """
     import time
 
     # Clean up very old permissions (1 hour+) before reloading
     await db.delete_old_pending_permissions(time.time() - 3600)
     print(f"[STARTUP] Cleaned up permissions older than 1 hour")
 
-    # Load pending permissions for all conversations
+    # Keep rows in SQLite.  A reconnecting socket will request its own
+    # conversation's pending rows through ``_send_pending_permissions``.
     conn = await db.get_db()
     rows = await conn.execute_fetchall(
-        "SELECT request_id, conv_id, tool_name, tool_input, input_summary, started_at FROM pending_permissions ORDER BY started_at"
+        "SELECT request_id, conv_id, run_id, parent_id, draft_msg_id, client_instance_id, permission_scope "
+        "FROM pending_permissions ORDER BY started_at"
     )
-
-    # Build permission messages
-    perm_messages = {}
     for row in rows:
-        perm_msg = {
-            "type": "permission_request",
-            "request_id": row["request_id"],
-            "conv_id": row["conv_id"],
-            "tool_name": row["tool_name"],
-            "tool_input": row["tool_input"],
-            "input_summary": row["input_summary"],
-        }
-        perm_messages[row["conv_id"]] = perm_msg
         print(
-            f"[STARTUP] Reloading pending permission: {row['request_id']} for conv={row['conv_id']} tool={row['tool_name']}"
+            f"[STARTUP] Preserved pending permission: {row['request_id']} "
+            f"for conv={row['conv_id']} run={row['run_id'] or row['permission_scope'] or 'conversation'}"
         )
-
-    # Broadcast to active WebSockets
-    dead_pairs = []
-    sent_count = 0
-    for cid, clients in list(_active_websockets.items()):
-        for ws in list(clients):
-            try:
-                if cid in perm_messages:
-                    await ws.send_json(perm_messages[cid])
-                    sent_count += 1
-            except Exception as e:
-                print(f"[STARTUP] Failed to reload perm to conv={cid}: {e}")
-                dead_pairs.append((cid, ws))
-    print(f"[STARTUP] Reloaded {sent_count} permission(s) to active WebSockets")
-
-    # Clean up from DB
-    for row in rows:
-        await db.delete_pending_permission(row["request_id"])
-    print(f"[STARTUP] Cleared {len(rows)} pending permissions from DB")
+    await conn.close()
 
 
 async def _ensure_llama():
@@ -802,7 +1423,7 @@ async def _cron_scheduler_loop() -> None:
         try:
             due = await asyncio.to_thread(_cron_due_jobs_sync, _cron_now())
             for job in due:
-                asyncio.create_task(_cron_run_job(job))
+                _spawn_background_task(_cron_run_job(job), f"cron job {job['id']}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -833,7 +1454,37 @@ CRON_HELP = {
 }
 
 
-app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
+try:
+    _STARTUP_SOURCE_IDENTITY = acceptance_source_identity()
+except Exception as _identity_error:
+    print(f"[ACCEPTANCE] Build identity unavailable: {_identity_error}")
+    _STARTUP_SOURCE_IDENTITY = None
+
+
+app = FastAPI(title="EX umbra Omnia", lifespan=lifespan)
+
+# Loopback/Tailscale gate plus remote browser authentication by default. Agent
+# processes (hooks, MCP servers, child runs) call only these routes, from
+# loopback, and never carry the browser cookie. They request; they don't approve.
+loom_auth.install(
+    app,
+    public_prefixes=("/static/",),
+    agent_routes=(
+        r"/api/cc-permission",
+        r"/api/cc-tool-start",
+        r"/api/cc-tool-result",
+        r"/api/local/describe-image",
+        r"/api/conversations/\d+/agent-runs",
+        r"/api/conversations/\d+/chat-items",
+        r"/api/agent-runs/[^/]+(/cancel|/resume|/context-retrieval)?",
+        r"/api/conversations/\d+/context-retrieval",
+        r"/api/search-space/(query|retrieve)",
+        r"/api/history/(search_conversations|read_conversation_context|get_conversation_details)",
+        r"/api/state-schemas",
+        r"/api/conversations/\d+/state",
+        r"/api/state/[^/]+",
+    ),
+)
 
 # --- Graceful shutdown endpoint ---
 _server_ref: list = []  # holds uvicorn.Server for shutdown
@@ -841,8 +1492,12 @@ _server_ref: list = []  # holds uvicorn.Server for shutdown
 
 @app.post("/shutdown")
 async def shutdown():
-    """Gracefully stop this server instance — checkpoints WAL first."""
-    await db.close_db()  # checkpoints WAL + closes connection
+    """Ask Uvicorn to exit without blocking the admin's HTTP timeout.
+
+    New admissions are rejected synchronously. Lifespan teardown waits behind
+    any launch already holding the admission lock before it drains providers.
+    """
+    _request_generation_shutdown()
     if _server_ref:
         _server_ref[0].should_exit = True
         return JSONResponse({"status": "shutting down"})
@@ -860,26 +1515,398 @@ async def api_list_generations():
     # Annotate each with liveness + in-memory status
     for r in rows:
         r["pid_alive"] = _pid_alive(r.get("pid")) if r.get("pid") else False
+        draft_id = r.get("draft_msg_id")
         r["in_memory"] = any(
-            k[0] == r.get("conv_id") and not t.done()
+            not t.done() and (
+                _generation_snapshots.get(k, {}).get("draft_msg_id") == draft_id
+                or getattr(t, "_draft_msg_id", None) == draft_id
+                or (draft_id is None and k[0] == r.get("conv_id"))
+            )
             for k, t in _active_generations.items()
         )
     return rows
 
 
+@app.get("/api/build-identity")
+async def api_build_identity():
+    """Identity captured when this Main process loaded its source."""
+    return JSONResponse(
+        {"source": _STARTUP_SOURCE_IDENTITY},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _require_admin_relay(request: Request) -> None:
+    # The admin UI is a privileged surface. Browser requests go through the
+    # admin server, which relays with the machine secret; a constant header
+    # would let any local process (including an agent's shell) approve itself.
+    if (not request.client or not loom_auth.is_loopback(request.client.host)
+            or request.headers.get("origin")
+            # Checked here, not via middleware state, so the gate holds even
+            # if the route is mounted without the access middleware.
+            or loom_auth.credential(request.scope) != "relay"):
+        raise HTTPException(403, "Admin loopback relay required")
+
+
+@app.get("/api/admin/supervision")
+async def api_admin_supervision(request: Request):
+    """Small metadata projection; no transcripts, cursor writes or PID scans."""
+    _require_admin_relay(request)
+    rows = await db.list_active_generations()
+    runs = {r["draft_msg_id"]: {
+        "conv_id": r["conv_id"], "draft_msg_id": r["draft_msg_id"],
+        "branch_id": r["draft_msg_id"], "run_id": None, "kind": "generation",
+        "mode": r.get("mode"), "project_dir": r.get("project_dir"),
+        "started_at": r.get("started_at"), "pid": r.get("pid"),
+        "status": "tracked", "loom_thread_id": r.get("loom_thread_id"),
+    } for r in rows}
+    for key, task in list(_active_generations.items()):
+        if task.done():
+            continue
+        snap = _generation_snapshots.get(key) or {}
+        draft = snap.get("draft_msg_id")
+        attestation = snap.get("model_attestation") or {}
+        item = runs.setdefault(draft or f"gen:{key[2]}", {})
+        item.update({"conv_id": key[0], "run_id": f"gen:{key[2]}",
+                     "kind": "generation", "draft_msg_id": draft,
+                     "branch_id": draft or snap.get("parent_id") or key[1],
+                     "mode": attestation.get("harness") or item.get("mode"),
+                     "model": attestation.get("effective_model") or attestation.get("launch_model"),
+                     "status": "cancelling" if getattr(task, "_stop_disposition", None)
+                     else ("running" if draft else "preparing")})
+        if snap.get("started_at"):
+            item.setdefault("started_at", snap["started_at"])
+    for child in await db.list_agent_runs(statuses=["queued", "launching", "running", "cancelling"]):
+        run_id = f"agent:{child['run_id']}"
+        runs[run_id] = {"conv_id": child["conversation_id"], "run_id": run_id,
+                        "kind": "child", "branch_id": child.get("parent_message_id"),
+                        "mode": child.get("effective_harness") or child.get("requested_harness"),
+                        "model": child.get("effective_model") or child.get("requested_model"),
+                        "status": child["status"], "started_at": child.get("started_at"),
+                        "project_dir": child.get("project_dir"), "pid": child.get("pid")}
+    permissions = []
+    public_fields = ("conv_id", "run_id", "parent_id", "draft_msg_id", "permission_scope",
+                     "tool_name", "tool_input", "input_summary", "source", "risk_level",
+                     "risk_reason", "rule_preview", "supports_allow_all", "started_at")
+    for request_id, pending in list(_pending_hook_permissions.items()):
+        if pending.get("response") is not None:
+            continue
+        item = {name: pending.get(name) for name in public_fields}
+        item["request_id"] = request_id
+        owner = next((r for r in runs.values() if r.get("run_id") == item.get("run_id")
+                      and r["conv_id"] == item["conv_id"]), None) if item.get("run_id") else None
+        item["branch_id"] = item.get("draft_msg_id") or item.get("parent_id") or (owner or {}).get("branch_id")
+        item["profile"] = (pending.get("policy") or {}).get("profile")
+        if owner:
+            if owner["status"] != "cancelling":
+                owner["status"] = "awaiting_permission"
+            item["project_dir"] = owner.get("project_dir")
+            item["mode"] = owner.get("mode")
+            item["model"] = owner.get("model")
+        permissions.append(item)
+    conversations = {}
+    for item in [*runs.values(), *permissions]:
+        cid = item["conv_id"]
+        if cid not in conversations:
+            conversations[cid] = await db.get_conversation(cid) or {}
+        conv = conversations[cid]
+        item["title"] = conv.get("title") or f"Conversation #{cid}"
+        item["project_dir"] = item.get("project_dir") or conv.get("project_dir") or ""
+        item["mode"] = item.get("mode") or item.get("source") or conv.get("mode")
+        # A model selected for the NEXT turn is not evidence about this run.
+        if not item.get("model") and item.get("status") == "preparing" and conv.get("cc_model"):
+            item["model"] = "Selected: " + conv["cc_model"]
+    # A final draft can be persisted before provider teardown finishes. Keep
+    # such turns out of the inbox until their owning task has actually ended.
+    live_drafts = {item.get("draft_msg_id") for item in runs.values() if item.get("draft_msg_id")}
+    try:
+        landed = await db.list_landed_generations()
+        # Recheck after the read's await boundary as new tasks may have started.
+        live_drafts.update(getattr(task, "_draft_msg_id", None)
+                           for task in _active_generations.values() if not task.done())
+        live_drafts.discard(None)  # children have no draft of their own
+        landed = [item for item in landed if item.get("draft_msg_id") not in live_drafts]
+    except Exception as exc:
+        # Optional history must never take working approvals/active tracking down.
+        print(f"[ADMIN] Completion history unavailable ({type(exc).__name__})")
+        landed = None
+    return JSONResponse(_scrub_surrogates({"generations": list(runs.values()), "permissions": permissions,
+                                          "landed": landed, "landed_limit": 100}),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/admin/permissions/{request_id}")
+async def api_admin_permission_response(request_id: str, request: Request, data: dict = Body(...)):
+    _require_admin_relay(request)
+    if type(data.get("allow")) is not bool or type(data.get("always", False)) is not bool:
+        raise HTTPException(422, "Approval choices must be booleans")
+    pending = _pending_hook_permissions.get(request_id)
+    if not pending or pending.get("response") is not None:
+        raise HTTPException(409, "Request already resolved or no longer active")
+    if (data.get("conv_id") != pending.get("conv_id")
+            or data.get("run_id") != pending.get("run_id")):
+        raise HTTPException(409, "Permission owner changed; refresh the request")
+    if data.get("always") and not pending.get("supports_allow_all"):
+        raise HTTPException(422, "This request supports one-time approval only")
+    if not await _answer_pending_permission(request_id, data, channel="admin"):
+        raise HTTPException(409, "Request already resolved or no longer active")
+    return {"resolved": True, "allowed": data["allow"]}
+
+
+@app.post("/api/conversations/{conv_id}/context-retrieval")
+async def api_context_retrieval(conv_id: int, data: dict = Body(...)):
+    from context_checkpoints import retrieve
+    try:
+        return await retrieve(data.get("token"), conv_id, message_id=data.get("message_id"),
+                              offset=data.get("offset", 0), limit=data.get("limit", 8000))
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.post("/api/agent-runs/{run_id}/context-retrieval")
+async def api_child_context_retrieval(run_id: str, data: dict = Body(...)):
+    from child_context import retrieve
+    try:
+        return await retrieve(data.get("token"), run_id, message_id=data.get("message_id"),
+                              offset=data.get("offset", 0), limit=data.get("limit", 8000))
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.post("/api/conversations/{conv_id}/agent-runs")
+async def api_spawn_agent_run(conv_id: int, data: dict = Body(...)):
+    """Queue a Loom-managed child run without creating a tree message."""
+    global _agent_supervisor
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if _agent_supervisor is None:
+        _agent_supervisor = AgentSupervisor(
+            launcher=_launch_agent_run,
+            event_sink=_publish_agent_event,
+            batch_sink=_publish_agent_events,
+            target_resolver=_resolve_agent_target,
+        )
+        await _agent_supervisor.start()
+    parent_run_id = str(data.get("parent_run_id") or "").strip() or None
+    if parent_run_id and parent_run_id.startswith("agent:"):
+        parent_run_id = parent_run_id.split(":", 1)[1]
+    inferred_parent_message_id = None
+    parent = None
+    if parent_run_id:
+        parent = await _resolve_parent_run_context(conv_id, parent_run_id)
+        if not parent:
+            synthetic_generation = str(parent_run_id).startswith("gen:")
+            if not synthetic_generation:
+                raise HTTPException(status_code=400, detail="parent_run_id does not belong to this conversation")
+        if parent:
+            inferred_parent_message_id = parent.get("parent_message_id")
+    project_dir = data.get("project_dir") or (parent or {}).get("project_dir") or conv.get("project_dir") or "."
+    try:
+        access = agent_access.validate(project_dir, data.get("access"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if parent and agent_access.sensitive(parent):
+        if access is None:
+            access = parent["access"]
+        if not access.get("sensitive"):
+            raise HTTPException(status_code=400, detail="Sensitive descendants cannot broaden disclosure")
+    path_scope = data.get("path_scope") or []
+    if not isinstance(path_scope, list) or any(not isinstance(item, str) for item in path_scope):
+        raise HTTPException(status_code=400, detail="path_scope must be a list of paths")
+    workspace_root = Path(project_dir).resolve()
+    image_request = data.get("image_request")
+    if image_request is not None:
+        try:
+            image_request = await asyncio.to_thread(
+                image_generation.prepare_image_request, workspace_root, image_request,
+            )
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        data = {
+            **data, "harness": "agy", "profile": None,
+            "model": data.get("model") or image_generation.DEFAULT_AGENT_MODEL,
+            "task": image_generation.image_task(image_request),
+        }
+        path_scope = image_generation.image_scope(image_request)
+    parent_message_id = data.get("parent_message_id") or inferred_parent_message_id
+    if parent_message_id is not None:
+        parent_message = await db.get_message(parent_message_id)
+        if not parent_message or int(parent_message.get("conversation_id")) != int(conv_id):
+            raise HTTPException(status_code=400, detail="parent_message_id does not belong to this conversation")
+    normalized_scope = []
+    for raw_path in path_scope:
+        candidate = Path(raw_path)
+        resolved = (candidate if candidate.is_absolute() else workspace_root / candidate).resolve()
+        if resolved != workspace_root and workspace_root not in resolved.parents:
+            raise HTTPException(status_code=400, detail=f"path_scope escapes project_dir: {raw_path}")
+        normalized_scope.append(str(resolved.relative_to(workspace_root)) if resolved != workspace_root else ".")
+    try:
+        harness, model = _resolve_agent_target(
+            {"requested_harness": data.get("harness"), "requested_model": data.get("model"),
+             "model_profile": data.get("profile")},
+            _agent_inheritance_context(conv, parent),
+        )
+        if access and access.get("sensitive") and harness != "local":
+            raise ValueError("Sensitive children require profile=local")
+        run = await _agent_supervisor.spawn(
+            conv_id,
+            str(data.get("task") or ""),
+            parent_run_id=parent_run_id,
+            parent_message_id=parent_message_id,
+            harness=harness,
+            model=model,
+            profile=data.get("profile"),
+            project_dir=str(project_dir),
+            path_scope=normalized_scope,
+            client_instance_id=str(data.get("client_instance_id") or "").strip() or None,
+            defer_start=True,
+            image_request=image_request,
+            access=access,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    client_id = str(run.get("client_instance_id") or "").strip()
+    if client_id:
+        websocket = _find_client_websocket(conv_id, client_id)
+        if websocket:
+            _event_router.subscribe(websocket, run["run_id"])
+    queued_event = await db.append_agent_event(
+        run["run_id"], "agent_queued", {"task": run["task"], "status": "queued"}
+    )
+    await _publish_agent_event(run, queued_event)
+    _agent_supervisor.wake()
+    return run
+
+
+@app.get("/api/conversations/{conv_id}/agent-runs")
+async def api_list_agent_runs(conv_id: int, parent_run_id: str | None = None, request: Request = None):
+    if not await db.get_conversation(conv_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return [agent_access.public_run(run, human=bool(request and loom_auth.credential(request.scope)))
+            for run in await db.list_agent_runs(conv_id, parent_run_id=parent_run_id)]
+
+
+@app.get("/api/agent-runs/{run_id}")
+async def api_get_agent_run(run_id: str, request: Request = None):
+    run = await db.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if not agent_access.sensitive(run):
+        run['chat_items'] = await chat_presentations.run_items(f'agent:{run_id}')
+    return agent_access.public_run(run, human=bool(request and loom_auth.credential(request.scope)))
+
+
+@app.get("/api/agent-runs/{run_id}/events")
+async def api_list_agent_events(run_id: str, after_sequence: int = 0, limit: int = 500, request: Request = None):
+    run = await db.get_agent_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if agent_access.sensitive(run) and not (request and loom_auth.credential(request.scope)):
+        raise HTTPException(status_code=403, detail="Sensitive logs require a paired browser")
+    return await db.list_agent_events(run_id, after_sequence=after_sequence, limit=limit)
+
+
+@app.post("/api/agent-runs/{run_id}/release")
+async def api_release_agent_result(run_id: str, data: dict, request: Request):
+    if loom_auth.credential(request.scope) != "browser":
+        raise HTTPException(status_code=403, detail="Only a paired human browser can release sensitive output")
+    run = await db.get_agent_run(run_id)
+    if not run or not agent_access.sensitive(run) or run["status"] != "completed":
+        raise HTTPException(status_code=409, detail="Release requires a completed sensitive child")
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > 32000:
+        raise HTTPException(status_code=400, detail="Release must contain 1–32000 characters")
+    await db.update_agent_run(run_id, released_result=text)
+    return {"released": True}
+
+
+@app.post("/api/agent-runs/{run_id}/cancel")
+async def api_cancel_agent_run(run_id: str, request: Request = None):
+    global _agent_supervisor
+    if not await db.get_agent_run(run_id):
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if _agent_supervisor is not None:
+        run = await _agent_supervisor.cancel(run_id)
+    else:
+        run = await db.request_agent_cancel(run_id)
+    return agent_access.public_run(run, human=bool(request and loom_auth.credential(request.scope)))
+
+
+@app.post("/api/agent-runs/{run_id}/resume")
+async def api_resume_agent_run(run_id: str, request: Request = None):
+    """Explicit recovery from owned evidence, only after verified provider exit."""
+    global _agent_supervisor
+    existing = await db.get_agent_run(run_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if not db.agent_run_can_resume(existing):
+        raise HTTPException(status_code=409, detail="Child must be stopped and paused/failed, without cancellation, before recovery")
+    if _agent_supervisor is None:
+        _agent_supervisor = AgentSupervisor(
+            launcher=_launch_agent_run,
+            event_sink=_publish_agent_event,
+            batch_sink=_publish_agent_events,
+            target_resolver=_resolve_agent_target,
+        )
+        await _agent_supervisor.start()
+    try:
+        run = await _agent_supervisor.resume(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return agent_access.public_run(run, human=bool(request and loom_auth.credential(request.scope)))
+
+
 @app.post("/api/generations/{draft_msg_id}/kill")
 async def api_kill_generation(draft_msg_id: int):
-    """Terminate a tracked generation and mark its draft errored."""
+    """Cancel exactly one generation and retain its lane until provider exit."""
     rows = await db.list_active_generations()
     row = next((r for r in rows if r.get("draft_msg_id") == draft_msg_id), None)
     if not row:
         return JSONResponse({"error": "not tracked"}, status_code=404)
     pid = row.get("pid")
-    killed = _kill_pid(pid) if pid else False
-    # Cancel the in-memory task too
-    for k, t in list(_active_generations.items()):
-        if k[0] == row.get("conv_id") and not t.done():
-            t.cancel()
+    conv_id = int(row.get("conv_id"))
+    generation_lease = await db.get_live_generation_lease(conv_id)
+    if (
+        generation_lease
+        and generation_lease.get("draft_msg_id") is not None
+        and int(generation_lease["draft_msg_id"]) != int(draft_msg_id)
+    ):
+        generation_lease = None
+    matching_keys = _active_generation_keys_for_cancel(
+        conv_id, draft_msg_id=draft_msg_id
+    )
+    matching_tasks = [
+        _active_generations[key]
+        for key in matching_keys
+        if key in _active_generations
+    ]
+    await _pause_serial_queue_for_cancel(conv_id, draft_msg_id=draft_msg_id)
+    for task in matching_tasks:
+        _request_generation_stop(task, "cancel")
+
+    # Let the provider adapter perform graceful, tree-aware teardown first.
+    # If it does not finish, force-kill only this exact provider process tree.
+    # Never cancel sibling tasks merely because they share a conversation.
+    if matching_tasks:
+        done, pending = await asyncio.wait(matching_tasks, timeout=12.0)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+    else:
+        pending = set()
+    killed = False
+    if pid and _pid_alive(pid):
+        killed = _kill_pid(pid)
+        await _wait_for_pid_exit(pid, timeout=8.0)
+        if pending:
+            done_after_kill, pending = await asyncio.wait(pending, timeout=4.0)
+            if done_after_kill:
+                await asyncio.gather(*done_after_kill, return_exceptions=True)
+    pid_alive = bool(pid and _pid_alive(pid))
     # Mark draft as errored if still empty
     try:
         m = await db.get_message(draft_msg_id)
@@ -890,8 +1917,32 @@ async def api_kill_generation(draft_msg_id: int):
             )
     except Exception:
         pass
+    task_alive = any(not task.done() for task in matching_tasks)
+    if pid_alive or task_alive:
+        return JSONResponse(
+            {
+                "status": "cancelling",
+                "pid": pid,
+                "pid_killed": killed,
+                "pid_alive": pid_alive,
+            },
+            status_code=202,
+        )
+    # A live handler normally removes its own row in `finally`. If the server
+    # no longer owns a task, cleanup is safe only after the PID is gone.
     await db.unregister_active_generation(draft_msg_id)
-    return {"status": "killed", "pid": pid, "pid_killed": killed}
+    if generation_lease:
+        await db.release_generation_lease(
+            generation_lease["lease_id"], "killed"
+        )
+    await db.update_message_content(draft_msg_id, turn_lifecycle_state="cancelled")
+    await _send_generation_idle_if_quiescent(conv_id)
+    return {
+        "status": "killed",
+        "pid": pid,
+        "pid_killed": killed,
+        "pid_alive": False,
+    }
 
 
 @app.get("/api/debug/state")
@@ -915,14 +1966,6 @@ async def api_debug_state(request: Request):
     # Active generations (SQLite DB tracking)
     gen_db = await db.list_active_generations()
 
-    # Active Hermes processes
-    hermes_procs = []
-    for cid, proc in _active_hermes_procs.items():
-        hermes_procs.append({
-            "conv_id": cid,
-            "pid": proc.pid,
-            "alive": _pid_alive(proc.pid) if proc.pid else False,
-        })
     goose_procs = []
     for cid, proc in _active_goose_procs.items():
         goose_procs.append({
@@ -943,7 +1986,6 @@ async def api_debug_state(request: Request):
     return {
         "active_generations_memory": gen_memory,
         "active_generations_db": gen_db,
-        "active_hermes_procs": hermes_procs,
         "active_goose_procs": goose_procs,
         "model_name_map": model_map,
         "llama_config": llama_cfg,
@@ -972,7 +2014,6 @@ async def api_debug_stream_state(conv_id: int, request: Request):
     ]
     db_gens = [r for r in await db.list_active_generations() if r.get("conv_id") == conv_id]
     cc_proc = _active_claude_procs.get(conv_id)
-    hermes_proc = _active_hermes_procs.get(conv_id)
     goose_proc = _active_goose_procs.get(conv_id)
     clients = _active_websockets.get(conv_id)
 
@@ -984,12 +2025,13 @@ async def api_debug_stream_state(conv_id: int, request: Request):
         "last_event_type": state.get("last_event_type"),
         "events_sent_this_session": state.get("events_sent", 0),
         "clients_at_last_send": state.get("clients_at_send"),
+        "connections_at_last_send": state.get("connections_at_send"),
+        "recipients_at_last_send": state.get("clients_at_send"),
         "ws_clients_now": len(clients) if clients else 0,
         "active_generations_in_memory": in_memory_gens,
         "active_generations_db": db_gens,
         "claude_subprocess_pid": cc_proc.pid if cc_proc else None,
         "claude_subprocess_alive": _pid_alive(cc_proc.pid) if cc_proc and cc_proc.pid else False,
-        "hermes_subprocess_pid": hermes_proc.pid if hermes_proc else None,
         "goose_subprocess_pid": goose_proc.pid if goose_proc else None,
         "goose_subprocess_alive": _pid_alive(goose_proc.pid) if goose_proc and goose_proc.pid else False,
     }
@@ -1060,12 +2102,14 @@ _active_generations: dict[tuple[int, int | None, int], asyncio.Task] = {}
 _gen_seq = 0  # monotonic counter for unique gen keys
 # Active Claude Code subprocesses (for cancellation)
 _active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
-# Active Hermes (ACP) subprocesses (for cancellation) — parallel to _active_claude_procs
-_active_hermes_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active Goose ACP subprocesses (for cancellation) — main Loom provider lane
 _active_goose_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active WebSocket connections per conversation — multiple clients can watch the same conv
 _active_websockets: dict[int, set[WebSocket]] = {}
+# Explicit event subscriptions.  A conversation socket is not implicitly
+# subscribed to every generation in that conversation.
+_event_router = SubscriptionRouter()
+_event_sequencer = EventSequencer()
 
 # Per-conv stream-event tracker: lets /api/debug/stream-state answer "is this
 # conv getting tokens right now, and when was the last one" without scraping
@@ -1075,16 +2119,228 @@ _stream_state: dict[int, dict] = {}
 _STREAM_EVENT_TYPES = frozenset({
     "stream_chunk", "thinking_chunk", "text_delta",
     "tool_start", "tool_input_chunk", "tool_result",
-    "stream_end", "stream_start", "generation_active",
+    "stream_end", "stream_start", "generation_preparing", "generation_active",
+    "cancelled", "interrupted",
 })
 # Pending hook-based permission requests: request_id -> {event, response, conv_id}
 _pending_hook_permissions: dict[str, dict] = {}
 # Permission requests the user approved for the current branch generation.
 # Keyed by (conversation id, permission scope), then an exact request fingerprint.
 _auto_approve_permissions: dict[tuple[int, str], set[str]] = {}
+# Session-local grants outlive a generation, not a server restart. Legacy
+# exact/tool-wide caches are never consulted by the authoritative policy.
+_permission_rules: dict[str, dict] = {}
+
+
+async def _permission_context(conv: dict, scope: str, child: dict | None = None) -> dict:
+    branch = _generation_branch_for_scope(conv["id"], scope)
+    root = str((child or {}).get("project_dir") or conv.get("project_dir") or "")
+    anchor = (child or {}).get("parent_message_id")
+    if not child:
+        anchor = branch.get("draft_msg_id") or branch.get("parent_id")
+        if not anchor and scope.startswith("gen:"):
+            lease = await db.get_generation_lease(scope)
+            if lease and lease["conv_id"] == conv["id"] and not lease.get("released_at"):
+                anchor = lease.get("draft_msg_id") or lease.get("user_msg_id")
+    ancestors = await db.get_message_ancestor_ids(conv["id"], anchor) if anchor else set()
+    return {"workspace": permission_rules.workspace_identity(root),
+            "branch_id": anchor if anchor in ancestors else None,
+            "ancestor_ids": ancestors, "conversation_id": conv["id"]}
+
+
+def _remember_permission_rule(pending: dict) -> bool:
+    candidate = pending.get("rule_candidate")
+    if not candidate or not pending.get("supports_allow_all"):
+        return False
+    # Repeated approval of the same capability does not grow the cache.
+    for rule in _permission_rules.values():
+        if all(rule.get(k) == candidate.get(k) for k in
+               ("conversation_id", "workspace", "branch_id", "shape")):
+            return True
+    rule_id = str(uuid.uuid4())
+    _permission_rules[rule_id] = {"id": rule_id, **candidate}
+    return True
+
+
+@app.get("/api/conversations/{conv_id}/permission-rules")
+async def list_permission_rules(conv_id: int):
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    return {"profile": conv.get("permission_profile") or "balanced", "lifetime": "server_session",
+            "rules": [permission_rules.public_rule(r) for r in _permission_rules.values()
+                      if r["conversation_id"] == conv_id]}
+
+
+@app.delete("/api/conversations/{conv_id}/permission-rules/{rule_id}")
+async def revoke_permission_rule(conv_id: int, rule_id: str):
+    rule = _permission_rules.get(rule_id)
+    if not rule or rule["conversation_id"] != conv_id:
+        raise HTTPException(404, "Permission rule not found")
+    del _permission_rules[rule_id]
+    return {"revoked": True}
+
+
 # Live generation state — survives WS disconnects so reconnecting clients get a snapshot.
 # Keyed by gen_key (conv_id, parent_id, seq). Updated on every stream event.
 _generation_snapshots: dict[tuple[int, int | None, int], dict] = {}
+
+
+async def _answer_pending_permission(request_id: str, data: dict, *, websocket=None,
+                                     channel: str | None = None) -> bool:
+    """Shared first-response-wins resolver; callers establish UI authority.
+
+    ``decision_source`` stays "user" (providers such as Goose key on it);
+    ``decision_channel`` records which authenticated surface answered.
+    """
+    pending = _pending_hook_permissions.get(request_id)
+    if not pending or pending.get("response") is not None:
+        return False
+    allow = bool(data.get("allow", False))
+    feedback = str(data.get("feedback") or "").strip()[:4000]
+    integrity = pending.get("integrity_check")
+    integrity_error = await asyncio.to_thread(revalidate_integrity, integrity) if allow and integrity else ""
+    if integrity_error:
+        allow = False
+        feedback = integrity_error
+    resolution_source = "loom_policy" if integrity_error else "user"
+    if channel is None:
+        channel = "browser" if websocket is not None else "unknown"
+    pending_conv_id = int(pending["conv_id"])
+    permission_scope = pending.get("permission_scope") or _permission_scope_for_active_generation(pending_conv_id)
+    always = bool(data.get("always")) and bool(
+        pending.get("supports_allow_all", True)
+    )
+    # Re-check after awaits; only the first responder can grant.
+    if pending.get("response") is not None:
+        return False
+    remembered = allow and always and _remember_permission_rule(pending)
+    pending["response"] = {
+        "allow": allow,
+        "always": False,
+        "remembered": bool(remembered),
+        "feedback": feedback,
+        "decision_source": resolution_source,
+        "decision_channel": channel,
+    }
+    pending["event"].set()
+    await db.save_permission_resolution(
+        request_id,
+        pending_conv_id,
+        pending.get("tool_name") or "Unknown",
+        allow,
+        feedback,
+        source=pending.get("source") or "loom_permission_hook",
+        decision_source=resolution_source,
+        decision_channel=channel,
+        run_id=pending.get("run_id"),
+        parent_id=pending.get("parent_id"),
+        draft_msg_id=pending.get("draft_msg_id"),
+        permission_scope=permission_scope,
+    )
+    # Also clean up from DB
+    await db.delete_pending_permission(request_id)
+    await _broadcast_permission_resolved(
+        request_id, pending, allow=allow, feedback=feedback,
+        decision_source=resolution_source, permission_scope=permission_scope, websocket=websocket)
+    return True
+
+
+async def _broadcast_permission_resolved(request_id: str, pending: dict, *, allow: bool, feedback: str,
+                                         decision_source: str, permission_scope: str,
+                                         websocket=None) -> None:
+    """Tell subscribed pages a request is settled so its card stops accepting clicks."""
+    pending_conv_id = int(pending["conv_id"])
+    await _ws_broadcast_all({"type": "permission_notice", "request_id": request_id,
+                             "conv_id": pending_conv_id, "status": "resolved"})
+    resolved = LoomEventEnvelope.from_payload(
+        {
+            "type": "permission_resolved",
+            "request_id": request_id,
+            "allowed": allow,
+            "conv_id": pending_conv_id,
+            "permission_scope": permission_scope,
+            "feedback": feedback,
+            "decision_source": decision_source,
+        },
+        conversation_id=pending_conv_id,
+        run_id=pending.get("run_id")
+        or (permission_scope if permission_scope.startswith(("gen:", "agent:")) else None),
+        parent_id=pending.get("parent_id"),
+        draft_id=pending.get("draft_msg_id"),
+        client_instance_id=pending.get("client_instance_id"),
+        sequence=_event_sequencer.next(
+            canonical_run_id(pending.get("run_id")
+                              or (permission_scope if permission_scope.startswith(("gen:", "agent:")) else None)),
+            pending_conv_id,
+        ),
+    )
+    recipients = _event_router.recipients(
+        resolved, _active_websockets.get(pending_conv_id, set())
+    )
+    origin = _find_client_websocket(pending_conv_id, pending.get("client_instance_id"))
+    if origin is not None:
+        recipients.add(origin)  # The request can precede this page's run subscription.
+    if websocket is not None:
+        recipients.add(websocket)  # Acknowledge the answering chat page.
+    for target in list(recipients):
+        try:
+            await target.send_json(resolved.as_dict())
+        except Exception:
+            _active_websockets.get(pending_conv_id, set()).discard(target)
+            _event_router.unregister(target)
+
+
+async def _resolve_pending_permissions_for_scope(
+    conv_id: int,
+    permission_scope: str,
+    *,
+    message: str,
+    decision_source: str = "loom_lifecycle",
+) -> None:
+    """Finish unresolved approvals without impersonating a user denial.
+
+    ACP permission requests are long-lived HTTP calls.  When their owning
+    generation ends, wake those calls with a lifecycle result before removing
+    the durable pending row.  Selecting a provider's reject option is reserved
+    for an actual Deny click in Loom.
+    """
+    for request_id, pending in list(_pending_hook_permissions.items()):
+        if (
+            pending.get("conv_id") != conv_id
+            or pending.get("permission_scope") != permission_scope
+            or pending.get("response") is not None
+        ):
+            continue
+        pending["response"] = {
+            "allow": False,
+            "always": False,
+            "feedback": message,
+            "decision_source": decision_source,
+        }
+        # Wake the provider bridge before persistence. Database shutdown or a
+        # transient lock must not strand the adapter until its HTTP timeout.
+        pending["event"].set()
+        try:
+            await db.save_permission_resolution(
+                request_id,
+                conv_id,
+                pending.get("tool_name") or "Unknown",
+                False,
+                message,
+                source=pending.get("source") or "loom_permission_hook",
+                decision_source=decision_source,
+                run_id=pending.get("run_id"),
+                parent_id=pending.get("parent_id"),
+                draft_msg_id=pending.get("draft_msg_id"),
+                permission_scope=permission_scope,
+            )
+            await db.delete_pending_permission(request_id)
+        except Exception as exc:
+            print(
+                f"[PERM] Failed to persist {decision_source} outcome for "
+                f"{request_id}: {exc}"
+            )
 
 
 def _stable_json(value) -> str:
@@ -1155,8 +2411,30 @@ def _generation_branch_for_scope(conv_id: int, permission_scope: str) -> dict:
                 "gen_id": gen_id,
                 "parent_id": snapshot.get("parent_id"),
                 "draft_msg_id": snapshot.get("draft_msg_id"),
+                "client_instance_id": snapshot.get("client_instance_id"),
             }
     return {"gen_id": gen_id}
+
+
+async def _permission_socket_is_on_exact_draft(
+    websocket: WebSocket,
+    conv_id: int,
+    draft_msg_id: int | str | None,
+) -> bool:
+    """Allow recovery on the owning draft, never an observing descendant."""
+    if draft_msg_id is None:
+        return False
+    client_instance_id = str(
+        getattr(websocket, "_client_instance_id", "") or ""
+    ).strip()
+    if not client_instance_id:
+        return False
+    cursor = await db.get_client_loom_cursor(conv_id, client_instance_id)
+    return bool(
+        cursor
+        and cursor.get("leaf_message_id") is not None
+        and str(cursor["leaf_message_id"]) == str(draft_msg_id)
+    )
 
 
 _COMMAND_KEYS = {"command", "cmd", "shell_command", "script"}
@@ -1195,14 +2473,6 @@ _DESTRUCTIVE_COMMAND_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     (
         re.compile(r"(?i)\brobocopy\b[^\r\n;&|]*/(?:mir|purge)\b"),
         "robocopy mirror/purge is blocked",
-    ),
-    (
-        re.compile(r"(?i)\bformat(?:\.com)?\b"),
-        "format is blocked",
-    ),
-    (
-        re.compile(r"(?i)\bdiskpart\b"),
-        "diskpart is blocked",
     ),
 )
 _DESTRUCTIVE_GIT_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
@@ -1244,24 +2514,6 @@ _DESTRUCTIVE_GIT_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     ),
 )
 _DESTRUCTIVE_VERB_RE = re.compile(r"(?i)\b(?:rm|remove-item|ri|rd|rmdir|del|erase)\b")
-_UNBOUNDED_SCAN_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
-    (
-        re.compile(r"(?i)\btree(?:\.com)?(?:\s|$)"),
-        "unbounded tree scan is blocked",
-    ),
-    (
-        re.compile(r"(?i)\bdir\b[^\r\n;&|]*/s\b"),
-        "unbounded dir /s scan is blocked",
-    ),
-    (
-        re.compile(r"(?i)\b(?:get-childitem|gci|ls)\b[^\r\n;&|]*-(?:recurse|r)\b"),
-        "unbounded recursive directory scan is blocked",
-    ),
-    (
-        re.compile(r"(?i)\bls\b[^\r\n;&|]*-[A-Za-z]*R[A-Za-z]*\b"),
-        "unbounded ls -R scan is blocked",
-    ),
-)
 _BROAD_TARGET_RE = re.compile(
     r"(?i)(?:^|\s)(?:"
     r"[A-Z]:[\\/](?:\s|$)"
@@ -1370,6 +2622,145 @@ def _has_unclosed_quote(command: str) -> bool:
     return bool(quote)
 
 
+def _read_shell_word(text: str, start: int = 0) -> tuple[str, int]:
+    """Read one shell-ish word without treating quoted payload text as code."""
+    size = len(text)
+    index = start
+    while index < size and text[index].isspace():
+        index += 1
+    if index >= size:
+        return "", size
+    quote = text[index] if text[index] in ("'", '"') else ""
+    if quote:
+        index += 1
+        begin = index
+        while index < size:
+            if text[index] == quote and (index == begin or text[index - 1] not in ("\\", "`")):
+                return text[begin:index], index + 1
+            index += 1
+        return text[begin:], size
+    begin = index
+    while index < size and not text[index].isspace():
+        index += 1
+    return text[begin:index], index
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    """Split command operators while preserving separators inside quotes."""
+    segments: list[str] = []
+    begin = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char in ("^", "`"):
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            continue
+        if not quote and char in ";|&\r\n":
+            segment = command[begin:index].strip()
+            if segment:
+                segments.append(segment)
+            begin = index + 1
+    tail = command[begin:].strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _strip_outer_shell_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1].strip()
+    return value
+
+
+def _shell_payload(arguments: str, flags: set[str]) -> str:
+    index = 0
+    while index < len(arguments):
+        word, end = _read_shell_word(arguments, index)
+        if not word:
+            break
+        if word.lower() in flags:
+            return _strip_outer_shell_quotes(arguments[end:])
+        index = end
+    return ""
+
+
+def _effective_shell_segments(command: str, *, _depth: int = 0) -> list[str]:
+    """Return executable command segments, unwrapping common shell launchers.
+
+    Permission payloads from Codex commonly contain a full PowerShell wrapper.
+    Safety checks must inspect the wrapped command, but never words inside an
+    unrelated quoted argument such as a Git commit message.
+    """
+    if _depth > 5:
+        return [command.strip()] if command.strip() else []
+    effective: list[str] = []
+    for segment in _split_shell_segments(command):
+        executable, end = _read_shell_word(segment)
+        basename = executable.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        arguments = segment[end:].strip()
+        payload = ""
+        if basename in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+            payload = _shell_payload(arguments, {"-command", "-c", "-commandwithargs"})
+        elif basename in {"cmd", "cmd.exe"}:
+            payload = _shell_payload(arguments, {"/c", "/k"})
+        elif basename in {"bash", "bash.exe", "sh", "sh.exe", "zsh", "zsh.exe"}:
+            payload = _shell_payload(arguments, {"-c", "-lc"})
+        if payload:
+            effective.extend(_effective_shell_segments(payload, _depth=_depth + 1))
+        else:
+            effective.append(segment)
+    return effective
+
+
+def _unbounded_scan_reason(command: str) -> str:
+    """Classify actual scan executables, never matching quoted argument text."""
+    for segment in _effective_shell_segments(command):
+        executable, end = _read_shell_word(segment)
+        basename = executable.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        arguments = segment[end:]
+        if basename in {"tree", "tree.com"}:
+            return "unbounded tree scan is blocked"
+        if basename == "dir" and re.search(r"(?i)(?:^|\s)/s(?:\s|$)", arguments):
+            return "unbounded dir /s scan is blocked"
+        if basename in {"get-childitem", "gci", "ls"} and re.search(
+            r"(?i)(?:^|\s)-(?:recurse|r)(?:\s|$)", arguments
+        ):
+            return "unbounded recursive directory scan is blocked"
+        if basename == "ls" and re.search(
+            r"(?:^|\s)-[A-Za-z]*R[A-Za-z]*(?:\s|$)", arguments
+        ):
+            return "unbounded ls -R scan is blocked"
+    return ""
+
+
+def _dangerous_executable_reason(command: str) -> str:
+    """Match destructive programs as executables, not words in arguments.
+
+    Raw word-boundary matching classified PowerShell's harmless
+    ``Format-List`` and ``Format-Table`` cmdlets as the disk formatter.  The
+    shell parser already unwraps cmd/PowerShell/bash launchers, so inspect the
+    executable token of each effective segment instead.
+    """
+    for segment in _effective_shell_segments(command):
+        executable, _ = _read_shell_word(segment)
+        basename = executable.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        if basename in {"format", "format.com"}:
+            return "disk format is blocked"
+        if basename in {"diskpart", "diskpart.exe"}:
+            return "diskpart is blocked"
+    return ""
+
+
 def _unsafe_shell_command_reason(tool_name: str, tool_input) -> str:
     command = _extract_permission_command(tool_name, tool_input)
     if not _looks_like_shell_permission(tool_name, tool_input, command):
@@ -1383,6 +2774,10 @@ def _unsafe_shell_command_reason(tool_name: str, tool_input) -> str:
                 return f"{reason}; command also has unclosed quotes"
             return reason
 
+    executable_reason = _dangerous_executable_reason(command)
+    if executable_reason:
+        return executable_reason
+
     if _DESTRUCTIVE_VERB_RE.search(command) and _BROAD_TARGET_RE.search(command):
         if _has_unclosed_quote(command):
             return "broad destructive command with unclosed quotes is blocked"
@@ -1391,9 +2786,9 @@ def _unsafe_shell_command_reason(tool_name: str, tool_input) -> str:
     if _has_unclosed_quote(command) and _DESTRUCTIVE_VERB_RE.search(command):
         return "destructive command with unclosed quotes is blocked"
 
-    for pattern, reason in _UNBOUNDED_SCAN_PATTERNS:
-        if pattern.search(command):
-            return reason
+    scan_reason = _unbounded_scan_reason(command)
+    if scan_reason:
+        return scan_reason
 
     return ""
 
@@ -1408,6 +2803,7 @@ def _destructive_git_command_reason(tool_name: str, tool_input) -> str:
             if _has_unclosed_quote(command):
                 return f"{reason}; command also has unclosed quotes"
             return reason
+
     return ""
 
 
@@ -1443,6 +2839,20 @@ def _goose_auto_allow_reason(tool_name: str, tool_input) -> str:
     return ""
 
 
+def _permission_policy_shadow_enabled() -> bool:
+    """Run the formal-policy runtime beside the legacy gate without enforcing it."""
+    return str(os.environ.get("LOOM_PERMISSION_POLICY_SHADOW", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+_recent_generations: dict[tuple[int, int], dict] = {}
+_MAX_RECENT_GENERATIONS = 128
+
+
 def _update_gen_snapshot(gen_key: tuple, **fields):
     """Update the live snapshot for an active generation (called on every stream event)."""
     snap = _generation_snapshots.get(gen_key)
@@ -1459,8 +2869,64 @@ def _update_gen_snapshot(gen_key: tuple, **fields):
             "mode": "claude",
         }
         _generation_snapshots[gen_key] = snap
+    previous_draft_id = snap.get("draft_msg_id")
     snap.update(fields)
+    if len(gen_key) >= 3:
+        record_key = (int(gen_key[0]), int(gen_key[2]))
+        recent = _recent_generations.setdefault(record_key, {})
+        recent.update(snap)
+        if len(_recent_generations) > _MAX_RECENT_GENERATIONS:
+            oldest = next(iter(_recent_generations))
+            _recent_generations.pop(oldest, None)
+    if previous_draft_id is None and snap.get("draft_msg_id") is not None:
+        try:
+            _spawn_background_task(
+                _advance_unambiguous_generation_cursors(gen_key),
+                "advance generation cursor",
+            )
+            task = asyncio.current_task()
+            lease_id = getattr(task, "_generation_lease_id", None)
+            if lease_id:
+                _spawn_background_task(
+                    db.bind_generation_lease(
+                        lease_id,
+                        draft_msg_id=int(snap["draft_msg_id"]),
+                        state="running",
+                    ),
+                    "bind generation lease",
+                )
+        except RuntimeError:
+            pass
     return snap
+
+
+async def _advance_unambiguous_generation_cursors(gen_key: tuple) -> None:
+    """Advance only the page that launched one unambiguous run."""
+    snapshot = _generation_snapshots.get(gen_key) or {}
+    thread_id = snapshot.get("loom_thread_id")
+    client_instance_id = snapshot.get("client_instance_id")
+    draft_msg_id = snapshot.get("draft_msg_id")
+    parent_id = snapshot.get("parent_id", gen_key[1])
+    if not thread_id or not client_instance_id or draft_msg_id is None or parent_id is None:
+        return
+    client_siblings = [
+        key for key, task in _active_generations.items()
+        if not task.done()
+        and key[0] == gen_key[0]
+        and str((_generation_snapshots.get(key) or {}).get("loom_thread_id"))
+            == str(thread_id)
+        and str((_generation_snapshots.get(key) or {}).get("parent_id", key[1]))
+            == str(parent_id)
+        and str((_generation_snapshots.get(key) or {}).get("client_instance_id") or "")
+            == str(client_instance_id)
+    ]
+    # One page asking for several sibling generations has no unique child to
+    # follow. Different pages launching one sibling each remain independent.
+    if len(client_siblings) != 1:
+        return
+    await db.advance_loom_cursor_for_generation(
+        gen_key[0], thread_id, client_instance_id, parent_id, draft_msg_id
+    )
 
 
 def _parse_image_paths(image_path) -> list[str]:
@@ -1510,32 +2976,17 @@ async def toggle_canvas(conv_id: int, data: dict = None):
     project_dir = conv.get("project_dir") or ""
     if enabled and not project_dir:
         # Auto-create a workspace for conversations without a project_dir
-        workspace = Path("canvas_workspaces") / str(conv_id)
+        workspace = (Path("canvas_workspaces") / str(conv_id)).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         project_dir = str(workspace)
         await db.update_conversation_fields(conv_id, project_dir=project_dir)
 
     canvas_slug = conv.get("canvas_slug") or ""
     if enabled:
-        canvas_dir = Path(project_dir) / "canvas"
-        canvas_dir.mkdir(parents=True, exist_ok=True)
-        # Auto-create .gitignore so canvas output doesn't leak into git
-        gitignore = canvas_dir / ".gitignore"
-        if not gitignore.exists():
-            gitignore.write_text(
-                "# Canvas output is generated per-conversation — don't commit it\n"
-                "*\n"
-                "!.gitignore\n",
-                encoding="utf-8",
-            )
-        index_file = canvas_dir / "index.html"
-        if not index_file.exists():
-            index_file.write_text(
-                '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
-                "<title>Canvas</title></head>\n"
-                "<body><h1>Canvas ready</h1></body></html>\n",
-                encoding="utf-8",
-            )
+        try:
+            await asyncio.to_thread(ensure_canvas_workspace, project_dir, CANVAS_CLAUDE_MD)
+        except (OSError, ValueError):
+            return JSONResponse({"error": "Could not prepare Canvas inside the workspace"}, status_code=400)
 
         # Mint a stable slug the first time canvas is enabled. Retry on the
         # off chance the unique index rejects the generated slug.
@@ -1557,17 +3008,46 @@ async def toggle_canvas(conv_id: int, data: dict = None):
     }
 
 
+@app.get("/api/canvas/{conv_id}/share-link")
+async def canvas_share_link(conv_id: int, request: Request):
+    from canvas_links import canvas_tailnet_url
+    conv = await db.get_conversation(conv_id)
+    if not conv or not conv.get("canvas_enabled") or not is_valid_slug(conv.get("canvas_slug") or ""):
+        return JSONResponse({"detail": "No enabled Canvas link"}, status_code=404)
+    try:
+        url = await asyncio.to_thread(canvas_tailnet_url, conv["canvas_slug"],
+                                      request.url.scheme, request.url.port)
+    except ValueError as error:
+        return JSONResponse({"detail": str(error)}, status_code=503)
+    return {"url": url}
+
+
 @app.get("/api/canvas/{conv_id}")
 async def list_canvas_files(conv_id: int):
     """List files in a conversation's canvas directory."""
     conv = await db.get_conversation(conv_id)
     if not conv or not conv.get("project_dir"):
         return JSONResponse({"error": "No canvas"}, status_code=404)
-    canvas_dir = Path(conv["project_dir"]) / "canvas"
+    try:
+        canvas_dir = canvas_root(conv["project_dir"])
+    except (OSError, ValueError):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     if not canvas_dir.is_dir():
         return {"files": []}
     files = [f.name for f in canvas_dir.iterdir() if f.is_file()]
     return {"files": sorted(files)}
+
+
+@app.get("/api/conversations/{conv_id}/canvas/revision")
+async def get_canvas_revision(conv_id: int):
+    conv = await db.get_conversation(conv_id)
+    if not conv or not conv.get("canvas_enabled") or not conv.get("project_dir"):
+        return JSONResponse({"error": "No enabled canvas"}, status_code=404)
+    try:
+        result = await asyncio.to_thread(canvas_revision, conv["project_dir"])
+    except (OSError, ValueError):
+        result = {"revision": None, "complete": False}
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/canvas/{conv_id}/{file_path:path}")
@@ -1576,18 +3056,21 @@ async def serve_canvas_file(conv_id: int, file_path: str = "index.html"):
     conv = await db.get_conversation(conv_id)
     if not conv or not conv.get("project_dir"):
         return JSONResponse({"error": "No canvas"}, status_code=404)
-    canvas_dir = Path(conv["project_dir"]).resolve() / "canvas"
     if not file_path:
         file_path = "index.html"
-    target = (canvas_dir / file_path).resolve()
-    # Path traversal guard
-    if not str(target).startswith(str(canvas_dir)):
+    try:
+        canvas_dir = canvas_root(conv["project_dir"])
+        target = (canvas_dir / file_path).resolve()
+    except (OSError, ValueError):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if not target.is_relative_to(canvas_dir):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     if not target.is_file():
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return FileResponse(str(target))
+    return FileResponse(str(target), headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/search")
 @app.get("/")
 async def index():
     return FileResponse(
@@ -1614,10 +3097,11 @@ async def canvas_by_slug(slug: str):
         f"<title>{title}</title>"
         "<style>html,body{margin:0;height:100%;background:#000}"
         "iframe{border:0;width:100vw;height:100vh;display:block;background:#fff}</style>"
-        '<iframe sandbox="allow-scripts allow-same-origin" '
-        f'src="/api/canvas/{conv["id"]}/index.html"></iframe>'
+        '<iframe sandbox="allow-scripts allow-same-origin allow-modals allow-downloads" '
+        f'data-canvas-conv="{conv["id"]}" src="/api/canvas/{conv["id"]}/index.html"></iframe>'
+        '<script src="/static/canvas-viewer.js?v=1"></script>'
     )
-    return HTMLResponse(html)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 # ── Health ──
@@ -1629,23 +3113,6 @@ async def api_health():
     return llama_status
 
 
-@app.post("/api/nrol/mcp-activity")
-async def api_nrol_mcp_activity():
-    """Return recent NROL MCP activity from the admin sidecar without launching work."""
-    admin_port = int(os.environ.get("ADMIN_PORT", "3002"))
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"http://127.0.0.1:{admin_port}/tools/nrol-mcp-activity",
-                json={},
-            )
-        payload = resp.json() if resp.content else {}
-        return JSONResponse(payload, status_code=resp.status_code)
-    except Exception as e:
-        return JSONResponse(
-            {"status": "error", "output": f"Could not read NROL MCP activity via admin server: {e}"},
-            status_code=502,
-        )
 
 
 # Map of probe targets to (port, health_path). All run on localhost alongside
@@ -1653,7 +3120,7 @@ async def api_nrol_mcp_activity():
 # without browser mixed-content blocking the direct HTTP request.
 _STATUS_TARGETS = {
     "admin":   (3002, "/api/status"),
-    "nrol":    (int(os.environ.get("ALPHA_OMEGA_PORT", "8098")), "/topics"),
+    
     "comfyui": (8188, "/system_stats"),
 }
 
@@ -1828,145 +3295,6 @@ async def api_admin_status():
     return await api_server_status("admin")
 
 
-# ── Hermes runtime management (Prometheus + attendants) ──────────────────────
-# Three Hermes runtimes live in this process's _RUNTIMES (hermes_client.py:917):
-#   - Llama attendant (home = config.hermes_home, ensouled, model-bound)
-#   - Dream attendant (home = -dream suffix, ensouled, model-bound)
-#   - Prometheus     (home = -prometheus suffix, incognito, always-warm)
-# The admin_server is a SEPARATE process (port 8000) and can't see _RUNTIMES
-# directly, so the admin Hermes-management UI relays to these endpoints. The
-# attendant-clear-on-model-stop binding also relays here: when admin stops
-# llama/dream, it POSTs /api/hermes/attendant/clear so the bound attendant's
-# warm process is cleared from THIS process's _RUNTIMES.
-
-def _hermes_runtime_for_attendant(backend: str) -> dict | None:
-    """Return the held runtime for an attendant backend, or None.
-
-    `backend` is "llama" or "dream". Read-only snapshot for the status endpoint.
-    """
-    if hermes_client is None:
-        return None
-    if backend == "llama":
-        home = config.hermes_home
-    elif backend == "dream":
-        home = _ensure_dream_hermes_home()
-    else:
-        return None
-    rt = hermes_client.find_runtime_by_home(home)
-    if rt is None:
-        return None
-    proc = rt.proc
-    return {
-        "home": rt.home,
-        "alive": rt._is_alive(),
-        "pid": proc.pid if proc is not None else None,
-        "agent_info": rt._agent_info,
-    }
-
-
-@app.post("/api/hermes/attendant/clear")
-async def api_hermes_attendant_clear(backend: str = "llama"):
-    """Clear the bound attendant's warm runtime when its model server stops.
-
-    The attendant-clear-on-model-stop coupling: admin's llama-unload / dream-stop
-    paths POST here so the soul-bearing process doesn't outlive the model it
-    talks to. The soul (home dir, state.db, memories) survives — only the warm
-    process is cleared. Next attendant turn re-inits (probe cache skips the
-    expensive context-length probe).
-    """
-    if hermes_client is None:
-        return JSONResponse({"status": "ok", "cleared": False, "reason": "hermes_unavailable"})
-    if backend == "llama":
-        home = config.hermes_home
-    elif backend == "dream":
-        home = _ensure_dream_hermes_home()
-    else:
-        return JSONResponse({"status": "error", "error": f"unknown backend: {backend}"}, status_code=400)
-    cleared = await hermes_client.stop_runtime_by_home(home)
-    # Broadcast the model-down state so the UI indicator flips.
-    await _ws_broadcast_all({
-        "type": "hermes_model_state",
-        "backend": backend,
-        "up": False,
-    })
-    return JSONResponse({"status": "ok", "cleared": cleared, "backend": backend})
-
-
-@app.get("/api/hermes/status")
-async def api_hermes_status():
-    """Status of all three Hermes runtimes for the admin Hermes-management panel.
-
-    Reports liveness of the two local model servers (transitively = attendant
-    availability) + the held runtime state for each of the three. Prometheus is
-    implicitly always-functional (cloud fallback); its held-runtime state shows
-    whether the warm process is currently up.
-    """
-    if hermes_client is None:
-        return JSONResponse({
-            "hermes_available": False,
-            "import_error": str(_HERMES_IMPORT_ERROR) if _HERMES_IMPORT_ERROR else None,
-        })
-    llama_up = await _probe_llama_live()
-    dream_up = await _probe_dream_live()
-    prometheus_home = _prometheus_home_path()
-    prom_rt = hermes_client.find_runtime_by_home(prometheus_home)
-    prom_proc = prom_rt.proc if prom_rt else None
-    return JSONResponse({
-        "hermes_available": True,
-        "models": {
-            "llama": {"up": llama_up, "attendant": _hermes_runtime_for_attendant("llama")},
-            "dream": {"up": dream_up, "attendant": _hermes_runtime_for_attendant("dream")},
-        },
-        "prometheus": {
-            "home": prometheus_home,
-            "held": prom_rt is not None,
-            "alive": prom_rt._is_alive() if prom_rt else False,
-            "pid": prom_proc.pid if prom_proc else None,
-        },
-        "runtimes": hermes_client.list_hermes_runtimes(),
-    })
-
-
-@app.post("/api/hermes/prometheus/stop")
-async def api_hermes_prometheus_stop():
-    """Stop Prometheus' warm runtime (independent of model servers)."""
-    if hermes_client is None:
-        return JSONResponse({"status": "error", "error": "hermes_unavailable"}, status_code=503)
-    home = _prometheus_home_path()
-    cleared = await hermes_client.stop_runtime_by_home(home)
-    return JSONResponse({"status": "ok", "cleared": cleared, "home": home})
-
-
-@app.post("/api/hermes/prometheus/restart")
-async def api_hermes_prometheus_restart():
-    """Restart Prometheus: re-route the backend (rewrite config) and FORCE-clear
-    the warm runtime, even if the backend signature is unchanged.
-
-    Distinct from the routing path (route_prometheus_backend called on turn
-    dispatch), which only reloads when the signature changed. This is the
-    explicit admin "restart" intent — e.g. clear a wedged warm process even when
-    the backend is the same. stop_runtime_by_home refuses to kill a runtime with
-    an active turn, so `reloaded` reports whether the clear actually happened.
-    """
-    if hermes_client is None:
-        return JSONResponse({"status": "error", "error": "hermes_unavailable"}, status_code=503)
-    backend = await route_prometheus_backend(force=True)
-    return JSONResponse({
-        "status": "ok",
-        "backend": backend["backend"],
-        "model": backend["model"],
-        "base_url": backend["base_url"],
-        "home": backend["home"],
-        "reloaded": backend.get("reloaded", True),
-        "note": ("warm runtime cleared; re-inits on next Prometheus turn"
-                 if backend.get("reloaded")
-                 else "warm runtime NOT cleared (active turn in flight); "
-                      "re-inits against new config on the next turn anyway"),
-    })
-
-
-
-
 # ── Local model list cache ────────────────────────────────────────────────
 # Serves the .gguf file list from disk so the UI model dropdown is instant.
 
@@ -2127,14 +3455,18 @@ async def _refresh_all_engines_cache() -> dict:
 
     # Append Dream Engine models from an OpenAI-compatible DiffusionGemma
     # endpoint. backend:"dream" routes direct generation through dream_client.
-    # of the Hermes ACP CLI.
+    # This model endpoint is independent of the retired Hermes harness.
     dream_seen: set[str] = set()
     dream_model = (getattr(config, "dream_model", "") or "").strip()
-    if dream_model:
+    # Only offer Dream entries while the sidecar answers its health probe:
+    # when the Dream server is down, dropdowns show no Dream models at all
+    # instead of unloaded placeholders.
+    dream_up = isinstance(dh, dict)
+    if dream_up and dream_model:
         out.append({"name": dream_model, "backend": "dream", "loaded": False, "configured": True})
         dream_seen.add(dream_model)
 
-    if isinstance(dh, dict) and dh is not None:
+    if dream_up:
         avail = dh.get("available") or []
         loaded = bool(dh.get("loaded_model"))
         for mid in avail:
@@ -2158,20 +3490,32 @@ async def _refresh_all_engines_cache() -> dict:
     return _ALL_ENGINES_CACHE
 
 
+def _with_openrouter_models(cache: dict) -> dict:
+    """Serve cached engine models plus registry OpenRouter selectors.
+
+    OpenRouter models are not probed like local engines; the shared registry
+    (hot-reloadable from the admin Models editor) is the source of truth, so
+    they are merged at response time instead of living in the TTL cache.
+    """
+    data = dict(cache)
+    data["models"] = [*cache.get("models", []), *model_registry.openrouter_models()]
+    return data
+
+
 @app.get("/api/local/all-models")
 async def api_local_all_models():
     """Returns all local .gguf models plus live llama-server models.
     Used by the inline dropdown for model selection."""
     if _all_engines_cache_fresh():
-        return _ALL_ENGINES_CACHE
+        return _with_openrouter_models(_ALL_ENGINES_CACHE)
     # Single-flight: hold the lock so concurrent callers serialize on one
     # refresh, then re-check freshness once inside — another caller may have
     # just refreshed the cache while we waited for the lock.
     async with _ALL_ENGINES_REFRESH_LOCK:
         if _all_engines_cache_fresh():
-            return _ALL_ENGINES_CACHE
+            return _with_openrouter_models(_ALL_ENGINES_CACHE)
         await _refresh_all_engines_cache()
-    return _ALL_ENGINES_CACHE
+    return _with_openrouter_models(_ALL_ENGINES_CACHE)
 
 
 @app.post("/api/local/refresh-all-models")
@@ -2534,6 +3878,225 @@ async def api_search(q: str = ""):
     return await db.search_conversations(q)
 
 
+async def _search_workspace_catalog() -> list[dict]:
+    conversations = await db.list_workspace_conversations()
+    grouped: dict[str, dict] = {}
+    for row in conversations:
+        try:
+            key = workspace_key(row["project_dir"])
+        except ValueError:
+            continue
+        item = grouped.setdefault(key, {
+            "workspace_key": key,
+            "project_dir": row["project_dir"],
+            "canonical_path": canonical_workspace(row["project_dir"]),
+            "conversation_ids": [],
+            "conversation_count": 0,
+            "message_count": 0,
+            "updated_at": 0,
+            "titles": [],
+        })
+        item["conversation_ids"].append(int(row["conversation_id"]))
+        item["conversation_count"] += 1
+        item["message_count"] += int(row.get("message_count") or 0)
+        item["updated_at"] = max(float(item["updated_at"]), float(row.get("updated_at") or 0))
+        if len(item["titles"]) < 4:
+            item["titles"].append(row.get("conversation_title") or "Untitled")
+    policies = {row["workspace_key"]: row["policy"] for row in await asyncio.to_thread(_search_index.policies)}
+    for key, item in grouped.items():
+        item["policy"] = policies.get(key, "excluded")
+    return sorted(grouped.values(), key=lambda row: row["updated_at"], reverse=True)
+
+
+async def _sync_search_workspaces(keys: list[str]) -> list[dict]:
+    catalog = {row["workspace_key"]: row for row in await _search_workspace_catalog()}
+    missing = [key for key in keys if key not in catalog]
+    if missing:
+        raise HTTPException(404, f"Unknown workspace key(s): {', '.join(missing[:3])}")
+    try:
+        await SearchService(_search_index, _search_source_id(), keys, local=True).sync()
+    except SearchPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return [catalog[key] for key in dict.fromkeys(keys)]
+
+
+def _search_chat() -> SearchChat:
+    return SearchChat(_search_index, _search_source_id())
+
+
+@app.post("/api/search-space/sessions")
+async def api_search_session_create(data: dict = Body(...)):
+    keys = data.get("workspace_keys")
+    if not isinstance(keys, list) or not 1 <= len(keys) <= 32 or not all(isinstance(k, str) for k in keys):
+        raise HTTPException(400, "Select at least one workspace")
+    await _sync_search_workspaces(keys)
+    return _search_chat().create(list(dict.fromkeys(keys)))
+
+
+@app.get("/api/search-space/sessions/{session_id}")
+async def api_search_session_get(session_id: str):
+    session = _search_chat().get(session_id)
+    if not session:
+        raise HTTPException(404, "Search conversation no longer exists or has expired")
+    try:
+        SearchOperator(_search_index, source_id=_search_source_id()).plan(session["workspace_keys"])
+    except SearchPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return session
+
+
+@app.get("/api/search-space/sessions")
+async def api_search_sessions_list():
+    return []
+
+
+@app.post("/api/search-space/sessions/{session_id}/messages")
+async def api_search_session_ask(session_id: str, data: dict = Body(...)):
+    try:
+        return await _search_chat().ask(session_id, data.get("question"))
+    except SearchPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except SearchBackendUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/search-space/sessions/{session_id}")
+async def api_search_session_delete(session_id: str):
+    _search_chat().delete(session_id)
+    return {"deleted": True}
+
+
+async def _history_service(request: Request) -> tuple[SearchService, object]:
+    scope = resolve_scope(request.headers.get("x-loom-history", ""))
+    same_source = scope is not None and scope.source_id == _search_source_id()
+    if not scope or not same_source:
+        raise HTTPException(403, "History capability is missing, expired or belongs to another Loom database")
+    conv = await db.get_conversation(scope.conversation_id)
+    if not conv or conv.get('backstage_parent_id'):
+        raise HTTPException(403, "History is unavailable to this role")
+    assigned_dir = conv.get("project_dir")
+    if scope.run_id and not scope.run_id.startswith("gen:"):
+        run = await db.get_agent_run(scope.run_id.removeprefix("agent:"))
+        if not run or run["conversation_id"] != scope.conversation_id or run["status"] != "running":
+            raise HTTPException(403, "History run is no longer active")
+        assigned_dir = run["project_dir"]
+    assigned = bool(assigned_dir and workspace_key(assigned_dir) == scope.workspace_key)
+    policy_name = _search_index.policy_for(assigned_dir) if assigned else "excluded"
+    policy = {"cloud": Policy.CLOUD, "sensitive": Policy.SENSITIVE}.get(policy_name, Policy.EXCLUDED)
+    if not may_read(active=True, assigned=assigned, same_source=same_source, policy=policy, local=scope.local):
+        raise HTTPException(403, "History scope is excluded, changed, or requires a local agent")
+    return SearchService(_search_index, _search_source_id(), [scope.workspace_key], local=scope.local), scope
+
+
+def _history_origin(request: Request, scope) -> str:
+    # Prefer the actual browser connection which launched this run. This gives
+    # remote users their Tailscale URL rather than an MCP loopback URL.
+    websocket = _find_client_websocket(scope.conversation_id, scope.client_instance_id) if scope.client_instance_id else None
+    if websocket is not None:
+        from urllib.parse import urlsplit
+        url = urlsplit(str(websocket.url))
+        return f"{'https' if url.scheme == 'wss' else 'http'}://{url.netloc}"
+    public = os.environ.get("LOOM_PUBLIC_URL", "").strip().rstrip("/")
+    if public.startswith(("https://", "http://")):
+        return public
+    return str(request.base_url).rstrip("/")
+
+
+@app.post("/api/history/{tool}")
+async def api_history_tool(tool: str, request: Request, data: dict = Body(...)):
+    service, scope = await _history_service(request)
+    try:
+        result = await service.call(tool, data)
+        # Recheck the capability and assignment after asynchronous retrieval.
+        await _history_service(request)
+    except SearchPolicyError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    origin = _history_origin(request, scope)
+    def links(value):
+        if isinstance(value, dict):
+            return {key: origin + item if key == "url" and isinstance(item, str) and item.startswith("/?conversation=")
+                    else links(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [links(item) for item in value]
+        return value
+    return links(result)
+
+
+@app.get("/api/search-space/workspaces")
+async def api_search_space_workspaces():
+    return await _search_workspace_catalog()
+
+
+@app.put("/api/search-space/workspaces/policy")
+async def api_search_space_policy(data: dict = Body(...)):
+    project_dir = str(data.get("project_dir") or "").strip()
+    policy = str(data.get("policy") or "").strip().lower()
+    catalog = await _search_workspace_catalog()
+    known = {row["workspace_key"]: row for row in catalog}
+    try:
+        key = workspace_key(project_dir)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if key not in known:
+        raise HTTPException(404, "Workspace is not used by a Loom conversation")
+    try:
+        result = await asyncio.to_thread(_search_index.set_policy, known[key]["project_dir"], policy)
+        if policy == "excluded":
+            _search_chat().discard_workspace(key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
+
+
+@app.post("/api/search-space/index")
+async def api_search_space_index(data: dict = Body(...)):
+    keys = data.get("workspace_keys") or []
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(400, "workspace_keys must be a non-empty list")
+    return {"workspaces": await _sync_search_workspaces([str(key) for key in keys])}
+
+
+@app.post("/api/search-space/query")
+async def api_search_space_query(data: dict = Body(...)):
+    question = str(data.get("question") or "").strip()
+    keys = data.get("workspace_keys") or []
+    if len(question) < 2 or not isinstance(keys, list) or not keys:
+        raise HTTPException(400, "A question and at least one workspace are required")
+    normalized = [str(key) for key in keys]
+    await _sync_search_workspaces(normalized)
+    operator = SearchOperator(_search_index, source_id=_search_source_id())
+    try:
+        return await operator.ask(question, normalized, limit=int(data.get("limit") or 24))
+    except SearchPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except SearchBackendUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/search-space/retrieve")
+async def api_search_space_retrieve(data: dict = Body(...)):
+    query = str(data.get("query") or "").strip()
+    keys = data.get("workspace_keys") or []
+    if len(query) < 2 or not isinstance(keys, list) or not keys:
+        raise HTTPException(400, "A query and at least one workspace are required")
+    normalized = [str(key) for key in keys]
+    await _sync_search_workspaces(normalized)
+    try:
+        plan = SearchOperator(_search_index, source_id=_search_source_id()).plan(normalized)
+    except SearchPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    matches = await asyncio.to_thread(
+        _search_index.search, [query], normalized, int(data.get("limit") or 24), _search_source_id()
+    )
+    return {**plan, "sources": matches}
+
+
 @app.get("/api/conversations/{conv_id}/search")
 async def api_search_conversation(conv_id: int, q: str = ""):
     if len(q) < 2:
@@ -2550,42 +4113,11 @@ async def api_create_conversation(data: dict = None):
     lore_ids = data.get("lore_ids", [])
     style_nudge = data.get("style_nudge", "Natural")
     mode = data.get("mode", "weave")
+    if reason := model_registry.retirement_reason(mode, data.get("cc_model")):
+        raise HTTPException(410, reason)
     project_dir = data.get("project_dir")
-    nrol_operator = 1 if data.get("nrol_operator") else 0
     parallel_agents_enabled = 1 if _truthy_setting(data.get("parallel_agents_enabled")) else 0
-    if nrol_operator:
-        # Operator conversations are CC sessions launched from a neutral
-        # workspace — never the Loom repo or the NROL engine repo — so any
-        # file path the session touches is outside its project boundary.
-        mode = "claude"
-        if not project_dir:
-            operator_dir = Path(__file__).parent / "workspaces" / "nrol_operator"
-            operator_dir.mkdir(parents=True, exist_ok=True)
-            # Provision the scheduled-scan shim so a Loom cron job can be
-            # registered on this conversation (cron scripts must live in the
-            # conversation workspace). POST /api/conversations/{id}/cronjobs
-            # with script="nrol_scan_tick.py" to enable scheduled scans.
-            tick = operator_dir / "nrol_scan_tick.py"
-            if not tick.exists():
-                tick.write_text(
-                    '"""NROL-AO scheduled scan tick (Loom cron shim).\n'
-                    "\n"
-                    "Safe-policy scan: PARK/SCHEMA_GAP auto-apply (cannot move\n"
-                    "posteriors), FIRE/OBSERVE are filed as pending proposals for\n"
-                    "operator review, digest written beside the activity ledger.\n"
-                    '"""\n'
-                    "import sys\n"
-                    "from pathlib import Path\n"
-                    "\n"
-                    "sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))\n"
-                    "\n"
-                    "from bin.nrol_scan_tick import main\n"
-                    "\n"
-                    'if __name__ == "__main__":\n'
-                    "    sys.exit(main())\n",
-                    encoding="utf-8",
-                )
-            project_dir = str(operator_dir)
+    pass
 
     first_turn = data.get("first_turn", "character")  # "character" or "user"
     custom_scene = data.get("custom_scene")
@@ -2602,10 +4134,7 @@ async def api_create_conversation(data: dict = None):
         custom_scene = None
         first_turn = "user"
 
-    if nrol_operator:
-        blocked = _nrol_operator_block_reason(cc_model)
-        if blocked:
-            raise HTTPException(status_code=400, detail=blocked)
+    pass
 
     if mode == "claude":
         resolved_mode = _mode_for_cc_model(cc_model)
@@ -2621,8 +4150,7 @@ async def api_create_conversation(data: dict = None):
             _reject_disabled_umans_for_new_selection(cc_model)
 
     if parallel_agents_enabled:
-        if nrol_operator:
-            raise HTTPException(400, "Parallel agents are not available for NROL-AO operator conversations")
+        pass
         if mode not in _AGENT_WORKSPACE_MODES:
             raise HTTPException(400, "Parallel agents are only available for agent conversations")
         if not project_dir:
@@ -2647,9 +4175,8 @@ async def api_create_conversation(data: dict = None):
         system_prompt=(system_prompt.strip() if isinstance(system_prompt, str) and system_prompt.strip() else None),
         parallel_agents_enabled=parallel_agents_enabled,
     )
-    if nrol_operator:
-        fields["nrol_operator"] = 1
-    if mode in ("local", "hermes", "weave", "dream") and local_model:
+    pass
+    if mode in ("local", "weave") and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
     # Refresh conv data
@@ -2738,6 +4265,37 @@ async def api_create_conversation(data: dict = None):
             await db.set_active_branch(conv["id"], greeting_msg["id"])
 
     return conv
+
+
+@app.post("/api/casual-chats")
+async def api_create_casual_chat(data: dict = Body(...)):
+    """Explicit casual intent; leave ordinary conversation defaults untouched."""
+    request_id = str(data.get("request_id") or "").strip()
+    model = str(data.get("cc_model") or "").strip()
+    effort = str(data.get("cc_effort") or "high").strip()
+    if not request_id or len(request_id) > 128:
+        raise HTTPException(400, "A bounded chat request ID is required")
+    mode = _mode_for_cc_model(model)
+    if mode is None or model_registry.retirement_reason(mode, model):
+        raise HTTPException(400, "Choose an available agent model for the new chat")
+    if is_umans_model(model) or openrouter_client.is_openrouter_model(model):
+        _reject_disabled_umans_for_new_selection(model)
+    workspace = _CASUAL_CHAT_ROOT
+    if workspace.is_symlink() or workspace.is_junction():
+        raise HTTPException(400, "ExoHome must be an ordinary workspace directory")
+    try:
+        workspace.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(400, "ExoHome is unavailable; check its directory permissions") from exc
+    try:
+        return await db.create_casual_conversation(
+            request_id, str(data.get("title") or "New chat")[:120], mode,
+            str(workspace.resolve()), model, effort,
+        )
+    except db.DeletedCasualChatRequest as exc:
+        raise HTTPException(410, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/conversations/{conv_id}/codex-goal")
@@ -2875,8 +4433,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["nsfw"] = int(data["nsfw"])
     if "cc_model" in data:
         cc_model = data["cc_model"]
-        if conv and conv.get("mode") == "goose":
-            cc_model = _goose_selector_for_model(cc_model) or cc_model
+        if reason := model_registry.retirement_reason(None, cc_model):
+            raise HTTPException(410, reason)
         resolved_mode = _mode_for_cc_model(cc_model)
         if resolved_mode is None:
             raise HTTPException(
@@ -2889,10 +4447,10 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
-    if "incognito" in data:
-        # Incognito routes Hermes-class turns to Prometheus (always-warm,
-        # cloud-fallback, no soul). 0 = ensouled attendant, 1 = Prometheus.
-        fields["incognito"] = int(_truthy_setting(data["incognito"]))
+    if "permission_profile" in data:
+        if not isinstance(data["permission_profile"], str) or data["permission_profile"] not in {p.value for p in permission_policy_model.PermissionProfile}:
+            raise HTTPException(400, "Unknown Loom permission profile")
+        fields["permission_profile"] = data["permission_profile"]
     if "local_model" in data:
         fields["local_model"] = data["local_model"]
     if "ooda_enabled" in data:
@@ -2911,8 +4469,7 @@ async def api_update_conversation(conv_id: int, data: dict):
         desired = 1 if _truthy_setting(data.get("parallel_agents_enabled")) else 0
         if desired:
             mode = fields.get("mode") or conv.get("mode")
-            if conv.get("nrol_operator"):
-                raise HTTPException(400, "Parallel agents are not available for NROL-AO operator conversations")
+            pass
             if mode not in _AGENT_WORKSPACE_MODES:
                 raise HTTPException(400, "Parallel agents are only available for agent conversations")
             if not conv.get("project_dir"):
@@ -2935,6 +4492,34 @@ async def api_delete_conversation(conv_id: int):
 @app.get("/api/bookmarks")
 async def api_get_all_bookmarks():
     return await db.get_all_bookmarks()
+
+
+@app.get("/api/agent-notification-dismissals")
+async def api_agent_notification_dismissals():
+    return await db.get_agent_notification_dismissals()
+
+
+@app.post("/api/agent-notification-dismissals")
+async def api_dismiss_agent_notifications(data: dict):
+    keys = data.get('keys')
+    if not isinstance(keys, list) or len(keys) > 2048 or any(
+        not isinstance(key, str) or len(key) > 512 for key in keys
+    ):
+        raise HTTPException(status_code=422, detail="Invalid notification keys")
+    await db.dismiss_agent_notifications(keys)
+    return await db.get_agent_notification_dismissals()
+
+
+@app.get("/api/bookmarks/{bookmark_id}/message")
+async def api_bookmark_message(bookmark_id: int):
+    bookmarks = await db.get_all_bookmarks()
+    bookmark = next((item for item in bookmarks if item['id'] == bookmark_id), None)
+    if bookmark is None:
+        raise HTTPException(status_code=404, detail="Pin not found")
+    message = await db.get_message(bookmark['message_id'])
+    if message is None or message['conversation_id'] != bookmark['conversation_id']:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return message
 
 
 @app.get("/api/conversations/{conv_id}/bookmarks")
@@ -2960,6 +4545,52 @@ async def api_update_bookmark(bookmark_id: int, data: dict):
 @app.delete("/api/bookmarks/{bookmark_id}")
 async def api_delete_bookmark(bookmark_id: int):
     await db.delete_bookmark(bookmark_id)
+    return {"ok": True}
+
+
+# ── Branch Pins ──
+
+
+def _branch_pin_label(data: dict) -> str:
+    label = data.get("label", "")
+    if not isinstance(label, str):
+        raise HTTPException(status_code=400, detail="label must be a string")
+    label = label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+    if len(label) > 120:
+        raise HTTPException(status_code=400, detail="label must be 120 characters or fewer")
+    return label
+
+
+@app.get("/api/conversations/{conv_id}/branch-pins")
+async def api_get_branch_pins(conv_id: int):
+    return await db.get_branch_pins(conv_id)
+
+
+@app.post("/api/conversations/{conv_id}/branch-pins")
+async def api_add_branch_pin(conv_id: int, data: dict):
+    message_id = data.get("message_id")
+    if not isinstance(message_id, int) or isinstance(message_id, bool):
+        raise HTTPException(status_code=400, detail="message_id must be an integer")
+    pin = await db.add_branch_pin(conv_id, message_id, _branch_pin_label(data))
+    if not pin:
+        raise HTTPException(status_code=404, detail="message not found in this conversation")
+    return pin
+
+
+@app.put("/api/branch-pins/{pin_id}")
+async def api_update_branch_pin(pin_id: int, data: dict):
+    pin = await db.update_branch_pin(pin_id, _branch_pin_label(data))
+    if not pin:
+        raise HTTPException(status_code=404, detail="branch pin not found")
+    return pin
+
+
+@app.delete("/api/branch-pins/{pin_id}")
+async def api_delete_branch_pin(pin_id: int):
+    if not await db.delete_branch_pin(pin_id):
+        raise HTTPException(status_code=404, detail="branch pin not found")
     return {"ok": True}
 
 
@@ -3250,6 +4881,9 @@ async def api_get_tree_map(conv_id: int):
 @app.put("/api/conversations/{conv_id}/messages/{msg_id}")
 async def api_update_message(conv_id: int, msg_id: int, data: dict):
     """Update a user message's content in-place (no new branch)."""
+    existing = await db.get_message(msg_id)
+    if not existing or int(existing.get("conversation_id") or 0) != int(conv_id):
+        raise HTTPException(404, "Message not found in this conversation")
     content = data.get("content", "").strip()
     if not content:
         return {"ok": False, "error": "Content cannot be empty"}
@@ -3267,6 +4901,13 @@ async def api_update_message(conv_id: int, msg_id: int, data: dict):
 @app.delete("/api/conversations/{conv_id}/messages/{msg_id}")
 async def api_delete_branch(conv_id: int, msg_id: int):
     """Delete a message and its entire subtree."""
+    existing = await db.get_message(msg_id)
+    if not existing or int(existing.get("conversation_id") or 0) != int(conv_id):
+        raise HTTPException(404, "Message not found in this conversation")
+    queued_before_ids = {
+        item["user_msg_id"]
+        for item in await db.list_queued_generations(conv_id)
+    }
     result = await db.delete_branch(msg_id)
     if result["deleted"] == 0:
         return {"ok": False, "error": "Message not found"}
@@ -3285,6 +4926,22 @@ async def api_delete_branch(conv_id: int, msg_id: int):
             if leaves:
                 await db.set_active_branch(conv_id, next(iter(leaves)))
 
+    queued_after_ids = {
+        item["user_msg_id"]
+        for item in await db.list_queued_generations(conv_id)
+    }
+    removed_queue_ids = sorted(queued_before_ids - queued_after_ids)
+    if removed_queue_ids:
+        await _ws_send(
+            conv_id,
+            {
+                "type": "queue_changed",
+                "queued": False,
+                "user_msg_id": removed_queue_ids[0],
+                "user_msg_ids": removed_queue_ids,
+            },
+        )
+
     return {"ok": True, "deleted": result["deleted"]}
 
 
@@ -3293,12 +4950,18 @@ async def api_delete_branch(conv_id: int, msg_id: int):
 
 @app.get("/api/conversations/{conv_id}/branch/{leaf_id}")
 async def api_get_branch(conv_id: int, leaf_id: int):
+    leaf = await db.get_message(leaf_id)
+    if not leaf or int(leaf.get("conversation_id") or 0) != int(conv_id):
+        raise HTTPException(404, "Branch message not found in this conversation")
     branch = await db.get_branch_to_root(leaf_id)
     return branch
 
 
 @app.post("/api/conversations/{conv_id}/switch-branch/{leaf_id}")
 async def api_switch_branch(conv_id: int, leaf_id: int):
+    leaf = await db.get_message(leaf_id)
+    if not leaf or int(leaf.get("conversation_id") or 0) != int(conv_id):
+        raise HTTPException(404, "Branch message not found in this conversation")
     # Walk down from clicked node to deepest descendant (follow first/latest child)
     current = leaf_id
     while True:
@@ -3314,14 +4977,107 @@ async def api_switch_branch(conv_id: int, leaf_id: int):
 # ── Messages ──
 
 
+@app.get("/api/conversations/{conv_id}/threads")
+async def api_list_loom_threads(conv_id: int):
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    return await db.list_loom_threads(conv_id)
+
+
+@app.get("/api/conversations/{conv_id}/cursor/{client_instance_id}")
+async def api_get_loom_cursor(conv_id: int, client_instance_id: str):
+    cursor = await db.get_client_loom_cursor(conv_id, client_instance_id)
+    if not cursor:
+        raise HTTPException(404, "No Loom cursor exists for this browser page")
+    return cursor
+
+
+@app.post("/api/conversations/{conv_id}/cursor")
+async def api_select_loom_cursor(conv_id: int, data: dict):
+    try:
+        cursor = await db.select_loom_cursor(
+            conv_id,
+            str(data.get("client_instance_id") or ""),
+            str(data.get("loom_thread_id") or ""),
+            data.get("leaf_message_id"),
+            expected_revision=data.get("expected_revision"),
+        )
+        await _prune_client_generation_subscriptions(
+            conv_id, str(data.get("client_instance_id") or "")
+        )
+        return cursor
+    except db.LoomCursorConflict as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/conversations/{conv_id}/threads")
+async def api_create_loom_thread(conv_id: int, data: dict):
+    """Create an empty thread and supersede this page's older cursor."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    client_instance_id = str(data.get("client_instance_id") or "").strip()
+    if not client_instance_id:
+        raise HTTPException(400, "client_instance_id is required")
+    existing_cursor = await db.get_client_loom_cursor(conv_id, client_instance_id)
+    expected_revision = data.get("expected_revision")
+    if expected_revision is not None:
+        try:
+            expected_revision = int(expected_revision)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "expected_revision must be an integer")
+    if existing_cursor and (
+        expected_revision is None
+        or int(existing_cursor["revision"]) != int(expected_revision)
+    ):
+        raise HTTPException(409, "The Loom cursor changed before the new thread was created")
+    thread = await db.create_loom_thread(
+        conv_id, client_instance_id=client_instance_id
+    )
+    try:
+        cursor = await db.select_loom_cursor(
+            conv_id,
+            client_instance_id,
+            thread["thread_id"],
+            None,
+            expected_revision=expected_revision,
+        )
+    except db.LoomCursorConflict as exc:
+        connection = await db.get_db()
+        await connection.execute(
+            "DELETE FROM loom_threads WHERE thread_id = ? AND root_message_id IS NULL",
+            (thread["thread_id"],),
+        )
+        await connection.commit()
+        raise HTTPException(409, str(exc))
+    await _prune_client_generation_subscriptions(conv_id, client_instance_id)
+    return {"thread": thread, "cursor": cursor}
+
+
 @app.post("/api/conversations/{conv_id}/messages")
 async def api_add_message(conv_id: int, data: dict):
     role = data.get("role", "user")
     content = data.get("content", "")
     raw_image_path = data.get("image_path")
-    # Distinguish between "parent_id not provided" (auto-detect) and "parent_id: null" (root)
+    # ``parent_id`` is an explicit topology value. Omitting it is never an
+    # instruction to consult the conversation-global active branch.
     parent_id_provided = "parent_id" in data
     parent_id = data.get("parent_id")
+    target_anchor_id = parent_id
+    client_instance_id = str(data.get("client_instance_id") or "").strip() or None
+    requested_send_intent = str(data.get("send_intent") or "continue").strip().lower()
+    topology_intent = str(data.get("topology_intent") or "").strip().lower()
+    if requested_send_intent not in {"continue", "parallel", "new_thread"}:
+        raise HTTPException(400, "send_intent must be 'continue', 'parallel', or 'new_thread'")
+    if topology_intent and topology_intent not in {"continue", "branch", "new_thread"}:
+        raise HTTPException(400, "topology_intent must be 'continue', 'branch', or 'new_thread'")
+    is_new_thread = requested_send_intent == "new_thread" or topology_intent == "new_thread"
+    send_intent = "new_thread" if is_new_thread else requested_send_intent
+    if is_new_thread and (not parent_id_provided or parent_id is not None):
+        raise HTTPException(400, "A new thread requires an explicit null parent_id")
 
     # Normalize image_path: accept string, list, or null → store as JSON array or null
     if isinstance(raw_image_path, list):
@@ -3334,21 +5090,350 @@ async def api_add_message(conv_id: int, data: dict):
     if not content.strip() and not image_path:
         raise HTTPException(400, "Message content required")
 
-    # If parent_id was not provided at all, use the current active leaf.
-    # If parent_id was explicitly null, create a root message.
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    client_request_id = str(data.get("client_request_id") or "").strip() or None
+    if reason := model_registry.retirement_reason(
+        conv.get("mode"), data.get("cc_model") or conv.get("cc_model")
+    ):
+        raise HTTPException(410, reason)
+    if client_request_id and len(client_request_id) > 128:
+        raise HTTPException(400, "client_request_id is too long")
+    if role == "user" and client_request_id:
+        existing_message = await db.get_message_by_client_request(
+            conv_id, client_request_id
+        )
+        if existing_message:
+            # Idempotency is checked before cursor validation: a successful
+            # first attempt already advanced that cursor, so its network retry
+            # must return the original row rather than fail stale or relaunch.
+            existing_message["idempotent_replay"] = True
+            existing_message["generation_ids"] = []
+            queued_rows = await db.list_queued_generations(conv_id)
+            queued_row = next(
+                (
+                    item for item in queued_rows
+                    if int(item.get("user_msg_id")) == int(existing_message["id"])
+                ),
+                None,
+            )
+            existing_message["queued"] = bool(queued_row)
+            if queued_row:
+                existing_message["queue_after_draft_id"] = queued_row.get(
+                    "wait_for_draft_id"
+                )
+                existing_message["queue_status"] = queued_row.get("status")
+            return existing_message
+    parallel_enabled = _truthy_setting(conv.get("parallel_agents_enabled"))
+    if role == "user" and send_intent == "parallel" and not parallel_enabled:
+        raise HTTPException(
+            409,
+            "Parallel message launches are disabled for this conversation",
+        )
     if not parent_id_provided:
-        leaf = await db.get_active_leaf(conv_id)
-        parent_id = leaf["id"] if leaf else None
+        raise HTTPException(
+            400,
+            "parent_id is required; Loom never infers a message target from the active branch",
+        )
+
+    # An explicit null is a root request. User roots additionally require the
+    # new-thread cursor contract below; internal/system callers still have to
+    # say null rather than inheriting mutable global state.
+    if parent_id is not None:
+        parent = await db.get_message(parent_id)
+        if not parent or parent.get("conversation_id") != conv_id:
+            raise HTTPException(400, "parent_id does not belong to this conversation")
+
+    cursor_contract = None
+    loom_thread_id = str(data.get("loom_thread_id") or "").strip() or None
+    launch_generation = role == "user" and bool(data.get("launch_generation", False))
+    if role == "user":
+        required = [
+            key
+            for key in (
+                "loom_thread_id",
+                "cursor_id",
+                "cursor_revision",
+                "expected_leaf_id",
+                "topology_intent",
+            )
+            if key not in data
+        ]
+        if required or not client_instance_id:
+            missing = required + ([] if client_instance_id else ["client_instance_id"])
+            raise HTTPException(
+                409,
+                "This browser is using Loom's legacy message contract; reload before sending "
+                f"(missing: {', '.join(missing)})",
+            )
+        expected_leaf_id = data.get("expected_leaf_id")
+        same_expected_parent = (
+            (expected_leaf_id is None and parent_id is None)
+            or str(expected_leaf_id) == str(parent_id)
+        )
+        if not same_expected_parent:
+            raise HTTPException(409, "The requested parent does not match this tab's expected leaf")
+        try:
+            cursor_revision = int(data.get("cursor_revision"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "cursor_revision must be an integer")
+        cursor_contract = await db.get_loom_cursor(str(data.get("cursor_id")))
+        cursor_leaf_matches = bool(
+            cursor_contract
+            and (
+                (cursor_contract.get("leaf_message_id") is None and expected_leaf_id is None)
+                or str(cursor_contract.get("leaf_message_id")) == str(expected_leaf_id)
+            )
+        )
+        if not cursor_contract or not (
+            int(cursor_contract["conversation_id"]) == int(conv_id)
+            and str(cursor_contract["client_instance_id"]) == str(client_instance_id)
+            and str(cursor_contract["thread_id"]) == str(loom_thread_id)
+            and int(cursor_contract["revision"]) == cursor_revision
+            and cursor_leaf_matches
+        ):
+            raise HTTPException(409, "The Loom thread cursor changed; no message was attached")
+        thread = await db.get_loom_thread(loom_thread_id)
+        if not thread or int(thread["conversation_id"]) != int(conv_id):
+            raise HTTPException(400, "loom_thread_id does not belong to this conversation")
+        if parent_id is not None and str(parent.get("loom_thread_id") or "") != loom_thread_id:
+            raise HTTPException(409, "The selected leaf belongs to a different Loom thread")
+        if is_new_thread:
+            if thread.get("root_message_id") is not None:
+                raise HTTPException(409, "This standalone Loom thread already has a root message")
+        elif parent_id is None:
+            raise HTTPException(409, "Only an explicit new_thread action may create a root message")
+
+    # Normal sends continue the branch selected by this request. If that exact
+    # branch has an active assistant draft, the user message belongs after the
+    # draft and its generation intent is persisted below. An explicit parallel
+    # send deliberately keeps the supplied anchor and creates a sibling branch.
+    queue_after_draft_id = None
+    if role == "user" and send_intent == "continue" and topology_intent != "branch":
+        queue_after_draft_id = await _resolve_queue_target(
+            conv_id,
+            parent_id,
+            data.get("queue_after_draft_id"),
+        )
+        if queue_after_draft_id is not None:
+            parent_id = queue_after_draft_id
+
+    # An ordinary UI send persists the message and starts its run in this one
+    # server request. The browser is not the owner of a second, reconnectable
+    # "generate" command that could later target whichever conversation is
+    # current. Queued continuations use their durable scheduler instead.
+    reserved_lease_id = None
+    if launch_generation and queue_after_draft_id is None:
+        mode = _mode_for_cc_model(data.get("cc_model")) or conv.get("mode", "weave")
+        serial_lane = mode in _AGENT_WORKSPACE_MODES and not parallel_enabled
+        if serial_lane:
+            reserved_lease_id = uuid.uuid4().hex
+            acquired = await db.try_acquire_generation_lease(
+                conv_id,
+                reserved_lease_id,
+                user_msg_id=None,
+                draft_parent_id=None,
+                client_instance_id=client_instance_id,
+            )
+            if not acquired:
+                reserved_lease_id = None
+                queue_after_draft_id = await _single_lane_queue_barrier_draft_id(
+                    conv_id
+                )
+                if queue_after_draft_id is None:
+                    raise HTTPException(
+                        409,
+                        "The active agent has not exposed one durable draft yet; retry this send in a moment",
+                    )
+                # The draft may have appeared AFTER _resolve_queue_target's
+                # preflight. Reconcile topology at the reservation boundary
+                # too, but never reparent a new root or an explicit branch.
+                if send_intent == "continue" and topology_intent != "branch" and parent_id is not None:
+                    barrier = await db.get_message(queue_after_draft_id)
+                    if barrier and parent_id in {barrier["id"], barrier.get("parent_id")}:
+                        parent_id = barrier["id"]
+
+    if queue_after_draft_id is not None:
+        existing_queue = await db.list_queued_generations(conv_id)
+        if any(
+            str(item.get("wait_for_draft_id")) == str(queue_after_draft_id)
+            for item in existing_queue
+        ):
+            raise HTTPException(
+                409,
+                "This running agent already has a queued message; edit or cancel it before adding another",
+            )
 
     describe_context = data.get("describe_context", "").strip() or None
-    msg = await db.add_message(
-        conv_id, role, content, parent_id=parent_id, image_path=image_path,
-        describe_context=describe_context
-    )
+    try:
+        msg = await db.add_message(
+            conv_id, role, content, parent_id=parent_id, image_path=image_path,
+            describe_context=describe_context,
+            origin_client_id=client_instance_id,
+            target_anchor_id=target_anchor_id,
+            send_intent=send_intent,
+            loom_thread_id=loom_thread_id,
+            client_request_id=client_request_id,
+        )
+    except (sqlite3.IntegrityError, ValueError) as exc:
+        if reserved_lease_id:
+            await db.release_generation_lease(reserved_lease_id, "launch_failed")
+        if client_request_id:
+            existing_message = await db.get_message_by_client_request(
+                conv_id, client_request_id
+            )
+            if existing_message:
+                existing_message["idempotent_replay"] = True
+                existing_message["generation_ids"] = []
+                return existing_message
+        if role == "user" and is_new_thread:
+            raise HTTPException(
+                409, "This standalone Loom thread already received its root message"
+            ) from exc
+        raise
+    if queue_after_draft_id is not None:
+        generation_settings = {
+            key: data[key]
+            for key in ("cc_model", "cc_effort", "cc_permission_mode")
+            if data.get(key) is not None
+        }
+        try:
+            await db.enqueue_generation(
+                msg["id"],
+                conv_id,
+                queue_after_draft_id,
+                client_instance_id=client_instance_id,
+                loom_thread_id=loom_thread_id,
+                settings=generation_settings,
+                generation_count=data.get("generation_count", 1),
+            )
+        except sqlite3.IntegrityError:
+            # A competing window won the one-continuation slot after our
+            # preflight check. Remove only the row created by this request.
+            await db.delete_branch(msg["id"])
+            raise HTTPException(
+                409,
+                "This running branch already has a queued continuation; edit or cancel it before adding another",
+            )
+        msg["queued"] = True
+        msg["queue_after_draft_id"] = queue_after_draft_id
+    else:
+        msg["queued"] = False
+    if cursor_contract is not None:
+        try:
+            advanced_cursor = await db.advance_loom_cursor(
+                cursor_contract["cursor_id"],
+                conversation_id=conv_id,
+                client_instance_id=client_instance_id,
+                thread_id=loom_thread_id,
+                expected_leaf_id=data.get("expected_leaf_id"),
+                expected_revision=int(data.get("cursor_revision")),
+                new_leaf_id=msg["id"],
+            )
+        except db.LoomCursorConflict as exc:
+            await db.delete_branch(msg["id"])
+            if reserved_lease_id:
+                await db.release_generation_lease(
+                    reserved_lease_id, "launch_failed"
+                )
+            raise HTTPException(409, str(exc))
+        msg["loom_cursor"] = advanced_cursor
     await db.set_active_branch(conv_id, msg["id"])
-    from context_manager import update_rolling_summary
-    asyncio.create_task(update_rolling_summary(conv_id))
+    if queue_after_draft_id is not None:
+        await _ws_send(
+            conv_id,
+            {
+                "type": "queue_changed",
+                "queued": True,
+                "user_msg_id": msg["id"],
+                "wait_for_draft_id": queue_after_draft_id,
+            },
+        )
+        # Covers the race where the assistant finished between queue-target
+        # resolution and the durable insert.
+        _spawn_background_task(
+            _dispatch_ready_queued_generations(conv_id),
+            f"queue dispatch {conv_id}",
+        )
+    elif launch_generation:
+        generation_data = {
+            key: data[key]
+            for key in ("cc_model", "cc_effort", "cc_permission_mode")
+            if data.get(key) is not None
+        }
+        generation_data.update(
+            {
+                "action": "generate",
+                "parent_id": msg["id"],
+                "client_instance_id": client_instance_id,
+                "loom_thread_id": msg["loom_thread_id"],
+            }
+        )
+        count = max(1, min(5, int(data.get("generation_count") or 1)))
+        if conv.get("mode") != "weave":
+            count = 1
+        websocket = _find_client_websocket(conv_id, client_instance_id)
+        launched = []
+        for _ in range(count):
+            try:
+                gen_key, _task = await _launch_generation_task(
+                    websocket,
+                    conv_id,
+                    generation_data,
+                    client_instance_id,
+                    preacquired_lease_id=reserved_lease_id,
+                )
+            except Exception:
+                if reserved_lease_id:
+                    await db.release_generation_lease(
+                        reserved_lease_id, "launch_failed"
+                    )
+                raise
+            reserved_lease_id = None
+            launched.append(gen_key[2])
+        msg["generation_ids"] = launched
     return msg
+
+
+@app.get("/api/conversations/{conv_id}/generation-queue")
+async def api_generation_queue(conv_id: int, loom_thread_id: str | None = None):
+    if not await db.get_conversation(conv_id):
+        raise HTTPException(404, "Conversation not found")
+    items = await db.list_queued_generations(conv_id)
+    if loom_thread_id:
+        items = [
+            item for item in items
+            if str(item.get("loom_thread_id") or "") == str(loom_thread_id)
+        ]
+    return items
+
+
+@app.post(
+    "/api/conversations/{conv_id}/generation-queue/{user_msg_id}/resume"
+)
+async def api_resume_queued_generation(conv_id: int, user_msg_id: int):
+    message = await db.get_message(user_msg_id)
+    if not message or int(message.get("conversation_id")) != int(conv_id):
+        raise HTTPException(404, "Queued message not found")
+    conv = await db.get_conversation(conv_id)
+    if reason := model_registry.retirement_reason((conv or {}).get("mode"), (conv or {}).get("cc_model")):
+        raise HTTPException(410, reason)
+    if not await db.resume_queued_generation(user_msg_id):
+        raise HTTPException(409, "Queued message is not paused")
+    _spawn_background_task(
+        _dispatch_ready_queued_generations(conv_id), f"queue dispatch {conv_id}"
+    )
+    await _ws_send(
+        conv_id,
+        {
+            "type": "queue_changed",
+            "queued": True,
+            "status": "queued",
+            "user_msg_id": user_msg_id,
+        },
+    )
+    return {"ok": True, "user_msg_id": user_msg_id, "status": "queued"}
 
 
 @app.get("/api/conversations/{conv_id}/messages/{msg_id}/siblings")
@@ -3711,6 +5796,12 @@ async def api_get_config():
     return _normalized_config_dict()
 
 
+@app.get("/api/visual-settings")
+async def api_visual_settings():
+    from visual_settings import load
+    return JSONResponse(load(), headers={"Cache-Control":"no-store"})
+
+
 @app.put("/api/config")
 async def api_update_config(data: dict):
     config.load()
@@ -3778,16 +5869,93 @@ async def api_get_openrouter_usage():
     return await openrouter_client.usage_snapshot()
 
 
+@app.get("/api/provider-usage")
+async def api_get_provider_usage():
+    from provider_usage import monitor
+    return JSONResponse(await monitor.snapshot(), headers={"Cache-Control": "no-store"})
+
+
+from usage_activity import router as usage_activity_router
+app.include_router(usage_activity_router)
+
+
 @app.post("/api/openrouter/provision")
 async def api_post_openrouter_provision(data: dict = None):
     data = data or {}
     key = await openrouter_client.create_limited_key(
-        name=data.get("name", "A Shadow Loom"),
+        name=data.get("name", "EX umbra Omnia"),
         limit=data.get("limit", 12.5),
         limit_reset=data.get("limit_reset", "weekly"),
         include_byok_in_limit=data.get("include_byok_in_limit", True),
     )
     return {"ok": True, "key": key}
+
+
+# ── OpenRouter model registry editor (admin-managed) ──
+
+
+def _openrouter_model_projection() -> dict:
+    """List merged OpenRouter models with an overrides-file marker per entry."""
+    try:
+        overrides_ids = {str(m.get("id", "")).casefold() for m in model_registry.load_overrides()}
+    except ValueError:
+        overrides_ids = set()
+    return {
+        "models": [
+            {
+                "id": m["id"], "label": m["label"],
+                "context_length": m["context_length"],
+                "handoff_threshold": m.get("handoff_threshold"),
+                "aliases": m.get("aliases", []),
+                "capabilities": m.get("capabilities", {}),
+                "routes": m["routes"],
+                "overridden": m["id"].casefold() in overrides_ids,
+            }
+            for m in model_registry.openrouter_catalog_models()
+        ],
+        "overrides_active": bool(overrides_ids),
+    }
+
+
+def _refresh_registry_derived_cc_groups() -> None:
+    """Rebuild registry-derived CC picker groups after a registry hot reload.
+
+    CC_MODELS holds startup snapshots. Refresh the OpenRouter and Goose ACP
+    groups from the live registry, preserving runtime-derived entries (Goose
+    Dream selectors) which carry no registry model_id.
+    """
+    route_by_group = {
+        "OpenRouter": "openrouter",
+        "Goose ACP": "goose",
+        "Goose ACP - Smart/Subagents": "goose_smart",
+    }
+    for group in CC_MODELS:
+        route = route_by_group.get(group.get("group", ""))
+        if not route:
+            continue
+        fresh = {e["value"].casefold(): e for e in model_registry.REGISTRY.entries(route)}
+        preserved = [m for m in group.get("models", []) if not m.get("model_id")]
+        group["models"] = list(fresh.values()) + preserved
+
+
+@app.get("/api/models/openrouter")
+async def api_get_openrouter_models():
+    """Current merged OpenRouter model list for the admin slugs editor."""
+    return _openrouter_model_projection()
+
+
+@app.post("/api/models/openrouter")
+async def api_post_openrouter_models(data: dict = None):
+    """Replace the OpenRouter override set, hot-reload the registry, refresh pickers."""
+    data = data or {}
+    try:
+        model_registry.save_openrouter_overrides(data.get("models") or [])
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _refresh_registry_derived_cc_groups()
+    global _ALL_ENGINES_CACHE
+    _ALL_ENGINES_CACHE = None
+    return {"ok": True, **_openrouter_model_projection()}
 
 
 def load_local_codex_models() -> list[dict]:
@@ -3804,7 +5972,12 @@ def load_local_codex_models() -> list[dict]:
         for m in data.get("models", []):
             slug = m.get("slug")
             display_name = m.get("display_name")
-            if slug and display_name:
+            if (
+                slug
+                and display_name
+                and m.get("visibility", "list") != "hide"
+                and m.get("supported_in_api", True) is not False
+            ):
                 models.append({
                     "value": f"codex-{slug}",
                     "label": f"Codex ({display_name})"
@@ -3816,112 +5989,74 @@ def load_local_codex_models() -> list[dict]:
 
 
 def get_initial_codex_models() -> list[dict]:
-    local_models = load_local_codex_models()
-    if local_models:
-        return local_models
-    return [
-        {"value": "codex-gpt-5.6-sol", "label": "Codex (GPT-5.6-Sol)"},
-        {"value": "codex-gpt-5.6-terra", "label": "Codex (GPT-5.6-Terra)"},
-        {"value": "codex-gpt-4o", "label": "Codex (GPT-4o)"},
-    ]
+    return _codex_picker_models(load_local_codex_models())
+
+
+def _codex_picker_models(discovered: list[dict]) -> list[dict]:
+    """Discovered selectors plus explicit catalog pins, without access claims."""
+    rows = []
+    seen = set()
+    for row in [*discovered, *model_registry.REGISTRY.fallback("codex")]:
+        identity = row["value"].casefold()
+        if identity not in seen:
+            rows.append(dict(row))
+            seen.add(identity)
+    return rows
 
 
 def load_local_gemini_models() -> list[dict]:
-    """Load Gemini models from the local ~/.gemini/models_cache.json file if it exists."""
+    """Read cached models without blocking a request/startup on the agy CLI."""
     import os
     from pathlib import Path
     home = Path(os.environ.get("USERPROFILE") or Path.home())
-    cache_path = home / ".gemini" / "models_cache.json"
+    from gemini_client import agy_models_cache_path, _agy_model_rows
+    cache_path = agy_models_cache_path()
     if not cache_path.exists():
-        return []
-    try:
-        data = json.loads(cache_path.read_text(encoding="utf-8-sig"))
-        models = []
-        for m in data.get("models", []):
-            slug = m.get("slug")
-            display_name = m.get("display_name")
-            if slug and display_name:
-                models.append({
-                    "value": f"gemini:{slug}",
-                    "label": f"Gemini ({display_name})"
-                })
-        return models
-    except Exception as e:
-        print(f"[GEMINI] Failed to load local models cache: {e}")
-        return []
+        cache_path = home / ".gemini" / "models_cache.json"  # legacy read-only fallback
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+            models = _agy_model_rows(data.get("models", []))
+            if models:
+                return models
+        except Exception as e:
+            print(f"[GEMINI] Failed to load local models cache: {e}")
+
+    return []
 
 
 def get_initial_gemini_models() -> list[dict]:
-    local_models = load_local_gemini_models()
-    if local_models:
-        return local_models
-    return [
-        {"value": "Gemini 3.6 Flash (High)", "label": "Gemini 3.6 Flash (High)"},
-        {"value": "Gemini 3.6 Flash (Medium)", "label": "Gemini 3.6 Flash (Medium)"},
-        {"value": "Gemini 3.6 Flash (Low)", "label": "Gemini 3.6 Flash (Low)"},
-        {"value": "Gemini 3.6 Pro (High)", "label": "Gemini 3.6 Pro (High)"},
-        {"value": "Gemini 3.6 Pro (Low)", "label": "Gemini 3.6 Pro (Low)"},
-        {"value": "Gemini 3.5 Flash (High)", "label": "Gemini 3.5 Flash (High)"},
-        {"value": "Gemini 3.5 Flash (Medium)", "label": "Gemini 3.5 Flash (Medium)"},
-        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
-        {"value": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
-        {"value": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
-        {"value": "Claude Sonnet 4.6 (Thinking)", "label": "Claude Sonnet 4.6 (Thinking)"},
-        {"value": "Claude Opus 4.6 (Thinking)", "label": "Claude Opus 4.6 (Thinking)"},
-        {"value": "GPT-OSS 120B (Medium)", "label": "GPT-OSS 120B (Medium)"},
-    ]
+    return load_local_gemini_models() or model_registry.REGISTRY.fallback("gemini")
 
 
 # ── CC Model List ──
-# Single source of truth for Anthropic + Gemini models available in Loom/Braid.
-# Update this list when new models ship — all dropdowns pull from here.
+# Picker defaults are generated from the shared catalog. Discovery may replace
+# native groups; runtime local/Dream entries are derived separately.
+def _initial_cc_models() -> list[dict]:
+    registry = model_registry.REGISTRY
+    pareto_models = [
+        {"value": "gemini:gemini-3.8-flash-high", "label": "Gemini Flash 3.8 (High)", "effort": "high"},
+        {"value": "codex-gpt-6.1-sol", "label": "GPT 6.1 Sol (Medium)", "effort": "medium"},
+        {"value": "goose:openrouter:z-ai/glm-5.3-flash", "label": "GLM 5.3 Flash (Extra High in Goose)", "effort": "xhigh"},
+        {"value": "claude-sonnet-5-5[1m]", "label": "Claude Sonnet 5.5 (Medium in CC, 1M)", "effort": "medium"},
+    ]
+    return [
+        {"group": "Pareto", "models": pareto_models},
+        {"group": "Anthropic", "models": registry.fallback("anthropic")},
+        {"group": "Antigravity (agy)", "models": get_initial_gemini_models()},
+        {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
+        {"group": "Goose ACP", "models": registry.entries("goose") + [{
+            "value": f"goose:dream:{config.dream_model}", "label": f"Goose Dream ({config.dream_model})"}]},
+        {"group": "Goose ACP - Smart/Subagents", "models": registry.entries("goose_smart") + [{
+            "value": f"goose:auto:dream:{config.dream_model}", "label": f"Goose Smart Dream ({config.dream_model})"}]},
+        {"group": "OpenRouter", "models": registry.entries("openrouter")},
+        {"group": "Umans AI", "models": registry.fallback("umans")},
+        {"group": "Dream via Claude Code", "models": [{
+            "value": f"dream:{config.dream_model}", "label": f"Dream Claude ({config.dream_model})"}]},
+    ]
 
-CC_MODELS = [
-    {"group": "Anthropic", "models": [
-        {"value": "sonnet", "label": "Sonnet"},
-        {"value": "sonnet[1m]", "label": "Sonnet (1M)"},
-        {"value": "opus", "label": "Opus"},
-        {"value": "opus[1m]", "label": "Opus (1M)"},
-        {"value": "haiku", "label": "Haiku"},
-    ]},
-    {"group": "Antigravity (agy)", "models": get_initial_gemini_models()},
-    {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
-    {"group": "Goose ACP", "models": [
-        {"value": "goose:openrouter:z-ai/glm-5.2", "label": "Goose OpenRouter GLM 5.2"},
-        {"value": "goose:openrouter:moonshotai/kimi-k2.7-code", "label": "Goose OpenRouter Kimi K2.7 Code"},
-        {"value": "goose:openrouter:openai/gpt-5.6-luna", "label": "Goose OpenRouter GPT 5.6 Luna"},
-        {"value": "goose:openrouter:deepseek/deepseek-v4-flash-0731", "label": "Goose OpenRouter DeepSeek V4 Flash 0731"},
-        {
-            "value": f"goose:dream:{config.dream_model}",
-            "label": f"Goose Dream ({config.dream_model})",
-        },
-    ]},
-    {"group": "Goose ACP - Smart/Subagents", "models": [
-        {"value": "goose:auto:openrouter:z-ai/glm-5.2", "label": "Goose Smart GLM 5.2"},
-        {
-            "value": f"goose:auto:dream:{config.dream_model}",
-            "label": f"Goose Smart Dream ({config.dream_model})",
-        },
-    ]},
-    {"group": "OpenRouter", "models": [
-        {"value": "openrouter:z-ai/glm-5.2", "label": "OpenRouter GLM 5.2"},
-        {"value": "openrouter:moonshotai/kimi-k2.7-code", "label": "OpenRouter Kimi K2.7 Code"},
-        {"value": "openrouter:openai/gpt-5.6-luna", "label": "OpenRouter GPT 5.6 Luna"},
-        {"value": "openrouter:deepseek/deepseek-v4-flash-0731", "label": "OpenRouter DeepSeek V4 Flash 0731"},
-    ]},
-    {"group": "Umans AI", "models": [
-        {"value": "umans-coder", "label": "Umans Coder (Kimi K2.7-Code)"},
-        {"value": "umans-kimi-k2.7", "label": "Umans Kimi K2.7 (always thinks)"},
-        {"value": "umans-glm-5.2", "label": "Umans GLM 5.2 (largest context)"},
-        {"value": "umans-flash", "label": "Umans Flash (light, high-interactivity)"},
-    ]},
-    {"group": "Dream via Claude Code", "models": [
-        {
-            "value": f"dream:{config.dream_model}",
-            "label": f"Dream Claude ({config.dream_model})",
-        },
-    ]},
-]
+
+CC_MODELS = _initial_cc_models()
 
 
 def _runtime_goose_llama_model(auto: bool = False) -> dict | None:
@@ -3950,6 +6085,11 @@ def _cc_models_with_runtime_goose_llama() -> list[dict]:
             "group": group.get("group", ""),
             "models": list(group.get("models", [])),
         }
+        if copied["group"].startswith("ChatGPT Codex"):
+            # App-server can update its cache during an ordinary agent turn.
+            # Re-read that local evidence instead of retaining the startup list
+            # until an explicit refresh or a host restart. No provider call.
+            copied["models"] = _codex_picker_models(load_local_codex_models() or copied["models"])
         if copied["group"] == "Goose ACP":
             entry = _runtime_goose_llama_model(auto=False)
             if entry and not any(m.get("value") == entry["value"] for m in copied["models"]):
@@ -3958,26 +6098,100 @@ def _cc_models_with_runtime_goose_llama() -> list[dict]:
             entry = _runtime_goose_llama_model(auto=True)
             if entry and not any(m.get("value") == entry["value"] for m in copied["models"]):
                 copied["models"].append(entry)
+        # Explicit native pins supplement discovery, including after refresh.
+        family = ("codex" if copied["group"].startswith("ChatGPT Codex") else
+                  "gemini" if copied["group"].startswith("Antigravity") else
+                  "anthropic" if copied["group"].startswith("Anthropic") and "Auto" not in copied["group"] else
+                  "umans" if copied["group"] == "Umans AI" else None)
+        if family:
+            for entry in model_registry.REGISTRY.entries(family):
+                if not any(m.get("value") == entry["value"] for m in copied["models"]):
+                    copied["models"].append(entry)
+        copied["models"] = [{**model_registry.resolve(m.get("value")), **m} for m in copied["models"]]
         groups.append(copied)
     return groups
 
 
-def _visible_cc_models() -> list[dict]:
-    """Return CC model groups, hiding disabled compatibility provider groups."""
+# Cached Dream-sidecar availability for picker filtering. None means "never
+# probed" and keeps the legacy show-Dream behavior until the first probe runs.
+_DREAM_PICKER_PROBE_TTL_SEC = 60
+_dream_picker_cache: dict = {"ok": None, "checked_at": 0.0}
+
+
+async def _dream_available_cached() -> bool | None:
+    """Short-TTL Dream health result so picker filtering costs minimal latency."""
+    now = time.time()
+    if _dream_picker_cache["ok"] is not None and now - _dream_picker_cache["checked_at"] <= _DREAM_PICKER_PROBE_TTL_SEC:
+        return _dream_picker_cache["ok"]
+    try:
+        import dream_client as _dc
+        status = await asyncio.wait_for(_dc.health(config.dream_host, timeout=1.0), timeout=1.2)
+    except Exception:
+        status = None
+    _dream_picker_cache["ok"] = bool(status)
+    _dream_picker_cache["checked_at"] = now
+    return _dream_picker_cache["ok"]
+
+
+def _drop_dream_picker_entries(groups: list[dict]) -> list[dict]:
+    """Remove Dream-backed picker entries and the Dream group when Dream is down."""
+    dream_prefixes = ("goose:dream:", "goose:auto:dream:", "dream:")
+    filtered = []
+    for group in groups:
+        if group.get("group", "") == "Dream via Claude Code":
+            continue
+        models = [m for m in group.get("models", [])
+                  if not str(m.get("value", "")).lower().startswith(dream_prefixes)]
+        filtered.append({**group, "models": models})
+    return filtered
+
+
+def _visible_cc_models(dream_available: bool | None = None) -> list[dict]:
+    """Return CC model groups, hiding disabled compatibility provider groups.
+
+    When ``dream_available`` is False (or the last cached probe says Dream is
+    down) Dream-backed selectors are hidden from the picker.
+    """
     groups = _cc_models_with_runtime_goose_llama()
+    if not config.enable_goose:
+        groups = [
+            {**g, "models": [m for m in g.get("models", []) if not str(m.get("value", "")).lower().startswith("goose:")]}
+            if g.get("group") == "Pareto" else g
+            for g in groups
+        ]
     if config.enable_umans_models and config.enable_goose:
+        if dream_available is None:
+            dream_available = _dream_picker_cache["ok"]
+        if dream_available is False:
+            groups = _drop_dream_picker_entries(groups)
         return groups
-    return [
+    groups = [
         group
         for group in groups
         if (config.enable_umans_models or "umans" not in group.get("group", "").lower())
         and (config.enable_goose or "goose" not in group.get("group", "").lower())
     ]
+    if dream_available is None:
+        dream_available = _dream_picker_cache["ok"]
+    if dream_available is False:
+        groups = _drop_dream_picker_entries(groups)
+    return groups
 
 
 @app.get("/api/cc-models")
 async def api_cc_models():
-    return _visible_cc_models()
+    return _visible_cc_models(dream_available=await _dream_available_cached())
+
+
+@app.get("/api/model-registry.js")
+async def api_model_registry_script():
+    """Offline bootstrap before SPA rendering; no model probes or credentials."""
+    metadata = model_registry.REGISTRY.public(_visible_cc_models())
+    data = json.dumps(metadata, ensure_ascii=True).replace("<", "\\u003c")
+    return Response(
+        "EXOModelRegistry.install(" + data + ");\n",
+        media_type="application/javascript", headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/api/goose/diagnostics")
@@ -4094,65 +6308,23 @@ def _build_anthropic_model_dropdowns(api_models: list[dict]) -> tuple[list[dict]
     return auto_models, pinned_models, by_family
 
 
-@app.post("/api/cc-models/refresh")
-async def api_cc_models_refresh():
-    """Rebuild the Anthropic dropdown from the live `/v1/models` API, using the
-    local Claude Code subscription OAuth token (no API key, no generation —
-    one free metadata request). Produces two groups in place of the old single
-    "Anthropic" group:
+def _update_gemini_in_cc_models(models: list[dict]):
+    for group in CC_MODELS:
+        if group["group"].startswith("Antigravity"):
+            group["models"] = models
+            return
+    CC_MODELS.append({"group": "Antigravity", "models": models})
 
-      • "Anthropic — Auto"   alias values (`opus`, `sonnet[1m]`, …) labeled
-                              "(latest)" without a specific version, since the
-                              CLI's own bundled alias→ID map decides which
-                              concrete model actually runs.
-      • "Anthropic — Pinned" every full claude-* ID the API returns, so the
-                              user can pin an exact version. Each version is
-                              followed by its `[1m]` sibling where the version
-                              supports an explicit 1M suffix (Sonnet ≥4.5,
-                              Opus ≥4.7). Fable is surfaced as a pinned ID
-                              because the documented API ID is `claude-fable-5`.
 
-    Mutates CC_MODELS in place so existing references stay valid."""
-    token = _read_oauth_token()
-    if not token:
-        raise HTTPException(
-            401,
-            "No Claude Code login found (~/.claude/.credentials.json). "
-            "Run `claude` once to sign in, then retry.",
-        )
+def _update_codex_in_cc_models(models: list[dict]):
+    for group in CC_MODELS:
+        if group["group"].startswith("ChatGPT Codex"):
+            group["models"] = models
+            return
+    CC_MODELS.append({"group": "ChatGPT Codex", "models": models})
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                "https://api.anthropic.com/v1/models",
-                params={"limit": 100},
-                headers=headers,
-            )
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"Failed to reach Anthropic /v1/models: {e}")
 
-    if resp.status_code == 401:
-        raise HTTPException(
-            401,
-            "Anthropic rejected the login token (expired?). "
-            "Run `claude` and complete sign-in again, then retry.",
-        )
-    if resp.status_code != 200:
-        raise HTTPException(502, f"Anthropic /v1/models returned {resp.status_code}: {resp.text[:200]}")
-
-    try:
-        auto_models, pinned_models, by_family = _build_anthropic_model_dropdowns(resp.json().get("data", []))
-    except ValueError as e:
-        raise HTTPException(502, str(e))
-
-    # Splice the two new groups in where the old Anthropic group(s) were, keep
-    # everything else in original order. Handles both the initial hardcoded
-    # "Anthropic" group and any prior refresh's "Anthropic — Auto/Pinned" pair.
+def _update_anthropic_in_cc_models(auto_models: list[dict], pinned_models: list[dict]):
     new_cc_models: list[dict] = []
     inserted = False
     for group in CC_MODELS:
@@ -4166,31 +6338,151 @@ async def api_cc_models_refresh():
     if not inserted:
         new_cc_models.insert(0, {"group": "Anthropic — Pinned", "models": pinned_models})
         new_cc_models.insert(0, {"group": "Anthropic — Auto", "models": auto_models})
-
-    # Also reload and update Codex models cache in CC_MODELS
-    try:
-        local_models = load_local_codex_models()
-        if local_models:
-            for group in new_cc_models:
-                if group["group"].startswith("ChatGPT Codex"):
-                    group["models"] = local_models
-                    break
-    except Exception as e:
-        print(f"[REFRESH] Failed to update Codex models: {e}")
-
-    # Also reload and update Gemini models cache in CC_MODELS
-    try:
-        local_gemini = load_local_gemini_models()
-        if local_gemini:
-            for group in new_cc_models:
-                if group["group"].startswith("Antigravity"):
-                    group["models"] = local_gemini
-                    break
-    except Exception as e:
-        print(f"[REFRESH] Failed to update Gemini models: {e}")
-
     CC_MODELS[:] = new_cc_models
-    return {"models": _visible_cc_models(), "families": sorted(f for f, v in by_family.items() if v)}
+
+
+@app.post("/api/cc-models/refresh")
+async def api_cc_models_refresh(provider: str = "all"):
+    """Refresh model options for supported agent harnesses (Anthropic, Antigravity, Codex).
+
+    provider can be "all", "anthropic", "gemini", or "codex". When "all", discovery runs
+    concurrently across providers without one provider's failure blocking the others.
+    """
+    req_provider = (provider or "all").strip().lower()
+    refreshed: list[str] = []
+    skipped: dict[str, str] = {}
+    by_family: dict = {}
+
+    if req_provider == "gemini":
+        import gemini_client
+        models = await asyncio.to_thread(gemini_client.discover_agy_models)
+        if not models:
+            raise HTTPException(502, "Antigravity model discovery failed; existing models were retained.")
+        _update_gemini_in_cc_models(models)
+        return {
+            "ok": True,
+            "refreshed": ["gemini"],
+            "skipped": {},
+            "models": _visible_cc_models(),
+            "families": [],
+        }
+
+    if req_provider == "codex":
+        import codex_client
+        models = await codex_client.discover_codex_models(force=True)
+        if not models:
+            raise HTTPException(502, "Codex model discovery failed; existing models were retained.")
+        _update_codex_in_cc_models(models)
+        return {
+            "ok": True,
+            "refreshed": ["codex"],
+            "skipped": {},
+            "models": _visible_cc_models(),
+            "families": [],
+        }
+
+    async def _refresh_anthropic():
+        nonlocal by_family
+        token = _read_oauth_token()
+        if not token:
+            if req_provider == "anthropic":
+                raise HTTPException(
+                    401,
+                    "No Claude Code login found (~/.claude/.credentials.json). "
+                    "Run `claude` once to sign in, then retry.",
+                )
+            skipped["anthropic"] = "No Claude Code login found (~/.claude/.credentials.json)"
+            return
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    params={"limit": 100},
+                    headers=headers,
+                )
+        except httpx.HTTPError as e:
+            if req_provider == "anthropic":
+                raise HTTPException(502, f"Failed to reach Anthropic /v1/models: {e}")
+            skipped["anthropic"] = f"Failed to reach Anthropic /v1/models: {e}"
+            return
+
+        if resp.status_code == 401:
+            if req_provider == "anthropic":
+                raise HTTPException(
+                    401,
+                    "Anthropic rejected the login token (expired?). "
+                    "Run `claude` and complete sign-in again, then retry.",
+                )
+            skipped["anthropic"] = "Anthropic rejected the login token (expired)"
+            return
+        if resp.status_code != 200:
+            if req_provider == "anthropic":
+                raise HTTPException(502, f"Anthropic /v1/models returned {resp.status_code}: {resp.text[:200]}")
+            skipped["anthropic"] = f"Anthropic returned {resp.status_code}"
+            return
+
+        try:
+            auto_models, pinned_models, fams = _build_anthropic_model_dropdowns(resp.json().get("data", []))
+            by_family.update(fams)
+            _update_anthropic_in_cc_models(auto_models, pinned_models)
+            refreshed.append("anthropic")
+        except Exception as e:
+            if req_provider == "anthropic":
+                raise HTTPException(502, str(e))
+            skipped["anthropic"] = str(e)
+
+    async def _refresh_gemini():
+        import gemini_client
+        try:
+            models = await asyncio.to_thread(gemini_client.discover_agy_models)
+            if not models:
+                models = await asyncio.to_thread(load_local_gemini_models)
+            if models:
+                _update_gemini_in_cc_models(models)
+                refreshed.append("gemini")
+            else:
+                skipped["gemini"] = "Antigravity CLI discovery returned no models"
+        except Exception as e:
+            skipped["gemini"] = str(e)
+
+    async def _refresh_codex():
+        import codex_client
+        try:
+            models = await codex_client.discover_codex_models(force=True)
+            if not models:
+                models = load_local_codex_models()
+            if models:
+                _update_codex_in_cc_models(models)
+                refreshed.append("codex")
+            else:
+                skipped["codex"] = "Codex discovery returned no models"
+        except Exception as e:
+            skipped["codex"] = str(e)
+
+    tasks = []
+    if req_provider in ("all", "anthropic"):
+        tasks.append(_refresh_anthropic())
+    if req_provider in ("all", "gemini"):
+        tasks.append(_refresh_gemini())
+    if req_provider in ("all", "codex"):
+        tasks.append(_refresh_codex())
+
+    await asyncio.gather(*tasks, return_exceptions=False if req_provider != "all" else True)
+
+    families = sorted(f for f, v in by_family.items() if v) if by_family else []
+    return {
+        "ok": True,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "models": _visible_cc_models(),
+        "families": families,
+    }
 
 
 _VISION_MODEL_CACHE: dict[tuple[str, str], bool] = {}
@@ -4266,6 +6558,129 @@ _MIME_MAP = {
 }
 
 
+_PREVIEW_TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+
+
+def _project_file_servable(relative: Path) -> bool:
+    """Images and plan/task previews only; never dotfiles such as .env or .git.
+
+    Hidden folders are refused except Claude Code plan files (.claude/plans/*.md),
+    which the artifacts panel links to.
+    """
+    parts = relative.parts
+    if not parts:
+        return False
+    suffix = relative.suffix.lower()
+    if suffix not in _IMAGE_EXTENSIONS and suffix not in _PREVIEW_TEXT_EXTENSIONS:
+        return False
+    hidden = [p for p in parts if p.startswith(".")]
+    if not hidden:
+        return True
+    return (len(parts) == 3 and [p.lower() for p in parts[:2]] == [".claude", "plans"]
+            and suffix in _PREVIEW_TEXT_EXTENSIONS and not parts[2].startswith("."))
+
+
+async def _chat_presentation_owner(conv_id: int, run_id: str):
+    """Only a live exact run may publish; never infer ownership from focus."""
+    run_id = canonical_run_id(run_id)
+    if not run_id:
+        raise HTTPException(400, 'Exact run identity required')
+    if run_id.startswith('gen:'):
+        for key, snapshot in list(_generation_snapshots.items()):
+            if key[0] == conv_id and f'gen:{key[2]}' == run_id:
+                task = _active_generations.get(key)
+                if task is None or task.done():
+                    break
+                draft_id = snapshot.get('draft_msg_id')
+                message = await db.get_message(draft_id) if draft_id else None
+                if not message or message['conversation_id'] != conv_id or message['role'] != 'assistant':
+                    break
+                conv = await db.get_conversation(conv_id)
+                return run_id, snapshot.get('project_dir') or (conv or {}).get('project_dir') or '.', draft_id, None
+        raise HTTPException(409, 'Generation is no longer active or has no draft')
+    run = await db.get_agent_run(run_id.removeprefix('agent:'))
+    if not run or run['conversation_id'] != conv_id or run['status'] != 'running':
+        raise HTTPException(409, 'Child run is not active in this conversation')
+    if agent_access.sensitive(run):
+        raise HTTPException(403, 'Sensitive children require a human-released handoff')
+    return run_id, run['project_dir'], None, run
+
+
+@app.post('/api/conversations/{conv_id}/chat-items')
+async def api_publish_chat_item(conv_id: int, data: dict = Body(...)):
+    run_id, workspace, message_id, child = await _chat_presentation_owner(conv_id, data.get('run_id'))
+    # Reuse the server-issued run capability, without invoking history search.
+    # Numeric generation IDs alone can be reused after a host restart.
+    from search_space.scopes import resolve_scope
+    from search_space.index import workspace_key
+    capability = resolve_scope(data.get('scope_token'))
+    if (not capability or capability.conversation_id != conv_id
+            or canonical_run_id(capability.run_id) != run_id
+            or capability.workspace_key != workspace_key(workspace)
+            or capability.source_id != _search_source_id()):
+        raise HTTPException(403, 'Chat publication requires this live run capability')
+    try:
+        if not isinstance(data.get('request_id'), str):
+            raise ValueError('A UUID request_id is required')
+        request_id = str(uuid.UUID(data.get('request_id', '')))
+        existing = await chat_presentations.get_item(request_id)
+        if existing:
+            if existing['conversation_id'] != conv_id or existing['run_id'] != run_id or existing['message_id'] != message_id:
+                raise ValueError('Presentation request belongs to another run')
+            return chat_presentations.public_item(existing['item'])
+        source_id = data.get('source_id')
+        if source_id:
+            if not isinstance(source_id, str):
+                raise ValueError('source_id must be an attachment ID')
+            if data.get('path') is not None or data.get('content') is not None or data.get('mode') != 'attach':
+                raise ValueError('source_id must be used alone with attach')
+            source = await chat_presentations.get_item(source_id)
+            if not source or source['conversation_id'] != conv_id or source['item']['mode'] != 'attach':
+                raise ValueError('Attachment source unavailable in this conversation')
+            # Sensitive items are never admitted, and children cannot broaden access
+            # by copying a selection belonging to a different child.
+            if child and source['run_id'] != run_id:
+                raise ValueError('Children may only reuse their own selected attachments')
+            item = {**source['item'], 'id': request_id}
+        else:
+            if child and data.get('path') is not None:
+                target = chat_presentations.workspace_file(workspace, data['path'])
+                relative = str(target.relative_to(Path(workspace).resolve()))
+                if not any(agent_access.contains(p, relative) for p in agent_access.scopes(child)[0]):
+                    raise ValueError('File is outside the child read scope')
+            item = await asyncio.to_thread(chat_presentations.prepare, workspace, {**data, 'request_id': request_id})
+        # Recheck ownership after file IO in case cancellation happened while reading.
+        await _chat_presentation_owner(conv_id, run_id)
+        result = await chat_presentations.save(conv_id, run_id, message_id, item)
+    except (ValueError, TypeError, OSError, UnicodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if message_id is not None:
+        message = await db.get_message(message_id)
+        await _ws_send(conv_id, {'type': 'chat_item', 'run_id': run_id, 'gen_id': int(run_id.split(':')[1]),
+                                'draft_msg_id': message_id, 'loom_thread_id': message.get('loom_thread_id'),
+                                'parent_id': message.get('parent_id'), 'item': result})
+    return result
+
+
+@app.get('/api/chat-items/{item_id}/file')
+async def api_download_chat_item(item_id: str, download: bool = False):
+    stored = await chat_presentations.get_item(item_id)
+    if not stored:
+        raise HTTPException(404, 'File reference unavailable')
+    item = stored['item']
+    try:
+        target = await asyncio.to_thread(chat_presentations.download_path, item)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(404, 'File no longer available') from exc
+    # Only validated raster snapshots may render inline. Live files always download.
+    inline = item['mode'] == 'attach' and item['kind'] == 'image' and not download
+    return FileResponse(target, media_type=item.get('media_type') if inline else 'application/octet-stream',
+                        filename=Path(item.get('path') or item['label']).name,
+                        content_disposition_type='inline' if inline else 'attachment',
+                        headers={'Content-Security-Policy': "sandbox; default-src 'none'",
+                                 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store'})
+
+
 @app.get("/api/conversations/{conv_id}/file")
 async def serve_project_file(conv_id: int, path: str = ""):
     """Serve a file from a conversation's project directory (scoped, images only by default)."""
@@ -4279,23 +6694,26 @@ async def serve_project_file(conv_id: int, path: str = ""):
     base = Path(project_dir).resolve()
     target = (base / path).resolve()
 
-    # Prevent path traversal
-    if not str(target).startswith(str(base)):
+    # Component-aware containment: "C:\proj" must not contain "C:\proj-other".
+    if not target.is_relative_to(base):
         raise HTTPException(403, "Path traversal blocked")
+    if not _project_file_servable(target.relative_to(base)):
+        raise HTTPException(403, "Only images and markdown/text previews are served")
     if not target.exists() or not target.is_file():
         raise HTTPException(404, "File not found")
 
     suffix = target.suffix.lower()
-    media_type = _MIME_MAP.get(suffix)
-    if not media_type:
-        # Allow text files too for previews
-        media_type = "text/plain"
+    media_type = _MIME_MAP.get(suffix) or "text/plain"
 
+    # Agent-written files (e.g. an SVG with a script) must never run with
+    # Loom's origin when opened directly.
     return FileResponse(
         target,
         media_type=media_type,
         filename=target.name,
         content_disposition_type="inline",
+        headers={"Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+                 "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -4349,7 +6767,48 @@ async def serve_project_artifacts(conv_id: int):
     return {"artifacts": artifacts}
 
 
+@app.get("/api/conversations/{conv_id}/workspace-files")
+async def api_workspace_files(conv_id: int, path: str = ""):
+    from workspace_browser import WorkspaceBrowseError, list_workspace_directory
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    if not conv.get("project_dir"):
+        raise HTTPException(400, "No working directory selected")
+    try:
+        result = await asyncio.to_thread(list_workspace_directory, conv["project_dir"], path)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except (WorkspaceBrowseError, OSError) as exc:
+        raise HTTPException(400, "Workspace directory unavailable") from exc
+
+
+@app.get("/api/conversations/{conv_id}/workspace-git")
+async def api_workspace_git(conv_id: int):
+    from workspace_browser import WorkspaceBrowseError, git_workspace_summary
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    if not conv.get("project_dir"):
+        raise HTTPException(400, "No working directory selected")
+    try:
+        result = await asyncio.to_thread(git_workspace_summary, conv["project_dir"])
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except (WorkspaceBrowseError, OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(400, "Git information unavailable") from exc
+
+
 # ── Claude Code Permission Hook Endpoint ──
+
+# Leave time for the denial to travel back before the caller's own limit.
+_PERMISSION_WAIT_MARGIN_SECONDS = 30
+_PERMISSION_DEFAULT_WAIT_SECONDS = 24 * 60 * 60
+
+
+def _permission_wait_limit(source: str) -> int:
+    """Seconds Loom keeps a request open, bounded by the caller's own limit."""
+    if source == "claude_code":
+        return claude_client.PERMISSION_HOOK_TIMEOUT_SECONDS - _PERMISSION_WAIT_MARGIN_SECONDS
+    return _PERMISSION_DEFAULT_WAIT_SECONDS
 
 
 @app.post("/api/cc-permission")
@@ -4364,44 +6823,114 @@ async def handle_cc_permission(data: dict):
 
     tool_name = data.get("tool_name", "Unknown")
     tool_input = data.get("tool_input", {})
+    source = str(data.get("source") or "loom_permission_hook").strip()[:80]
 
     print(
-        f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}"
+        f"[PERM] Hook request: conv={conv_id} request_id={request_id}"
     )
 
     approval_method = data.get("approval_method", "")
+    explicit_scope = data.get("permission_scope", "")
+    if not explicit_scope and data.get("agent_run_id"):
+        explicit_scope = f"agent:{data['agent_run_id']}"
     permission_scope = _permission_scope_for_active_generation(
         conv_id,
-        data.get("permission_scope", ""),
+        explicit_scope,
     )
+    child_run = None
+    if permission_scope.startswith("agent:"):
+        child_run = await db.get_agent_run(permission_scope.split(":", 1)[1])
+        if (
+            not child_run or int(child_run["conversation_id"]) != conv_id
+            or child_run.get("status") not in {"launching", "running"}
+        ):
+            return {
+                "allow": False, "decision_source": "loom_lifecycle",
+                "message": "Loom child permission has no matching conversation/run owner.",
+            }
+        data = {**data, "agent_run_id": child_run["run_id"],
+                "client_instance_id": child_run.get("client_instance_id")}
+    conv = await db.get_conversation(conv_id) if conv_id else None
+    if not conv:
+        return {"allow": False, "decision_source": "loom_lifecycle",
+                "message": "Loom permission request has no conversation owner."}
+    context = await _permission_context(conv, permission_scope, child_run)
+    # Existing command patterns annotate asks only; they cannot veto policy.
+    risk_reason = (_destructive_git_command_reason(tool_name, tool_input)
+                   or _unsafe_shell_command_reason(tool_name, tool_input))
+    risk_reason = risk_reason.replace("is blocked", "requires review")
+    normalized_input = tool_input
+    if isinstance(tool_input, dict) and data.get("cwd") and not tool_input.get("cwd"):
+        normalized_input = {**tool_input, "cwd": data["cwd"]}
+    action = permission_policy_model.normalize_permission_request(
+        tool_name=tool_name, tool_input=normalized_input, approval_method=approval_method,
+        harness=source, workspace_root=context["workspace"], warned=bool(risk_reason))
+    if child_run:
+        access_error = agent_access.tool_error(child_run, tool_name, normalized_input, action.effect.value)
+        if access_error:
+            return {"allow": False, "decision_source": "loom_policy", "message": access_error}
+    candidate = permission_rules.action_rule(action, normalized_input)
+    if candidate and context["branch_id"]:
+        candidate = {**candidate, **{k: context[k] for k in
+                                   ("workspace", "branch_id", "conversation_id")}}
+    else:
+        candidate = None
+    matched = any(permission_rules.matches(
+        rule, conversation_id=conv_id, workspace=context["workspace"],
+        ancestor_ids=context["ancestor_ids"], candidate=candidate,
+    ) for rule in _permission_rules.values())
+    action = dataclass_replace(action, rule_matched=matched)
+    profile = permission_policy_model.profile_from_value(conv.get("permission_profile"))
+    destructive_review = profile is permission_policy_model.PermissionProfile.TRUST_REVIEW and action.destructive
+    if profile is permission_policy_model.PermissionProfile.TRUST_REVIEW:
+        # Only explicit destructive evidence prompts in this opt-in profile.
+        # Leave legacy warning/approval behavior untouched in other profiles.
+        risk_reason = action.destructive_reason
+        action = dataclass_replace(action, warned=bool(risk_reason))
+        if destructive_review:
+            candidate = None  # one-time only, including after an older branch grant
+    decision = permission_policy_model.decide(profile, action)
+    # File preservation is a precondition, not a model/profile permission or
+    # a remembered grant. All harnesses reaching this endpoint share it.
+    integrity = await asyncio.to_thread(
+        prepare_integrity_check, tool_name, normalized_input,
+        workspace=context["workspace"], approval_method=approval_method,
+        conversation_id=conv_id, scope=permission_scope,
+    )
+    if integrity.review_reason:
+        candidate = None
+        risk_reason = integrity.review_reason
+    effective_decision = (permission_policy_model.PolicyDecision.INVALID_REQUEST if integrity.error else
+                          permission_policy_model.PolicyDecision.ASK_WITH_WARNING
+                          if integrity.review_reason else decision)
+    policy = {"mode": "enforced", "profile": profile.value, "decision": decision.value,
+              "action": action.audit_dict(), "legacy_outcome": "not_evaluated",
+              "effective_decision": effective_decision.value,
+              "integrity_review": bool(integrity.review_reason),
+              "integrity_blocked": bool(integrity.error)}
+    branch_info = _generation_branch_for_scope(conv_id, permission_scope)
+    try:
+        await db.save_permission_policy_audit(
+            request_id, conv_id, policy,
+            run_id=canonical_run_id(permission_scope if permission_scope.startswith(("gen:", "agent:")) else None),
+            parent_id=branch_info.get("parent_id"), draft_msg_id=branch_info.get("draft_msg_id"),
+            permission_scope=permission_scope)
+    except Exception as exc:
+        print(f"[PERM] Policy audit persistence failed: {type(exc).__name__}")
+    if integrity.error:
+        return {"allow": False, "decision_source": "loom_policy",
+                "message": integrity.error, "feedback": integrity.error}
+    if decision is permission_policy_model.PolicyDecision.INVALID_REQUEST:
+        return {"allow": False, "decision_source": "loom_policy", "message": "Invalid Loom permission request."}
+    if tool_name not in ("ExitPlanMode", "exit_plan_mode") and effective_decision is permission_policy_model.PolicyDecision.AUTO_ALLOW:
+        integrity_error = await asyncio.to_thread(revalidate_integrity, integrity)
+        if integrity_error:
+            return {"allow": False, "decision_source": "loom_policy",
+                    "message": integrity_error, "feedback": integrity_error}
+        return {"allow": True, "always": False, "decision_source": "loom_policy",
+                "message": "Allowed by Loom branch rule." if matched else f"Allowed by Loom {profile.value} policy.",
+                "policy": policy}
     permission_key = _permission_fingerprint(tool_name, tool_input, approval_method)
-    scoped_key = (conv_id, permission_scope)
-
-    unsafe_reason = _unsafe_shell_command_reason(tool_name, tool_input)
-    if unsafe_reason:
-        command = _extract_permission_command(tool_name, tool_input)
-        msg = (
-            f"Blocked by Loom command safeguard: {unsafe_reason}. "
-            "Use a narrower non-recursive command, a structured file tool, or ask the user to run it manually."
-        )
-        print(f"[PERM] Auto-denied unsafe command for conv={conv_id}: {unsafe_reason} :: {command[:240]}")
-        return {"allow": False, "message": msg}
-
-    destructive_git_reason = _destructive_git_command_reason(tool_name, tool_input)
-
-    if _looks_like_goose_permission(data):
-        auto_allow_reason = _goose_auto_allow_reason(tool_name, tool_input)
-        if auto_allow_reason:
-            print(f"[PERM] Auto-allowed Goose tool for conv={conv_id}: {auto_allow_reason} :: {tool_name}")
-            return {"allow": True, "always": True, "message": auto_allow_reason}
-
-    # Auto-approve only the same request within the same branch generation.
-    if (
-        not destructive_git_reason
-        and permission_key in _auto_approve_permissions.get(scoped_key, set())
-    ):
-        print(f"[PERM] Auto-approved scoped permission: scope={permission_scope} key={permission_key}")
-        return {"allow": True, "always": True}
 
     # Build a human-readable summary
     input_summary = ""
@@ -4461,44 +6990,55 @@ async def handle_cc_permission(data: dict):
         "approval_method": approval_method,
         "permission_key": permission_key,
         "permission_scope": permission_scope,
+        "client_instance_id": data.get("client_instance_id"),
+        "agent_run_id": data.get("agent_run_id"),
+        "parent_run_id": data.get("parent_run_id"),
+        "source": source,
     }
-    if destructive_git_reason:
+    perm_msg.update({"policy": policy, "supports_allow_all": candidate is not None,
+                     "rule_preview": (f"{candidate['description']}; workspace {context['workspace']}; "
+                                      f"branch #{context['branch_id']} and descendants; until revoked or server restart.")
+                                      if candidate else "File preservation review is one-time; branch grants cannot bypass it." if integrity.review_reason
+                                      else "Destructive review is one-time; branch grants cannot bypass it." if destructive_review
+                                      else permission_rules.unavailable_reason(action, has_branch=bool(context["branch_id"]))})
+    if risk_reason:
         perm_msg.update(
             {
                 "risk_level": "destructive",
-                "risk_reason": destructive_git_reason,
-                "supports_allow_all": False,
+                "risk_reason": risk_reason,
             }
         )
     perm_msg.update(_generation_branch_for_scope(conv_id, permission_scope))
+    # ``gen:<n>`` identifies a normal conversation generation while
+    # ``agent:<uuid>`` identifies a supervisor-owned child run.  Both are
+    # exact run scopes; neither may fall back to a conversation-wide socket.
+    permission_run_id = canonical_run_id(
+        permission_scope
+        if permission_scope.startswith(("gen:", "agent:"))
+        else None
+    )
+    perm_msg["run_id"] = permission_run_id
     # Persist to DB first (survives server restart)
     await db.save_pending_permission(
-        request_id, conv_id, tool_name, tool_input, input_summary
+        request_id,
+        conv_id,
+        tool_name,
+        tool_input,
+        input_summary,
+        run_id=permission_run_id,
+        parent_id=perm_msg.get("parent_id"),
+        draft_msg_id=perm_msg.get("draft_msg_id"),
+        client_instance_id=perm_msg.get("client_instance_id"),
+        permission_scope=permission_scope,
+        source=source,
     )
     print(f"[PERM] Persisted permission request to DB: {request_id}")
 
-    # Broadcast permission request to any connected WebSockets (for real-time notifications)
-    # Don't block or deny if none are connected — let the user respond when they return
-    dead_pairs = []
-    sent_count = 0
-    for cid, clients in list(_active_websockets.items()):
-        for ws in list(clients):
-            try:
-                await ws.send_json(perm_msg)
-                sent_count += 1
-            except Exception as e:
-                print(f"[PERM] Failed to send to conv={cid}: {e}")
-                dead_pairs.append((cid, ws))
-    print(f"[PERM] Broadcast permission_request to {sent_count} websocket(s)")
-    for cid, ws in dead_pairs:
-        _active_websockets.get(cid, set()).discard(ws)
-
-    # Mark as broadcasted
-    await db.mark_permission_broadcasted(request_id)
-
-    # Store in memory dict for fast retrieval (will be loaded from DB on restart)
+    # Register the waiter BEFORE publishing. A fast browser response must
+    # never arrive while the request exists only in the database.
     _pending_hook_permissions[request_id] = {
         "event": asyncio.Event(),
+        "started_at": time.time(),
         "response": None,
         "conv_id": conv_id,
         "tool_name": tool_name,
@@ -4507,44 +7047,186 @@ async def handle_cc_permission(data: dict):
         "approval_method": approval_method,
         "permission_key": permission_key,
         "permission_scope": permission_scope,
-        "risk_level": "destructive" if destructive_git_reason else "",
-        "risk_reason": destructive_git_reason,
-        "supports_allow_all": not bool(destructive_git_reason),
+        "run_id": permission_run_id,
+        "risk_level": "destructive" if risk_reason else "",
+        "risk_reason": risk_reason,
+        "supports_allow_all": candidate is not None,
+        "rule_candidate": candidate,
+        "integrity_check": integrity,
+        "rule_preview": perm_msg["rule_preview"],
+        "policy": policy,
         "parent_id": perm_msg.get("parent_id"),
         "draft_msg_id": perm_msg.get("draft_msg_id"),
+        "client_instance_id": perm_msg.get("client_instance_id"),
+        "agent_run_id": data.get("agent_run_id"),
+        "source": source,
     }
+
+    # Route permission requests by the exact generation subscription.  A
+    # manual request without a run remains conversation-scoped.
+    permission_event = LoomEventEnvelope.from_payload(
+        perm_msg,
+        conversation_id=conv_id,
+        run_id=permission_run_id,
+        draft_id=perm_msg.get("draft_msg_id"),
+        parent_id=perm_msg.get("parent_id"),
+        client_instance_id=perm_msg.get("client_instance_id"),
+        sequence=_event_sequencer.next(permission_run_id, conv_id),
+    )
+    recipients = _event_router.recipients(
+        permission_event, _active_websockets.get(conv_id, set())
+    )
+    # A run may have multiple observers: for example, a window positioned on
+    # a queued descendant subscribes to its predecessor so it can show that
+    # predecessor's progress. Observation must not confer approval authority.
+    # Interactive permission requests are therefore unicast to the immutable
+    # page that launched the owning generation. This also covers the brief
+    # startup interval before that page's explicit run subscription exists.
+    origin_client_id = str(perm_msg.get("client_instance_id") or "").strip()
+    if origin_client_id:
+        origin = _find_client_websocket(conv_id, origin_client_id)
+        if origin is not None:
+            recipients = {origin}
+        else:
+            # A hard refresh replaces page identity. If the launch page is no
+            # longer connected, recover only on pages whose durable cursor is
+            # the exact owning assistant draft. Queued descendants and sibling
+            # branches may observe the run but cannot inherit its approvals.
+            recipients = {
+                ws
+                for ws in recipients
+                if await _permission_socket_can_recover(
+                    ws, conv_id, permission_run_id, perm_msg.get("draft_msg_id")
+                )
+            }
+    sent_count = 0
+    for ws in list(recipients):
+        try:
+            if child_run and agent_access.sensitive(child_run) and not loom_auth.credential(getattr(ws, "scope", {})):
+                continue
+            await ws.send_json(_scrub_surrogates(permission_event.as_dict()))
+            sent_count += 1
+        except Exception as exc:
+            print(f"[PERM] Failed to send scoped permission to conv={conv_id}: {exc}")
+            _active_websockets.get(conv_id, set()).discard(ws)
+            _event_router.unregister(ws)
+    print(f"[PERM] Routed permission_request to {sent_count} subscribed websocket(s)")
+    await _ws_broadcast_all({"type": "permission_notice", "request_id": request_id,
+                             "conv_id": conv_id, "status": "pending",
+                             "message_id": perm_msg.get("draft_msg_id") or perm_msg.get("parent_id")})
+
+    # Mark as broadcasted
+    await db.mark_permission_broadcasted(request_id)
 
     # Wait for user response with a timeout.
     # Keep the tool blocked while it waits for a real user decision. Pending
-    # requests are persisted and rebroadcast on reconnect/startup.
-    _PERM_TOTAL_DEADLINE = 24 * 60 * 60
+    # requests are persisted and rebroadcast on reconnect/startup. The wait must
+    # end before the caller gives up: Claude Code abandons its PreToolUse hook
+    # after the configured hook timeout and treats that as a refusal, so a
+    # later click would approve nothing. Other bridges wait a day.
+    _PERM_TOTAL_DEADLINE = _permission_wait_limit(source)
     _PERM_POLL_INTERVAL = 30
 
     elapsed = 0
-    user_response = {}
+    user_response = None
+    decision_source = ""
     while elapsed < _PERM_TOTAL_DEADLINE:
         perm_data = _pending_hook_permissions.get(request_id)
         if not perm_data:
-            break  # cleaned up by cancel/finally or already responded
-        if perm_data.get("response"):
+            decision_source = "loom_lifecycle"
+            break  # owning generation ended or request was otherwise retired
+        if perm_data.get("response") is not None:
             user_response = perm_data["response"]
+            decision_source = str(
+                user_response.get("decision_source") or "user"
+            )
             _pending_hook_permissions.pop(request_id, None)
             break
 
         # Wait on the event with a short timeout, then re-check
+        wait = min(_PERM_POLL_INTERVAL, _PERM_TOTAL_DEADLINE - elapsed)
         try:
-            await asyncio.wait_for(perm_data["event"].wait(), timeout=_PERM_POLL_INTERVAL)
+            await asyncio.wait_for(perm_data["event"].wait(), timeout=wait)
         except asyncio.TimeoutError:
             pass
-        elapsed += _PERM_POLL_INTERVAL
+        elapsed += wait
+    else:
+        # Deadline reached. A click that landed during the last wait still
+        # counts; otherwise close the request so a late click cannot record
+        # an approval that nothing is waiting for.
+        perm_data = _pending_hook_permissions.get(request_id)
+        if perm_data is not None and perm_data.get("response") is not None:
+            user_response = perm_data["response"]
+            decision_source = str(user_response.get("decision_source") or "user")
+        elif perm_data is not None:
+            decision_source = "loom_timeout"
+            perm_data["response"] = {"allow": False, "always": False, "feedback": "",
+                                     "decision_source": decision_source}
+        _pending_hook_permissions.pop(request_id, None)
+
+    if user_response is None:
+        if not decision_source:
+            decision_source = "loom_timeout"
+        message = (
+            "Loom permission request expired without a user decision; the agent was told no."
+            if decision_source == "loom_timeout"
+            else "Loom permission request was cancelled because its owning agent turn ended before a user decision."
+        )
+        if decision_source == "loom_timeout" and perm_data is not None:
+            await _broadcast_permission_resolved(
+                request_id, perm_data, allow=False, feedback=message,
+                decision_source=decision_source, permission_scope=permission_scope)
+        print(f"[PERM] Unresolved permission ended via {decision_source}: {request_id}")
+        await db.save_permission_resolution(
+            request_id,
+            conv_id,
+            tool_name,
+            False,
+            message,
+            source=source,
+            decision_source=decision_source,
+            run_id=permission_run_id,
+            parent_id=perm_msg.get("parent_id"),
+            draft_msg_id=perm_msg.get("draft_msg_id"),
+            permission_scope=permission_scope,
+        )
+        await db.delete_pending_permission(request_id)
+        return {
+            "allow": False,
+            "message": message,
+            "feedback": message,
+            "decision_source": decision_source,
+        }
 
     allowed = user_response.get("allow", False)
-    print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
+    if decision_source == "user":
+        print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
+    else:
+        print(f"[PERM] Permission resolved by {decision_source}: {'allow' if allowed else 'cancel'}")
 
     if allowed:
-        return {"allow": True, "always": bool(user_response.get("always", False))}
+        response = {
+            "allow": True,
+            # Rules remain in Loom. Native session-wide approval would bypass
+            # descendant/workspace checks on the next request.
+            "always": False,
+            "decision_source": decision_source,
+        }
     else:
-        return {"allow": False, "message": "Denied by user in Loom UI"}
+        response = {
+            "allow": False,
+            "message": (
+                "Denied by user in Loom UI"
+                if decision_source == "user"
+                else str(user_response.get("feedback") or "Permission request cancelled by Loom")
+            ),
+            "decision_source": decision_source,
+        }
+    feedback = str(user_response.get("feedback") or "").strip()[:4000]
+    if feedback:
+        response["feedback"] = feedback
+        response["message"] = feedback
+    return response
 
 
 @app.post("/api/cc-tool-start")
@@ -4554,17 +7236,21 @@ async def handle_cc_tool_start(data: dict):
     tool_name = data.get("tool_name", "")
     tool_id = data.get("tool_id", "")
     tool_input = data.get("tool_input", {})
+    permission_scope = str(data.get("permission_scope") or "").strip()
+    if not permission_scope and data.get("agent_run_id"):
+        permission_scope = f"agent:{data['agent_run_id']}"
     
     print(f"[PERM] Hook tool-start: conv={conv_id} tool={tool_name} id={tool_id}")
     
-    if conv_id in gemini_client._active_queues:
-        gemini_client._active_queues[conv_id].put_nowait({
+    queue = gemini_client.active_queue(conv_id, permission_scope)
+    if queue is not None:
+        queue.put_nowait({
             "type": "tool_start",
             "name": tool_name,
             "tool_id": tool_id,
         })
         if tool_input:
-            gemini_client._active_queues[conv_id].put_nowait({
+            queue.put_nowait({
                 "type": "tool_input_delta",
                 "json": json.dumps(tool_input, indent=2),
                 "tool_id": tool_id,
@@ -4580,11 +7266,15 @@ async def handle_cc_tool_result(data: dict):
     tool_id = data.get("tool_id", "")
     content = data.get("content", "")
     is_error = data.get("is_error", False)
+    permission_scope = str(data.get("permission_scope") or "").strip()
+    if not permission_scope and data.get("agent_run_id"):
+        permission_scope = f"agent:{data['agent_run_id']}"
     
     print(f"[PERM] Hook tool-result: conv={conv_id} tool={tool_name} id={tool_id} error={is_error}")
     
-    if conv_id in gemini_client._active_queues:
-        gemini_client._active_queues[conv_id].put_nowait({
+    queue = gemini_client.active_queue(conv_id, permission_scope)
+    if queue is not None:
+        queue.put_nowait({
             "type": "tool_result",
             "content": content,
             "tool_id": tool_id,
@@ -4645,12 +7335,10 @@ async def get_cc_hooks():
 async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
     """Report Codex state that can surprise Loom users across arbitrary folders."""
     target_dir = project_dir
-    nrol_operator = False
     if conv_id:
         conv = await db.get_conversation(conv_id)
         if conv:
             target_dir = conv.get("project_dir") or target_dir
-            nrol_operator = bool(conv.get("nrol_operator"))
     target_path = Path(target_dir).resolve() if target_dir else Path.cwd().resolve()
 
     config_path = Path.home() / ".codex" / "config.toml"
@@ -4674,7 +7362,7 @@ async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
             project_hooks = {"error": str(e)}
 
     expected_approval, expected_sandbox = codex_client._codex_launch_policies(
-        "default", nrol_operator
+        "default"
     )
     return {
         "target_dir": str(target_path),
@@ -4682,9 +7370,9 @@ async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
             "surface": "app-server",
             "approval_policy": expected_approval,
             "sandbox": expected_sandbox,
-            "writable_roots": [] if nrol_operator else [str(target_path)],
+            "writable_roots": [str(target_path)],
             "hook_scope": "disabled",
-            "mcp_servers": ["nrol-ao", "web-tools"] if nrol_operator else [],
+            "mcp_servers": ["loom-agent-control"],
         },
         "project_hook": {
             "path": str(project_hook_path),
@@ -4856,22 +7544,49 @@ def _scrub_surrogates(obj):
 
 
 async def _ws_send(conv_id: int, data: dict):
-    """Best-effort broadcast to ALL active WebSockets for a conversation.
-    Silently skips dead clients — generation continues regardless.
-    Auto-injects generation and branch identity from the current task."""
-    # Auto-tag every generation event so clients can distinguish parallel
-    # streams and reconnect to the branch they are actually viewing.
+    """Normalize and route one event through the explicit subscription bus.
+
+    The old implementation used ``_origin_ws`` as an implicit subscription and
+    allowed conversation-wide delivery for events without a generation task.
+    Every event now receives a typed identity envelope.  Run events have no
+    delivery fallback: a socket must explicitly subscribe to that run.
+    """
     task = asyncio.current_task()
     gen_key = getattr(task, "_gen_key", None)
-    if gen_key and data.get("type") != "generation_idle":
-        snapshot = _generation_snapshots.get(gen_key) or {}
-        tagged = dict(data)
+    snapshot = _generation_snapshots.get(gen_key) if gen_key else {}
+    snapshot = snapshot or {}
+    run_id = data.get("run_id")
+    if run_id is None and gen_key:
+        run_id = f"gen:{gen_key[2]}"
+    tagged = dict(data)
+    if gen_key:
         tagged.setdefault("gen_id", gen_key[2])
         tagged.setdefault("parent_id", snapshot.get("parent_id", gen_key[1]))
         if snapshot.get("draft_msg_id") is not None:
             tagged.setdefault("draft_msg_id", snapshot.get("draft_msg_id"))
-        data = tagged
-    clients = _active_websockets.get(conv_id)
+        client_instance_id = snapshot.get("client_instance_id") or getattr(
+            task, "_client_instance_id", None
+        )
+        if client_instance_id:
+            tagged.setdefault("client_instance_id", client_instance_id)
+    envelope = LoomEventEnvelope.from_payload(
+        tagged,
+        conversation_id=conv_id,
+        loom_thread_id=(
+            tagged.get("loom_thread_id") or snapshot.get("loom_thread_id")
+        ),
+        run_id=run_id,
+        draft_id=tagged.get("draft_msg_id"),
+        parent_id=tagged.get("parent_id"),
+        client_instance_id=tagged.get("client_instance_id"),
+        sequence=_event_sequencer.next(canonical_run_id(run_id), conv_id),
+    )
+    data = envelope.as_dict()
+    clients = _active_websockets.get(conv_id, set())
+    # Never derive a subscription from the task's origin socket. Launch,
+    # reconnect, and explicit subscribe paths establish authorization before
+    # content is emitted; absent a subscription, a run event has no recipient.
+    recipients = _event_router.recipients(envelope, clients)
     _t = data.get("type", "?")
     # Per-conv tracker for the /api/debug/stream-state endpoint: lets a
     # future LLM (or admin) ask "is conv N actively streaming right now?"
@@ -4881,33 +7596,53 @@ async def _ws_send(conv_id: int, data: dict):
             "last_event_type": _t,
             "last_event_at": time.time(),
             "events_sent": _stream_state.get(conv_id, {}).get("events_sent", 0) + 1,
-            "clients_at_send": len(clients) if clients else 0,
+            "clients_at_send": len(recipients) if recipients else 0,
+            "connections_at_send": len(clients),
         }
-    # TEMP DEBUG: log every WS send target + count + payload type so we can
-    # verify whether content events are reaching the WebSocket layer at all.
     _content = data.get("content", "") or ""
-    _snippet = (_content[:30] + "…") if len(_content) > 30 else _content
-    print(f"[WS-TRACE] conv={conv_id} type={_t} clients={len(clients) if clients else 0} {_snippet!r}")
-    if not clients:
+    _content_bytes = len(_content.encode("utf-8", errors="replace")) if isinstance(_content, str) else 0
+    print(f"[WS-TRACE] conv={conv_id} type={_t} run={envelope.run_id or '-'} seq={envelope.sequence} clients={len(recipients) if recipients else 0} connections={len(clients)} recipients={len(recipients)} bytes={_content_bytes}")
+    if not recipients:
         return
     dead = []
     scrubbed = None
-    for ws in list(clients):
+    for ws in list(recipients):
         try:
-            await ws.send_json(data)
+            await asyncio.wait_for(ws.send_json(data), timeout=5.0)
         except UnicodeEncodeError:
             # Unpaired surrogate in data — socket is fine, payload is bad.
             # Scrub once and retry; don't mark ws dead.
             if scrubbed is None:
                 scrubbed = _scrub_surrogates(data)
             try:
-                await ws.send_json(scrubbed)
+                await asyncio.wait_for(ws.send_json(scrubbed), timeout=5.0)
             except Exception:
                 dead.append(ws)
         except Exception:
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
+        _event_router.unregister(ws)
+
+
+async def _ws_reply(websocket: WebSocket, conv_id: int, data: dict) -> None:
+    """Send a direct, typed conversation reply to one socket.
+
+    Action-level errors and acknowledgements do not originate in a provider
+    generation, but they still use the same wire envelope so clients never
+    have to guess whether an untyped payload is a stream event.
+    """
+    envelope = LoomEventEnvelope.from_payload(
+        data,
+        conversation_id=conv_id,
+        run_id=data.get("run_id") or data.get("gen_id"),
+        draft_id=data.get("draft_msg_id"),
+        parent_id=data.get("parent_id"),
+        client_instance_id=data.get("client_instance_id"),
+        scope="conversation",
+        sequence=_event_sequencer.next(None, conv_id),
+    )
+    await websocket.send_json(_scrub_surrogates(envelope.as_dict()))
 
 
 def _has_active_generation_for_conv(conv_id: int) -> bool:
@@ -4915,6 +7650,111 @@ def _has_active_generation_for_conv(conv_id: int) -> bool:
         k[0] == conv_id and not task.done()
         for k, task in _active_generations.items()
     )
+
+
+async def _provider_lane_occupied(conv_id: int) -> bool:
+    """Return whether SQLite still owns the serial provider lane.
+
+    Task and PID state remain defensive evidence for legacy/in-flight rows,
+    but neither can grant admission. New runs acquire the database lease
+    atomically before an asyncio task or provider process exists.
+    """
+    try:
+        if await db.get_live_generation_lease(conv_id):
+            return True
+    except Exception as exc:
+        print(f"[GEN] Could not verify generation lease for conv={conv_id}: {exc!r}")
+        return True
+    if _has_active_generation_for_conv(conv_id):
+        return True
+    try:
+        rows = await db.list_active_generations()
+    except Exception as exc:
+        print(f"[GEN] Could not verify provider lane for conv={conv_id}: {exc!r}")
+        return True
+    return any(
+        int(row.get("conv_id")) == int(conv_id)
+        and bool(row.get("pid"))
+        and _pid_alive(int(row["pid"]))
+        for row in rows
+    )
+
+
+async def _single_lane_queue_barrier_draft_id(conv_id: int) -> int | None:
+    """Return the one durable draft currently occupying a serial lane.
+
+    This is execution ordering only; it must never become the new message's
+    topology parent unless the send is an actual continuation of that draft.
+    A missing or ambiguous draft fails closed so Loom never guesses which run
+    a queued launch should follow.
+    """
+    draft_ids: set[int] = set()
+    try:
+        lease = await db.get_live_generation_lease(conv_id)
+    except Exception as exc:
+        print(f"[GEN] Could not resolve generation lease for conv={conv_id}: {exc!r}")
+        return None
+    if lease and lease.get("draft_msg_id") is not None:
+        draft_ids.add(int(lease["draft_msg_id"]))
+    for key, task in _active_generations.items():
+        if key[0] != int(conv_id) or task.done():
+            continue
+        snapshot = _generation_snapshots.get(key) or {}
+        draft_id = snapshot.get("draft_msg_id")
+        if draft_id is not None:
+            draft_ids.add(int(draft_id))
+    try:
+        rows = await db.list_active_generations()
+    except Exception as exc:
+        print(f"[GEN] Could not resolve queue barrier for conv={conv_id}: {exc!r}")
+        return None
+    for row in rows:
+        if int(row.get("conv_id")) != int(conv_id):
+            continue
+        pid = row.get("pid")
+        if pid and _pid_alive(int(pid)):
+            draft_ids.add(int(row["draft_msg_id"]))
+    if len(draft_ids) != 1:
+        return None
+    return next(iter(draft_ids))
+
+
+async def _pause_serial_queue_for_cancel(
+    conv_id: int, *, draft_msg_id: int | None = None
+) -> int:
+    """Make cancel/kill a durable stop boundary before touching the task."""
+    lease = await db.get_live_generation_lease(conv_id)
+    if (
+        lease
+        and lease.get("draft_msg_id") is not None
+        and draft_msg_id is not None
+        and int(lease["draft_msg_id"]) != int(draft_msg_id)
+    ):
+        # A stale admin row must not pause or release a newer exact run.
+        return 0
+    if lease:
+        await db.mark_generation_lease_cancelling(lease["lease_id"])
+    conv = await db.get_conversation(conv_id)
+    parallel_enabled = bool(
+        conv and _truthy_setting(conv.get("parallel_agents_enabled"))
+    )
+    # A serial cancellation pauses the whole lane. In an explicitly parallel
+    # conversation, only continuations dependent on this exact draft pause.
+    paused = await db.pause_queued_generations(
+        conv_id,
+        wait_for_draft_id=(draft_msg_id if parallel_enabled else None),
+    )
+    if paused:
+        await _ws_send(
+            conv_id,
+            {
+                "type": "queue_changed",
+                "queued": True,
+                "status": "paused",
+                "wait_for_draft_id": draft_msg_id,
+            },
+        )
+    return paused
 
 
 def _active_generation_keys_for_cancel(
@@ -4944,35 +7784,384 @@ def _active_generation_keys_for_cancel(
     ]
 
 
+def _generation_stop_disposition(task: asyncio.Task | None = None) -> str:
+    """Return the user-requested stop meaning for the current generation."""
+    task = task or asyncio.current_task()
+    disposition = getattr(task, "_stop_disposition", "cancel") if task else "cancel"
+    return "interrupt" if disposition == "interrupt" else "cancel"
+
+
+def _request_generation_stop(task: asyncio.Task, disposition: str) -> None:
+    """Annotate the exact task before injecting CancelledError into it."""
+    task._stop_disposition = (
+        "interrupt" if disposition == "interrupt" else "cancel"
+    )
+    task.cancel()
+
+
+async def _finalize_user_stopped_generation(
+    conv_id: int,
+    draft_msg_id: int | None,
+    *,
+    partial_text: str = "",
+    content_blocks=None,
+    session_id: str | None = None,
+    session_mode: str | None = None,
+    model_used: str | None = None,
+    model_attestation=None,
+    generation_ms: int | None = None,
+    time_to_first_token_ms: int | None = None,
+) -> dict | None:
+    """Persist the invariant difference between Cancel and Interrupt.
+
+    Cancel retains the topology node but destroys partial provider context.
+    Interrupt retains partial text/tools and native-session ownership so a
+    later message can continue deliberately from that stopped turn.
+    """
+    if not draft_msg_id:
+        return None
+    disposition = _generation_stop_disposition()
+    if disposition == "interrupt":
+        text = partial_text if str(partial_text or "").strip() else "[Turn interrupted before response]"
+        serialized_blocks = None
+        if content_blocks:
+            serialized_blocks = (
+                content_blocks
+                if isinstance(content_blocks, str)
+                else json.dumps(content_blocks)
+            )
+        serialized_attestation = None
+        if model_attestation:
+            serialized_attestation = (
+                model_attestation
+                if isinstance(model_attestation, str)
+                else json.dumps(model_attestation, separators=(",", ":"))
+            )
+        await db.update_message_content(
+            draft_msg_id,
+            content=text,
+            content_blocks=serialized_blocks,
+            cc_session_id=session_id,
+            cc_session_mode=session_mode,
+            cc_model_used=model_used,
+            model_attestation=serialized_attestation,
+            generation_ms=generation_ms,
+            time_to_first_token_ms=time_to_first_token_ms,
+            turn_lifecycle_state="interrupted",
+        )
+    else:
+        await db.discard_message_partial_context(
+            draft_msg_id,
+            generation_ms=generation_ms,
+            time_to_first_token_ms=time_to_first_token_ms,
+        )
+    message = await db.get_message(draft_msg_id)
+    event_type = "interrupted" if disposition == "interrupt" else "cancelled"
+    await _ws_send(
+        conv_id,
+        {
+            "type": event_type,
+            "disposition": disposition,
+            "message": dict(message) if message else None,
+            "draft_msg_id": draft_msg_id,
+        },
+    )
+    task = asyncio.current_task()
+    if task is not None:
+        task._stop_event_sent = True
+    return message
+
+
 async def _send_generation_idle_if_quiescent(conv_id: int):
-    if not _has_active_generation_for_conv(conv_id):
+    if not await _provider_lane_occupied(conv_id):
         await _ws_send(conv_id, {"type": "generation_idle"})
 
 
+async def _probe_followed_generation(websocket, conv_id: int, data: dict):
+    """Recover a missed terminal event for exactly one page's followed draft.
+
+    A healthy heartbeat does not prove that stream_end arrived. Do not infer
+    completion from silence, a sibling run, or an empty in-memory registry.
+    Only a persisted terminal row may replace the followed stream.
+    """
+    run_id = canonical_run_id(data.get("run_id"))
+    try:
+        draft_id = int(data.get("draft_msg_id"))
+        gen_id = int(run_id[4:]) if run_id and run_id.startswith("gen:") else None
+    except (ValueError, TypeError):
+        return
+    if gen_id is None:
+        return
+    for key, task in list(_active_generations.items()):
+        snap = _generation_snapshots.get(key) or {}
+        active_draft_id = snap.get("draft_msg_id") or getattr(task, "_draft_msg_id", None)
+        if key[0] != conv_id or str(active_draft_id) != str(draft_id) or task.done():
+            continue
+        # Generation counters may be reused after a host restart. The durable
+        # draft ID must agree as well; never attach a different run.
+        if run_id == f"gen:{key[2]}" and run_id not in _event_router.subscriptions(websocket):
+            if await _websocket_can_subscribe_run(websocket, conv_id, run_id):
+                _event_router.subscribe(websocket, run_id)
+                await _send_active_gen_state(websocket, conv_id)
+        return
+    message = await db.get_message(draft_id)
+    if not message or message.get("conversation_id") != conv_id or message.get("role") != "assistant":
+        return
+    lifecycle = message.get("turn_lifecycle_state")
+    if lifecycle not in {"completed", "cancelled", "interrupted", "failed", "partial_failed"}:
+        # Legacy completed rows do not have an explicit lifecycle stamp.
+        if message.get("generation_ms") is None:
+            return
+    cursor = await db.get_client_loom_cursor(conv_id, getattr(websocket, "_client_instance_id", ""))
+    if not cursor:
+        return
+    # A queued continuation may be the cursor leaf; its followed draft is an
+    # ancestor. Read-only ancestry validation never advances that cursor.
+    ancestor_ids = await db.get_message_ancestor_ids(conv_id, cursor["leaf_message_id"]) if cursor.get("leaf_message_id") else set()
+    if draft_id not in ancestor_ids:
+        return
+    event = LoomEventEnvelope.from_payload(
+        {"type": "generation_terminal", "message": dict(message), "gen_id": gen_id},
+        conversation_id=conv_id, run_id=run_id, draft_id=draft_id,
+        parent_id=message.get("parent_id"), loom_thread_id=cursor.get("thread_id"),
+        scope="run", sequence=_event_sequencer.next(run_id, conv_id),
+    )
+    await websocket.send_json(event.as_dict())
+
+
+async def _record_first_response(conv_id, draft_id, gen_key, started_at, first_ms):
+    """Persist first observable provider output, including local reasoning."""
+    if first_ms is not None:
+        return first_ms
+    import time
+    first_ms = max(0, int((time.time() - started_at) * 1000))
+    await db.update_message_content(draft_id, time_to_first_token_ms=first_ms)
+    if gen_key:
+        _update_gen_snapshot(gen_key, time_to_first_token_ms=first_ms)
+    await _ws_send(conv_id, {"type": "first_token", "elapsed_ms": first_ms})
+    return first_ms
+
+
+async def _permission_socket_can_recover(websocket, conv_id, run_id, draft_msg_id) -> bool:
+    """Child controls are conversation-scoped; parent approvals remain draft-exact."""
+    if str(run_id or "").startswith("agent:"):
+        return (
+            run_id in _event_router.subscriptions(websocket)
+            and await _websocket_can_subscribe_run(websocket, conv_id, run_id)
+        )
+    return await _permission_socket_is_on_exact_draft(websocket, conv_id, draft_msg_id)
+
+
+async def _child_permission_response_authorized(websocket, conv_id, pending) -> bool:
+    if int(pending.get("conv_id") or 0) != int(conv_id):
+        return False
+    origin_id = str(pending.get("client_instance_id") or "")
+    if origin_id:
+        if origin_id == str(getattr(websocket, "_client_instance_id", "") or ""):
+            return True
+        if _find_client_websocket(conv_id, origin_id) is not None:
+            return False
+    return await _permission_socket_can_recover(
+        websocket, conv_id, pending.get("run_id") or pending.get("permission_scope"), None,
+    )
+
+
+async def _send_pending_permissions_to_socket(
+    websocket: WebSocket, conv_id: int, *, only_new: bool = False
+) -> None:
+    """Replay only permissions visible to this socket's explicit runs."""
+    try:
+        rows = await db.get_pending_permissions_for_conv(conv_id)
+    except Exception as exc:
+        print(f"[WS] Could not load pending permissions for conv={conv_id}: {exc}")
+        return
+    subscriptions = _event_router.subscriptions(websocket)
+    delivered = getattr(websocket, "_delivered_permission_ids", set())
+    for row in rows:
+        if only_new and row.get("request_id") in delivered:
+            continue
+        pending = _pending_hook_permissions.get(row.get("request_id"), {})
+        if pending.get("response") is not None:
+            continue
+        permission_scope = (
+            pending.get("permission_scope")
+            or row.get("permission_scope")
+            or ""
+        )
+        raw_run_id = pending.get("run_id") or row.get("run_id")
+        if raw_run_id is None and permission_scope.startswith(("gen:", "agent:")):
+            raw_run_id = permission_scope
+        run_id = canonical_run_id(raw_run_id)
+        if run_id and run_id.startswith("agent:"):
+            child = await db.get_agent_run(run_id.split(":", 1)[1])
+            if child and agent_access.sensitive(child) and not loom_auth.credential(getattr(websocket, "scope", {})):
+                continue
+        origin_client_id = (
+            pending.get("client_instance_id")
+            or row.get("client_instance_id")
+            or ""
+        )
+        websocket_client_id = str(
+            getattr(websocket, "_client_instance_id", "") or ""
+        )
+        # As with live delivery, observing an exact run does not grant a page
+        # authority over its interactive permission prompts. A persisted
+        # origin always wins; subscription routing is only the compatibility
+        # fallback for legacy rows that predate page identity.
+        if origin_client_id:
+            if str(origin_client_id) != websocket_client_id:
+                origin_connected = (
+                    _find_client_websocket(conv_id, origin_client_id) is not None
+                )
+                if origin_connected or not await _permission_socket_can_recover(
+                    websocket, conv_id, run_id, row.get("draft_msg_id")
+                ):
+                    continue
+        elif run_id is not None and run_id not in subscriptions:
+            continue
+        payload = {
+            "type": "permission_request",
+            "request_id": row.get("request_id"),
+            "conv_id": conv_id,
+            "tool_name": pending.get("tool_name") or row.get("tool_name"),
+            "tool_input": pending.get("tool_input") or row.get("tool_input"),
+            "input_summary": pending.get("input_summary") or row.get("input_summary"),
+            "approval_method": pending.get("approval_method", ""),
+            "permission_scope": permission_scope,
+            "source": pending.get("source") or row.get("source") or "",
+            "parent_id": pending.get("parent_id") or row.get("parent_id"),
+            "draft_msg_id": pending.get("draft_msg_id") or row.get("draft_msg_id"),
+            "client_instance_id": pending.get("client_instance_id") or row.get("client_instance_id"),
+            "supports_allow_all": pending.get("supports_allow_all", False),
+            "rule_preview": pending.get("rule_preview", "This request supports one-time approval only."),
+            "policy": pending.get("policy"),
+            "risk_level": pending.get("risk_level", ""),
+            "risk_reason": pending.get("risk_reason", ""),
+        }
+        payload.update(_generation_branch_for_scope(conv_id, permission_scope))
+        envelope = LoomEventEnvelope.from_payload(
+            payload,
+            conversation_id=conv_id,
+            run_id=run_id,
+            draft_id=payload.get("draft_msg_id"),
+            parent_id=payload.get("parent_id"),
+            client_instance_id=payload.get("client_instance_id"),
+            sequence=_event_sequencer.next(run_id, conv_id),
+        )
+        try:
+            await websocket.send_json(_scrub_surrogates(envelope.as_dict()))
+            delivered.add(row.get("request_id"))
+            websocket._delivered_permission_ids = delivered
+        except Exception as exc:
+            print(f"[WS] Failed to replay permission {row.get('request_id')}: {exc}")
+
+
 async def _handle_generation_with_workspace_safety(
-    websocket: WebSocket, conv_id: int, data: dict
+    websocket: WebSocket | None, conv_id: int, data: dict
 ):
     """Wrap every tool-capable provider turn in one neutral recovery boundary."""
     snapshot = None
     conv = await db.get_conversation(conv_id)
     project_dir = conv.get("project_dir") if conv else None
     mode = conv.get("mode") if conv else None
-    if project_dir and mode in _AGENT_WORKSPACE_MODES:
-        gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-        generation_id = gen_key[2] if gen_key else data.get("_gen_id")
-        recovery_root = default_recovery_root()
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    generation_id = gen_key[2] if gen_key else data.get("_gen_id")
+
+    async def _preparing(phase: str, text: str, **extra) -> None:
+        if gen_key:
+            _update_gen_snapshot(
+                gen_key,
+                phase=phase,
+                status_text=text,
+                **extra,
+            )
+        await _ws_send(
+            conv_id,
+            {
+                "type": "generation_preparing",
+                "phase": phase,
+                "text": text,
+                "parent_id": data.get("parent_id"),
+                "cc_model": data.get("cc_model") or (conv or {}).get("cc_model"),
+                **extra,
+            },
+        )
+
+    preparation_started = time.monotonic()
+    preparation_limit = max(0.01, float(getattr(config, "context_preparation_timeout_seconds", 120)))
+
+    async def _bounded_workspace_preparation(function, *args, phase, **kwargs):
+        work = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
-            snapshot = await asyncio.to_thread(
+            while True:
+                elapsed = time.monotonic() - preparation_started
+                remaining = preparation_limit - elapsed
+                if remaining <= 0:
+                    raise TimeoutError(f"Workspace preparation exceeded {preparation_limit:g}s; provider was not launched")
+                done, _ = await asyncio.wait({work}, timeout=min(10, remaining))
+                if done:
+                    return work.result()
+                await _preparing(phase, f"Preparing workspace ({int(time.monotonic() - preparation_started)}s elapsed)…")
+        finally:
+            # Cancellation stops awaiting the worker, never starts a provider.
+            # The filesystem worker may finish its external recovery writes.
+            if not work.done():
+                work.cancel()
+                await asyncio.gather(work, return_exceptions=True)
+
+    if project_dir and mode in _AGENT_WORKSPACE_MODES:
+        await _preparing(
+            "workspace_snapshot",
+            "Preparing workspace recovery snapshot…",
+        )
+        recovery_root = default_recovery_root()
+        snapshot_started = time.perf_counter()
+        try:
+            snapshot = await _bounded_workspace_preparation(
                 capture_workspace_snapshot,
                 project_dir,
                 recovery_root,
                 conversation_id=conv_id,
                 generation_id=generation_id,
+                phase="workspace_snapshot",
             )
+        except TimeoutError:
+            raise
         except Exception as exc:
             print(f"[WORKSPACE-SAFETY] Snapshot failed for conv={conv_id}: {exc!r}")
+            elapsed_ms = int((time.perf_counter() - snapshot_started) * 1000)
+            await _preparing(
+                "launching",
+                "Workspace recovery unavailable · launching agent…",
+                preparation_ms=elapsed_ms,
+            )
+        else:
+            elapsed_ms = int((time.perf_counter() - snapshot_started) * 1000)
+            recovery_stats = getattr(snapshot, "stats", None) or {}
+            skipped = recovery_stats.get("skipped_count", 0)
+            if snapshot is None:
+                status_text = "Workspace recovery unavailable · launching agent…"
+            elif skipped:
+                status_text = f"Workspace recovery partial ({skipped} files skipped; {elapsed_ms / 1000:.1f}s) · launching agent…"
+            else:
+                reused = recovery_stats.get("files_reused", 0)
+                reuse_note = f"; reused {reused} files" if reused else ""
+                status_text = f"Workspace protected ({elapsed_ms / 1000:.1f}s{reuse_note}) · launching agent…"
+            await _preparing(
+                "launching",
+                status_text,
+                preparation_ms=elapsed_ms,
+                recovery_stats=recovery_stats,
+            )
+    else:
+        await _preparing("launching", "Launching agent…")
 
     try:
+        if conv and conv.get("canvas_enabled") and project_dir:
+            await _bounded_workspace_preparation(
+                ensure_canvas_workspace, project_dir, CANVAS_CLAUDE_MD,
+                phase="canvas_workspace",
+            )
         await _handle_generation(websocket, conv_id, data)
     finally:
         if snapshot is not None:
@@ -4985,18 +8174,43 @@ async def _handle_generation_with_workspace_safety(
 
 
 async def _ws_broadcast_all(data: dict):
-    """Broadcast to ALL active WebSockets across ALL conversations."""
+    """Broadcast only content-free global notifications.
+
+    Generated text, tool output, permissions, and branch mutation events must
+    use :func:`_ws_send` and an exact run subscription.  This helper is kept
+    for liveness/notification signals and strips generated previews before
+    delivery so a global event can never mutate an unrelated chat.
+    """
+    raw = dict(data or {})
+    kind = str(raw.get("event_kind") or raw.get("type") or "event")
+    if kind not in GLOBAL_NOTIFICATION_KINDS:
+        print(f"[WS] Refusing non-notification global event: {kind}")
+        return
+    raw = content_free_notification(raw)
+    envelope = LoomEventEnvelope.from_payload(
+        raw,
+        conversation_id=raw.get("conversation_id", raw.get("conv_id")),
+        run_id=None,
+        draft_id=None,
+        parent_id=None,
+        client_instance_id=None,
+        sequence=_event_sequencer.next(None, raw.get("conversation_id", raw.get("conv_id"))),
+        scope="global",
+    )
+    event = envelope.as_dict()
     dead_pairs = []
     for cid, clients in list(_active_websockets.items()):
-        for ws in list(clients):
+        recipients = _event_router.recipients(envelope, clients)
+        for ws in list(recipients):
             try:
-                await ws.send_json(data)
+                await ws.send_json(event)
             except Exception:
                 dead_pairs.append((cid, ws))
     for cid, ws in dead_pairs:
         remaining = _active_websockets.get(cid)
         if remaining:
             remaining.discard(ws)
+            _event_router.unregister(ws)
             if not remaining:
                 _active_websockets.pop(cid, None)
 
@@ -5008,106 +8222,937 @@ async def _send_active_gen_state(websocket: WebSocket, conv_id: int) -> bool:
         k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()
     ]
     if not active_gen_keys:
-        await websocket.send_json({"type": "generation_idle"})
+        idle = LoomEventEnvelope.from_payload(
+            {"type": "generation_idle"},
+            conversation_id=conv_id,
+            scope="conversation",
+            sequence=_event_sequencer.next(None, conv_id),
+        )
+        await websocket.send_json(idle.as_dict())
         return False
     snapshots = []
+    subscriptions = _event_router.subscriptions(websocket)
     for gk in active_gen_keys:
         snap = _generation_snapshots.get(gk)
         if snap:
-            snapshots.append(
-                {
+            snapshot = {
                     "gen_id": gk[2],
+                    "run_id": f"gen:{gk[2]}",
                     "parent_id": snap.get("parent_id"),
                     "draft_msg_id": snap.get("draft_msg_id"),
-                    "full_text": snap.get("full_text", ""),
-                    "content_blocks": snap.get("content_blocks", []),
                     "input_tokens": snap.get("input_tokens", 0),
                     "output_tokens": snap.get("output_tokens", 0),
                     "started_at": snap.get("started_at", 0),
                     "cc_model": snap.get("cc_model", ""),
                     "model_attestation": snap.get("model_attestation"),
                     "mode": snap.get("mode", "claude"),
+                    "client_instance_id": snap.get("client_instance_id"),
+                    "loom_thread_id": snap.get("loom_thread_id"),
+                    "phase": snap.get("phase"),
+                    "status_text": snap.get("status_text"),
+                    "preparation_ms": snap.get("preparation_ms"),
+                    "time_to_first_token_ms": snap.get("time_to_first_token_ms"),
                 }
-            )
-    await websocket.send_json(
-        {
-            "type": "generation_active",
-            "snapshots": snapshots,
-        }
+            # A conversation socket may learn that runs exist, but generated
+            # content is a run-scoped payload.  Only an explicit subscription
+            # receives the progressive draft needed for reconnect recovery.
+            if snapshot["run_id"] in subscriptions:
+                snapshot["full_text"] = snap.get("full_text", "")
+                snapshot["content_blocks"] = snap.get("content_blocks", [])
+            snapshots.append(snapshot)
+    active_event = LoomEventEnvelope.from_payload(
+        {"type": "generation_active", "snapshots": snapshots},
+        conversation_id=conv_id,
+        scope="conversation",
+        sequence=_event_sequencer.next(None, conv_id),
     )
+    await websocket.send_json(active_event.as_dict())
     return True
+
+
+async def _websocket_can_subscribe_run(
+    websocket: WebSocket,
+    conv_id: int,
+    run_id: str | int | None,
+) -> bool:
+    """Authorize subscriptions from durable topology, never browser focus.
+
+    Normal generation output is visible to a page only when that page's
+    server cursor is on the run's exact parent or draft in the same Loom
+    thread. Child-agent activity is a separate conversation-scoped surface.
+    """
+    normalized = canonical_run_id(run_id)
+    if not normalized:
+        return False
+    if normalized.startswith("agent:"):
+        run = await db.get_agent_run(normalized.split(":", 1)[1])
+        return bool(run and int(run.get("conversation_id")) == int(conv_id))
+    if not normalized.startswith("gen:"):
+        return False
+    try:
+        gen_id = int(normalized.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return False
+    match = None
+    for key, task in _active_generations.items():
+        if key[0] == int(conv_id) and key[2] == gen_id and not task.done():
+            match = (key, _generation_snapshots.get(key) or {})
+            break
+    if not match:
+        return False
+    client_instance_id = getattr(websocket, "_client_instance_id", None)
+    if not client_instance_id:
+        return False
+    cursor = await db.get_client_loom_cursor(conv_id, client_instance_id)
+    if not cursor:
+        return False
+    key, snapshot = match
+    thread_id = snapshot.get("loom_thread_id")
+    cursor_leaf = cursor.get("leaf_message_id")
+    allowed_leaf_ids = {
+        str(snapshot.get("parent_id", key[1])),
+        str(snapshot.get("draft_msg_id")),
+    }
+    if cursor_leaf is not None and str(cursor_leaf) not in allowed_leaf_ids:
+        queued = await db.list_queued_generations(conv_id)
+        allowed_leaf_ids.update(
+            str(item.get("user_msg_id"))
+            for item in queued
+            if str(item.get("wait_for_draft_id"))
+            == str(snapshot.get("draft_msg_id"))
+        )
+    return bool(
+        thread_id
+        and str(cursor.get("thread_id")) == str(thread_id)
+        and cursor_leaf is not None
+        and str(cursor_leaf) in allowed_leaf_ids
+    )
+
+
+async def _prune_client_generation_subscriptions(
+    conv_id: int, client_instance_id: str | None
+) -> None:
+    """Drop run subscriptions that no longer match a page's server cursor."""
+    if not client_instance_id:
+        return
+    for websocket in list(_active_websockets.get(conv_id, set())):
+        if str(getattr(websocket, "_client_instance_id", "")) != str(
+            client_instance_id
+        ):
+            continue
+        for run_id in list(_event_router.subscriptions(websocket)):
+            if run_id.startswith("gen:") and not await _websocket_can_subscribe_run(
+                websocket, conv_id, run_id
+            ):
+                _event_router.unsubscribe(websocket, run_id)
+        await _subscribe_cursor_generation(websocket, conv_id)
+
+
+async def _subscribe_cursor_generation(websocket: WebSocket, conv_id: int) -> str | None:
+    """Subscribe a page when exactly one run occupies its exact thread leaf."""
+    client_instance_id = getattr(websocket, "_client_instance_id", None)
+    if not client_instance_id:
+        return None
+    cursor = await db.get_client_loom_cursor(conv_id, client_instance_id)
+    if not cursor or cursor.get("leaf_message_id") is None:
+        return None
+    queued = await db.list_queued_generations(conv_id)
+    candidates = []
+    for key, task in _active_generations.items():
+        if key[0] != int(conv_id) or task.done():
+            continue
+        snapshot = _generation_snapshots.get(key) or {}
+        if str(snapshot.get("loom_thread_id") or "") != str(cursor.get("thread_id") or ""):
+            continue
+        allowed_leaf_ids = {
+            str(snapshot.get("parent_id", key[1])),
+            str(snapshot.get("draft_msg_id")),
+        }
+        allowed_leaf_ids.update(
+            str(item.get("user_msg_id"))
+            for item in queued
+            if str(item.get("wait_for_draft_id"))
+            == str(snapshot.get("draft_msg_id"))
+        )
+        if str(cursor["leaf_message_id"]) not in allowed_leaf_ids:
+            continue
+        candidates.append(key)
+    if len(candidates) != 1:
+        return None
+    selected_key = candidates[0]
+    selected_snapshot = _generation_snapshots.get(selected_key) or {}
+    if (
+        selected_snapshot.get("draft_msg_id") is not None
+        and str(cursor.get("leaf_message_id"))
+        == str(selected_snapshot.get("parent_id", selected_key[1]))
+    ):
+        try:
+            await db.advance_loom_cursor(
+                cursor["cursor_id"],
+                conversation_id=conv_id,
+                client_instance_id=client_instance_id,
+                thread_id=cursor["thread_id"],
+                expected_leaf_id=cursor["leaf_message_id"],
+                expected_revision=cursor["revision"],
+                new_leaf_id=int(selected_snapshot["draft_msg_id"]),
+            )
+        except db.LoomCursorConflict:
+            return None
+    run_id = f"gen:{selected_key[2]}"
+    _event_router.subscribe(websocket, run_id)
+    return run_id
 
 
 @app.websocket("/ws/chat/{conv_id}")
 async def ws_chat(websocket: WebSocket, conv_id: int):
     await websocket.accept()
+    websocket._loom_connected_at = time.monotonic()
+    websocket_client_instance_id = websocket.query_params.get("client_instance_id")
+    websocket_run_id = websocket.query_params.get("run_id")
+    websocket._client_instance_id = websocket_client_instance_id
+    websocket._agent_event_batches = websocket.query_params.get("child_event_batches") == "1"
     print(f"[WS] Connection opened for conv={conv_id}")
     if conv_id not in _active_websockets:
         _active_websockets[conv_id] = set()
     _active_websockets[conv_id].add(websocket)
+    _event_router.register(websocket, conv_id)
 
-    # Tell the client whether a generation is running — include live snapshot if available
-    has_active = await _send_active_gen_state(websocket, conv_id)
-    if has_active:
-        # Resend ALL pending permission requests (broadcast globally now)
-        for rid, pending in list(_pending_hook_permissions.items()):
-            if pending.get("response"):
-                continue
-            print(f"[WS] Resending pending permission request {rid} on reconnect")
-            try:
-                perm_msg = {
-                    "type": "permission_request",
-                    "request_id": rid,
-                    "conv_id": pending.get("conv_id"),
-                    "tool_name": pending.get("tool_name", ""),
-                    "tool_input": pending.get("tool_input", ""),
-                    "input_summary": pending.get("input_summary", ""),
-                    "approval_method": pending.get("approval_method", ""),
-                    "permission_key": pending.get("permission_key", ""),
-                    "permission_scope": pending.get("permission_scope", ""),
-                    "risk_level": pending.get("risk_level", ""),
-                    "risk_reason": pending.get("risk_reason", ""),
-                    "supports_allow_all": pending.get("supports_allow_all", True),
-                    "parent_id": pending.get("parent_id"),
-                    "draft_msg_id": pending.get("draft_msg_id"),
-                }
-                gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
-                if gen_id is not None:
-                    perm_msg["gen_id"] = gen_id
-                await websocket.send_json(_scrub_surrogates(perm_msg))
-            except Exception as e:
-                # One malformed pending perm must not kill the whole reconnect —
-                # UnicodeEncodeError on an unpaired surrogate in tool_input was
-                # tearing down ws_chat before the receive loop started.
-                print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
+    # The durable cursor is the authority. A remembered run id is only a hint;
+    # it cannot subscribe a page positioned on another thread.
+    if websocket_run_id and await _websocket_can_subscribe_run(
+        websocket, conv_id, websocket_run_id
+    ):
+        _event_router.subscribe(websocket, canonical_run_id(websocket_run_id))
     else:
-        # Even when idle, resend any pending permissions from other conversations
-        for rid, pending in list(_pending_hook_permissions.items()):
-            if pending.get("response"):
-                continue
+        await _subscribe_cursor_generation(websocket, conv_id)
+    await _continue_ws_chat(
+        websocket, conv_id, websocket_client_instance_id
+    )
+
+
+def _active_generation_snapshots_for_conv(conv_id: int) -> list[dict]:
+    snapshots = []
+    for key, task in _active_generations.items():
+        if key[0] != conv_id or task.done():
+            continue
+        snapshot = dict(_generation_snapshots.get(key) or {})
+        snapshot.setdefault("parent_id", key[1])
+        snapshot.setdefault("gen_id", key[2])
+        snapshots.append(snapshot)
+    return snapshots
+
+
+async def _resolve_queue_target(
+    conv_id: int,
+    anchor_id: int | None,
+    explicit_draft_id: int | str | None = None,
+) -> int | None:
+    """Resolve continuation intent against live branch state.
+
+    The request's anchor is authoritative. We only queue when that anchor is
+    the active draft itself or the parent of exactly one active draft. Focus,
+    the database-wide active flag, and another tab's stream are irrelevant.
+    """
+    snapshots = _active_generation_snapshots_for_conv(conv_id)
+    # Queue topology and lane serialization must consult the same durable
+    # owner. A missing streaming snapshot is not evidence the draft vanished.
+    lease = await db.get_live_generation_lease(conv_id)
+    durable_ids = set()
+    if lease and lease.get("draft_msg_id") is not None:
+        durable_ids.add(int(lease["draft_msg_id"]))
+    # Parallel runs have no exclusive conversation lease, but still have
+    # durable run rows. Resolve only children of this request's exact anchor.
+    durable_ids.update(int(run["draft_msg_id"]) for run in await db.list_active_generations()
+                       if run.get("conv_id") == conv_id)
+    for draft_id in durable_ids:
+        durable_draft = await db.get_message(draft_id)
+        if (durable_draft and durable_draft.get("conversation_id") == conv_id
+                and durable_draft.get("role") == "assistant"):
+            if not any(str(snap.get("draft_msg_id")) == str(durable_draft["id"]) for snap in snapshots):
+                snapshots.append({"draft_msg_id": durable_draft["id"],
+                                  "parent_id": durable_draft.get("parent_id")})
+    if explicit_draft_id is not None:
+        # Preserve the exact queue parent even if its terminal event raced
+        # this POST. The scheduler separately checks terminal success before
+        # launching; disappearance from the live registry cannot make siblings.
+        try:
+            draft_id = int(explicit_draft_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "queue_after_draft_id must be a message ID")
+        draft = await db.get_message(draft_id)
+        if not draft or draft.get("conversation_id") != conv_id or draft.get("role") != "assistant":
+            raise HTTPException(400, "queue_after_draft_id is not an assistant draft in this conversation")
+        if anchor_id is not None and str(anchor_id) not in {
+            str(draft["id"]), str(draft.get("parent_id"))
+        }:
+            raise HTTPException(409, "The queued continuation target does not match this tab's branch anchor")
+        return draft["id"]
+
+    exact_drafts = [
+        snap for snap in snapshots
+        if snap.get("draft_msg_id") is not None
+        and str(snap.get("draft_msg_id")) == str(anchor_id)
+    ]
+    if len(exact_drafts) == 1:
+        return int(exact_drafts[0]["draft_msg_id"])
+
+    child_drafts = [
+        snap for snap in snapshots
+        if snap.get("draft_msg_id") is not None
+        and str(snap.get("parent_id")) == str(anchor_id)
+    ]
+    if len(child_drafts) > 1:
+        raise HTTPException(
+            409,
+            "More than one generation is active below this branch anchor; select the exact draft to continue it",
+        )
+    if child_drafts:
+        return int(child_drafts[0]["draft_msg_id"])
+    if any(
+        snap.get("draft_msg_id") is None
+        and str(snap.get("parent_id")) == str(anchor_id)
+        for snap in snapshots
+    ):
+        raise HTTPException(
+            409,
+            "The running reply has not created its durable draft yet; retry this continuation in a moment",
+        )
+    return None
+
+
+def _find_client_websocket(conv_id: int, client_instance_id: str | None):
+    if not client_instance_id:
+        return None
+    candidates = []
+    for websocket in _active_websockets.get(conv_id, set()):
+        if str(getattr(websocket, "_client_instance_id", "")) != str(client_instance_id):
+            continue
+        if any(getattr(websocket, field, WebSocketState.CONNECTED) != WebSocketState.CONNECTED
+               for field in ("client_state", "application_state")):
+            continue
+        candidates.append(websocket)
+    # Reconnect cleanup can overlap launch admission. Subscribe the current
+    # connection, never an arbitrary old/closed member of the conversation set.
+    return max(candidates, key=lambda ws: getattr(ws, "_loom_connected_at", 0), default=None)
+
+
+async def _run_id_belongs_to_conversation(run_id: str | int | None, conv_id: int) -> bool:
+    """Authorize a subscription against durable/in-memory run ownership."""
+    normalized = canonical_run_id(run_id)
+    if not normalized:
+        return False
+    if normalized.startswith("gen:"):
+        try:
+            gen_id = int(normalized.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return False
+        return any(
+            key[0] == int(conv_id) and key[2] == gen_id and not task.done()
+            for key, task in _active_generations.items()
+        )
+    if normalized.startswith("agent:"):
+        run = await db.get_agent_run(normalized.split(":", 1)[1])
+        return bool(run and int(run.get("conversation_id")) == int(conv_id))
+    return False
+
+
+class GenerationLaneOccupied(RuntimeError):
+    """A non-parallel conversation already owns its durable provider lane."""
+
+
+async def _create_generation_draft(
+    conv_id: int,
+    conv: dict,
+    parent_id: int,
+) -> dict:
+    """Create one provider draft with auditable serial-lane authorization.
+
+    Browser sockets, active-branch state, and in-memory task registries are
+    deliberately irrelevant here.  In a non-parallel agent conversation the
+    exact asyncio task must own the exact live SQLite lease, and the inserted
+    message records that lease ID.  The database trigger rejects every other
+    empty assistant-draft insert.
+    """
+    task = asyncio.current_task()
+    gen_key = getattr(task, "_gen_key", None) if task else None
+    lease_id = getattr(task, "_generation_lease_id", None) if task else None
+
+    def _lease_rejected(detail: str) -> GenerationLaneOccupied:
+        if task is not None:
+            task._generation_terminal_override = "lease_rejected"
+        return GenerationLaneOccupied(detail)
+
+    serial_lane = bool(
+        conv
+        and conv.get("mode") in _AGENT_WORKSPACE_MODES
+        and not _truthy_setting(conv.get("parallel_agents_enabled"))
+    )
+    if serial_lane and not lease_id:
+        raise _lease_rejected(
+            "A non-parallel provider draft cannot be created without its generation lease"
+        )
+    if lease_id:
+        lease = await db.get_generation_lease(lease_id)
+        expected_run_id = f"gen:{gen_key[2]}" if gen_key else None
+        if not lease or not (
+            int(lease.get("conv_id")) == int(conv_id)
+            and lease.get("released_at") is None
+            and lease.get("state") in {"launching", "running"}
+            and (expected_run_id is None or str(lease.get("run_id")) == expected_run_id)
+        ):
+            raise _lease_rejected(
+                "The generation lease no longer authorizes this provider draft"
+            )
+        if not await db.bind_generation_lease(
+            lease_id,
+            draft_parent_id=int(parent_id),
+            state="launching",
+        ):
+            raise _lease_rejected(
+                "The generation lease could not authorize this draft parent"
+            )
+    draft = await db.add_message(
+        conv_id,
+        "assistant",
+        "",
+        parent_id=parent_id,
+        generation_lease_id=lease_id,
+    )
+    if lease_id and not await db.bind_generation_lease(
+        lease_id,
+        draft_parent_id=int(parent_id),
+        draft_msg_id=int(draft["id"]),
+        state="running",
+    ):
+        await db.delete_branch(draft["id"])
+        raise _lease_rejected(
+            "The generation lease ended before its provider draft was bound"
+        )
+    if task is not None:
+        task._draft_msg_id = int(draft["id"])
+    return draft
+
+
+def _track_generation_provider(proc) -> None:
+    """Retain owned subprocess handles even after adapter registries are cleared."""
+    task = asyncio.current_task()
+    if task is not None and proc is not None:
+        handles = getattr(task, "_coordination_processes", None)
+        if handles is None:
+            handles = task._coordination_processes = []
+        if not any(handle is proc for handle in handles):
+            handles.append(proc)
+
+
+def _generation_providers_exited(task=None) -> bool:
+    task = task if task is not None else asyncio.current_task()
+    # Adapter return is the drain boundary for HTTP-only providers. CLI adapters
+    # additionally need acknowledgement from every process they launched (also
+    # retries). Descendant-tree teardown remains an adapter integration contract.
+    return all(getattr(proc, "returncode", None) is not None
+               for proc in getattr(task, "_coordination_processes", ()))
+
+
+async def _finish_deferred_generation_teardown(task, conv_id, draft_msg_id, lease_id, terminal_state):
+    """Keep durable ownership until every adapter process acknowledges exit."""
+    processes = getattr(task, "_coordination_processes", ())
+    await asyncio.gather(*(proc.wait() for proc in processes))
+    if not _generation_providers_exited(task):
+        return
+    if draft_msg_id is not None:
+        await db.unregister_active_generation(draft_msg_id)
+    if lease_id:
+        await db.release_generation_lease(lease_id, terminal_state)
+    await _send_generation_idle_if_quiescent(conv_id)
+
+
+async def _generation_task_entry(
+    websocket: WebSocket | None,
+    conv_id: int,
+    payload: dict,
+    lease_id: str | None,
+) -> None:
+    asyncio.current_task()._coordination_entered = True
+    terminal_state = "completed"
+    try:
+        if payload.get("action") == "compact":
+            await _handle_compact(websocket, conv_id, payload)
+        else:
+            await _handle_generation_with_workspace_safety(websocket, conv_id, payload)
+    except asyncio.CancelledError:
+        terminal_state = _generation_stop_disposition()
+        raise
+    except Exception as exc:
+        terminal_state = "error"
+        task = asyncio.current_task()
+        if payload.get("action") != "compact" and not getattr(task, "_draft_msg_id", None):
+            # Admission already succeeded. Persist a terminal receipt even if
+            # preparation failed before the adapter could create its draft.
+            error_text = f"Turn failed before provider launch: {type(exc).__name__}: {exc}"
             try:
-                perm_msg = {
-                    "type": "permission_request",
-                    "request_id": rid,
-                    "conv_id": pending.get("conv_id"),
-                    "tool_name": pending.get("tool_name", ""),
-                    "tool_input": pending.get("tool_input", ""),
-                    "input_summary": pending.get("input_summary", ""),
-                    "approval_method": pending.get("approval_method", ""),
-                    "permission_key": pending.get("permission_key", ""),
-                    "permission_scope": pending.get("permission_scope", ""),
-                    "risk_level": pending.get("risk_level", ""),
-                    "risk_reason": pending.get("risk_reason", ""),
-                    "supports_allow_all": pending.get("supports_allow_all", True),
-                    "parent_id": pending.get("parent_id"),
-                    "draft_msg_id": pending.get("draft_msg_id"),
-                }
-                gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
-                if gen_id is not None:
-                    perm_msg["gen_id"] = gen_id
-                await websocket.send_json(_scrub_surrogates(perm_msg))
-            except Exception as e:
-                print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
+                conv = await db.get_conversation(conv_id)
+                draft = await _create_generation_draft(conv_id, conv, payload["parent_id"])
+                await db.update_message_content(
+                    draft["id"], content=f"[Error: {error_text}]",
+                    turn_lifecycle_state="failed",
+                )
+                gen_key = getattr(task, "_gen_key", None)
+                if gen_key:
+                    _update_gen_snapshot(gen_key, draft_msg_id=draft["id"])
+                    await _advance_unambiguous_generation_cursors(gen_key)
+                await _ws_send(conv_id, {
+                    "type": "error", "error": error_text,
+                    "parent_id": payload["parent_id"], "message_id": draft["id"],
+                    "message": await db.get_message(draft["id"]),
+                })
+            except Exception as receipt_error:
+                print(f"[GEN] Could not persist launch failure for conv={conv_id}: {receipt_error!r}")
+                await _ws_send(conv_id, {
+                    "type": "error", "error": error_text,
+                    "parent_id": payload.get("parent_id"),
+                })
+        raise
+    finally:
+        task = asyncio.current_task()
+        draft_msg_id = getattr(task, "_draft_msg_id", None) if task else None
+        terminal_override = (
+            getattr(task, "_generation_terminal_override", None) if task else None
+        )
+        if terminal_state == "completed" and terminal_override:
+            terminal_state = str(terminal_override)
+        # Several provider adapters turn their own terminal failure into a
+        # durable assistant marker instead of re-raising it.  That is useful
+        # for the tree, but it must never make a queued successor look like a
+        # successful continuation. Derive the lease outcome from the final
+        # persisted turn as well as the Python task outcome.
+        if terminal_state == "completed" and draft_msg_id is not None:
+            final_draft = await db.get_message(draft_msg_id)
+            lifecycle = str(
+                (final_draft or {}).get("turn_lifecycle_state") or ""
+            ).lower()
+            final_text = str((final_draft or {}).get("content") or "").lstrip()
+            if lifecycle in {"cancelled", "interrupted", "failed", "partial_failed"}:
+                terminal_state = lifecycle
+            elif final_text.startswith("[Error:"):
+                terminal_state = "error"
+            elif final_text.startswith("[Turn interrupted"):
+                terminal_state = "interrupted"
+
+        exited = _generation_providers_exited(task)
+        release_effect, queue_effect = coordination.finish_effects(
+            terminal_state, exited=exited, leased=bool(lease_id)
+        )
+        if not exited:
+            print(f"[GEN] Retaining lease {lease_id}: provider exit not acknowledged")
+            _spawn_background_task(
+                _finish_deferred_generation_teardown(
+                    task, conv_id, draft_msg_id, lease_id, terminal_state
+                ),
+                f"generation teardown {conv_id}:{draft_msg_id}",
+                allow_during_shutdown=True,
+            )
+        if (terminal_state != "completed" or not exited) and draft_msg_id is not None:
+            paused = await db.pause_queued_generations(
+                conv_id, wait_for_draft_id=int(draft_msg_id)
+            )
+            if paused:
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "queue_changed",
+                        "queued": True,
+                        "status": "paused",
+                        "wait_for_draft_id": int(draft_msg_id),
+                    },
+                )
+        # Adapter cleanup is responsible for its subprocess tree; the reducer
+        # additionally refuses release without owned-process exit acknowledgement.
+        # Until release, SQLite's partial unique index keeps the lane closed.
+        if release_effect == "release_lease":
+            await db.release_generation_lease(lease_id, terminal_state)
+        if exited and draft_msg_id is not None:
+            await db.unregister_active_generation(draft_msg_id)
+        # Queue dispatch happens only after the durable lease records a
+        # successful predecessor.  Cancel, interrupt, provider error, crash,
+        # and process teardown all leave dependent work visibly paused.
+        if queue_effect == "launch_queued":
+            _spawn_background_task(
+                _dispatch_ready_queued_generations(conv_id),
+                f"queue dispatch {conv_id}",
+            )
+
+
+async def _launch_generation_task(
+    websocket: WebSocket | None,
+    conv_id: int,
+    data: dict,
+    client_instance_id: str | None = None,
+    *,
+    preacquired_lease_id: str | None = None,
+) -> tuple[tuple[int, int | None, int], asyncio.Task]:
+    """Serialize launch admission against Loom shutdown."""
+    async with _generation_admission_lock:
+        if _shutdown_requested:
+            if preacquired_lease_id:
+                await db.release_generation_lease(
+                    preacquired_lease_id, "shutdown"
+                )
+            raise HTTPException(
+                status_code=503,
+                detail="Loom is shutting down; this generation was not launched",
+            )
+        return await _launch_generation_task_admitted(
+            websocket,
+            conv_id,
+            data,
+            client_instance_id,
+            preacquired_lease_id=preacquired_lease_id,
+        )
+
+
+async def _launch_generation_task_admitted(
+    websocket: WebSocket | None,
+    conv_id: int,
+    data: dict,
+    client_instance_id: str | None = None,
+    *,
+    preacquired_lease_id: str | None = None,
+) -> tuple[tuple[int, int | None, int], asyncio.Task]:
+    """Atomically reserve and create one generation task.
+
+    For non-parallel agent conversations the SQLite lease is acquired before
+    an asyncio task, assistant draft, workspace snapshot, or provider process
+    can start. Every launch path calls this helper.
+    """
+    global _gen_seq
+    parent_id = data.get("parent_id")
+    _gen_seq += 1
+    gen_key = (conv_id, parent_id, _gen_seq)
+    conv = await db.get_conversation(conv_id)
+    launch_mode = _mode_for_cc_model(data.get("cc_model")) or (
+        conv.get("mode") if conv else None
+    )
+    if reason := model_registry.retirement_reason(
+        (conv or {}).get("mode"), data.get("cc_model") or (conv or {}).get("cc_model")
+    ):
+        if preacquired_lease_id:
+            await db.release_generation_lease(preacquired_lease_id, "error")
+        raise HTTPException(410, reason)
+    serial_lane = bool(
+        conv
+        and launch_mode in _AGENT_WORKSPACE_MODES
+        and not _truthy_setting(conv.get("parallel_agents_enabled"))
+    )
+    lease_id = preacquired_lease_id
+    if serial_lane and not lease_id:
+        lease_id = uuid.uuid4().hex
+        acquired = await db.try_acquire_generation_lease(
+            conv_id,
+            lease_id,
+            run_id=f"gen:{_gen_seq}",
+            user_msg_id=parent_id,
+            draft_parent_id=parent_id,
+            client_instance_id=client_instance_id,
+        )
+        if not acquired:
+            raise GenerationLaneOccupied(
+                f"Conversation {conv_id} already has a provider generation lease"
+            )
+    elif lease_id:
+        bound = await db.bind_generation_lease(
+            lease_id,
+            run_id=f"gen:{_gen_seq}",
+            user_msg_id=parent_id,
+            draft_parent_id=parent_id,
+            state="launching",
+        )
+        if not bound:
+            raise GenerationLaneOccupied(
+                f"Generation lease {lease_id} is no longer active"
+            )
+    payload = dict(data)
+    payload["_gen_id"] = _gen_seq
+    if client_instance_id:
+        payload["client_instance_id"] = client_instance_id
+    try:
+        task = asyncio.create_task(
+            _generation_task_entry(websocket, conv_id, payload, lease_id)
+        )
+    except Exception:
+        if lease_id:
+            await db.release_generation_lease(lease_id, "launch_failed")
+        raise
+    task._gen_key = gen_key
+    task._client_instance_id = client_instance_id
+    task._generation_lease_id = lease_id
+    _active_generations[gen_key] = task
+    if websocket is not None:
+        _event_router.register(websocket, conv_id)
+        _event_router.subscribe(websocket, f"gen:{gen_key[2]}")
+    effective_cc_model = data.get("cc_model") or (conv.get("cc_model") if conv else None)
+    _update_gen_snapshot(
+        gen_key,
+        parent_id=parent_id,
+        client_instance_id=client_instance_id,
+        loom_thread_id=data.get("loom_thread_id"),
+        cc_model=effective_cc_model,
+        harness=launch_mode,
+        phase="scheduled",
+        status_text="Preparing turn…",
+        started_at=time.time(),
+    )
+
+    # Provider handlers normally remove their own registry/snapshot entries.
+    # A cancellation during the pre-provider recovery snapshot never enters a
+    # provider handler, so clean that early-exit path up here as well.
+    def _forget_finished(done_task: asyncio.Task) -> None:
+        if _active_generations.get(gen_key) is done_task:
+            _active_generations.pop(gen_key, None)
+            _generation_snapshots.pop(gen_key, None)
+        if _generation_providers_exited(done_task):
+            _spawn_background_task(
+                _send_generation_idle_if_quiescent(conv_id),
+                f"generation idle {conv_id}",
+                allow_during_shutdown=True,
+            )
+        # A task cancelled before its coroutine first executes cannot reach
+        # _generation_task_entry.finally. Never override a finalizer which
+        # retained its lease because provider teardown was not acknowledged.
+        if lease_id and not getattr(done_task, "_coordination_entered", False):
+            try:
+                _spawn_background_task(
+                    db.release_generation_lease(
+                        lease_id,
+                        (
+                            _generation_stop_disposition(done_task)
+                            if done_task.cancelled() else "launch_failed"
+                        ),
+                    ),
+                    "generation lease release",
+                    allow_during_shutdown=True,
+                )
+            except RuntimeError:
+                pass
+
+    task.add_done_callback(_forget_finished)
+    return gen_key, task
+
+
+_queued_generation_dispatch_lock = asyncio.Lock()
+
+
+async def _dispatch_ready_queued_generations(conv_id: int | None = None):
+    """Launch durable continuations whose prerequisite draft has finished."""
+    async with _queued_generation_dispatch_lock:
+        queued = await db.list_queued_generations(conv_id, include_launching=False)
+        for item in queued:
+            item_conv_id = int(item["conv_id"])
+            wait_for_draft_id = int(item["wait_for_draft_id"])
+
+            # The prerequisite's durable lease is the authority for whether
+            # this is a continuation after success or work that must wait for
+            # human review.  Volatile task/PID registries can disappear on an
+            # adapter EOF or restart and are never sufficient to jump a queue.
+            barrier_lease = await db.get_generation_lease_for_draft(
+                wait_for_draft_id
+            )
+            if barrier_lease:
+                decision = coordination.queue_effect(
+                    held=barrier_lease.get("released_at") is None,
+                    outcome=str(barrier_lease.get("terminal_state") or ""),
+                    paused=item.get("status") == "paused",
+                    authorized=_truthy_setting(item.get("resume_authorized")),
+                )
+                if decision == "none":
+                    continue
+                if decision == "pause_queue":
+                    paused = await db.pause_queued_generations(
+                        item_conv_id, wait_for_draft_id=wait_for_draft_id
+                    )
+                    if paused:
+                        await _ws_send(
+                            item_conv_id,
+                            {
+                                "type": "queue_changed",
+                                "queued": True,
+                                "status": "paused",
+                                "wait_for_draft_id": wait_for_draft_id,
+                            },
+                        )
+                    continue
+            else:
+                # Compatibility for queues created before durable leases were
+                # introduced.  A clearly stopped/failed predecessor is still
+                # fail-closed; only an ordinary persisted answer may proceed.
+                barrier = await db.get_message(wait_for_draft_id)
+                lifecycle = str(
+                    (barrier or {}).get("turn_lifecycle_state") or ""
+                ).lower()
+                barrier_text = str((barrier or {}).get("content") or "").lstrip()
+                failed_legacy_barrier = (
+                    lifecycle in {"cancelled", "interrupted", "failed", "partial_failed"}
+                    or barrier_text.startswith("[Error:")
+                    or barrier_text.startswith("[Turn interrupted")
+                )
+                if (
+                    failed_legacy_barrier
+                    and not _truthy_setting(item.get("resume_authorized"))
+                ):
+                    paused = await db.pause_queued_generations(
+                        item_conv_id, wait_for_draft_id=wait_for_draft_id
+                    )
+                    if paused:
+                        await _ws_send(
+                            item_conv_id,
+                            {
+                                "type": "queue_changed",
+                                "queued": True,
+                                "status": "paused",
+                                "wait_for_draft_id": wait_for_draft_id,
+                            },
+                        )
+                    continue
+
+            snapshots = _active_generation_snapshots_for_conv(item_conv_id)
+            active_draft_ids = {
+                str(snap.get("draft_msg_id"))
+                for snap in snapshots
+                if snap.get("draft_msg_id") is not None
+            }
+            if str(item["wait_for_draft_id"]) in active_draft_ids:
+                continue
+
+            # A non-parallel agent conversation still has a one-process lane.
+            # If another branch became active first, keep this continuation in
+            # the queue instead of cancelling or stealing that generation.
+            conv = await db.get_conversation(item_conv_id)
+            if reason := model_registry.retirement_reason(
+                (conv or {}).get("mode"), (item.get("settings") or {}).get("cc_model") or (conv or {}).get("cc_model")
+            ):
+                await db.pause_queued_generations(item_conv_id, wait_for_draft_id=wait_for_draft_id)
+                await _ws_send(item_conv_id, {"type": "queue_changed", "queued": True,
+                    "status": "paused", "user_msg_id": item["user_msg_id"], "reason": reason})
+                continue
+            parallel_enabled = bool(
+                conv and _truthy_setting(conv.get("parallel_agents_enabled"))
+            )
+            if not parallel_enabled and await _provider_lane_occupied(item_conv_id):
+                continue
+            if any(
+                str(snap.get("parent_id")) == str(item["user_msg_id"])
+                for snap in snapshots
+            ):
+                await db.delete_queued_generation(item["user_msg_id"])
+                continue
+            queue_lease_id = None
+            serial_lane = bool(
+                conv
+                and conv.get("mode") in _AGENT_WORKSPACE_MODES
+                and not parallel_enabled
+            )
+            if serial_lane:
+                queue_lease_id = uuid.uuid4().hex
+                acquired = await db.try_acquire_generation_lease(
+                    item_conv_id,
+                    queue_lease_id,
+                    user_msg_id=int(item["user_msg_id"]),
+                    draft_parent_id=int(item["user_msg_id"]),
+                    client_instance_id=item.get("client_instance_id"),
+                )
+                if not acquired:
+                    continue
+            if not await db.claim_queued_generation(item["user_msg_id"]):
+                if queue_lease_id:
+                    await db.release_generation_lease(
+                        queue_lease_id, "claim_lost"
+                    )
+                continue
+
+            try:
+                websocket = _find_client_websocket(
+                    item_conv_id, item.get("client_instance_id")
+                )
+                settings = dict(item.get("settings") or {})
+                settings.update(
+                    {
+                        "action": "generate",
+                        "parent_id": item["user_msg_id"],
+                        "client_instance_id": item.get("client_instance_id"),
+                        "loom_thread_id": item.get("loom_thread_id"),
+                    }
+                )
+                count = max(1, min(5, int(item.get("generation_count") or 1)))
+                if not conv or conv.get("mode") != "weave":
+                    count = 1
+                launched = []
+                for _ in range(count):
+                    gen_key, _task = await _launch_generation_task(
+                        websocket,
+                        item_conv_id,
+                        settings,
+                        item.get("client_instance_id"),
+                        preacquired_lease_id=queue_lease_id,
+                    )
+                    queue_lease_id = None
+                    launched.append(gen_key[2])
+                await db.delete_queued_generation(item["user_msg_id"])
+                await _ws_send(
+                    item_conv_id,
+                    {
+                        "type": "queue_started",
+                        "user_msg_id": item["user_msg_id"],
+                        "wait_for_draft_id": item["wait_for_draft_id"],
+                        "gen_ids": launched,
+                        "client_instance_id": item.get("client_instance_id"),
+                    },
+                )
+            except Exception as exc:
+                print(
+                    f"[QUEUE] Failed to launch queued message {item['user_msg_id']}: {exc!r}"
+                )
+                if queue_lease_id:
+                    await db.release_generation_lease(
+                        queue_lease_id, "launch_failed"
+                    )
+                await db.release_queued_generation(item["user_msg_id"])
+
+
+async def _continue_ws_chat(
+    websocket: WebSocket,
+    conv_id: int,
+    websocket_client_instance_id: str | None,
+):
+    # Tell the client whether a generation is running — include live snapshot if available
+    queued_items = await db.list_queued_generations(conv_id)
+    page_cursor = (
+        await db.get_client_loom_cursor(conv_id, websocket_client_instance_id)
+        if websocket_client_instance_id else None
+    )
+    if page_cursor:
+        queued_items = [
+            item for item in queued_items
+            if str(item.get("loom_thread_id") or "")
+            == str(page_cursor.get("thread_id") or "")
+        ]
+    else:
+        queued_items = []
+    queue_event = LoomEventEnvelope.from_payload(
+        {"type": "queue_state", "items": queued_items},
+        conversation_id=conv_id,
+        scope="conversation",
+        sequence=_event_sequencer.next(None, conv_id),
+    )
+    await websocket.send_json(queue_event.as_dict())
+    has_active = await _send_active_gen_state(websocket, conv_id)
+    # Replay only this conversation's permissions and only for runs this
+    # socket explicitly owns.  Never replay the process-wide pending map.
+    await _send_pending_permissions_to_socket(websocket, conv_id)
+    # Global notices carry identity only. Approval payloads and authority stay
+    # on the owning page (or explicit Admin supervision), including Trusted.
+    for notice in await db.get_permission_notices():
+        if _pending_hook_permissions.get(notice["request_id"], {}).get("response") is None:
+            await websocket.send_json({"type": "permission_notice", "scope": "global",
+                                       **notice, "status": "pending"})
 
     try:
         while True:
@@ -5120,7 +9165,16 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # and doesn't force-reconnect (which would trigger loadMessages
                 # and wipe any in-progress textarea edit).
                 try:
-                    await websocket.send_json({"type": "pong"})
+                    pong = LoomEventEnvelope.from_payload(
+                        {"type": "pong"}, conversation_id=conv_id,
+                        scope="conversation",
+                        sequence=_event_sequencer.next(None, conv_id),
+                    )
+                    await websocket.send_json(pong.as_dict())
+                    await _probe_followed_generation(websocket, conv_id, data)
+                    # The old page's disconnect can finish after initial replay.
+                    # Retry undelivered prompts under the same exact-draft gate.
+                    await _send_pending_permissions_to_socket(websocket, conv_id, only_new=True)
                 except Exception:
                     pass
                 continue
@@ -5131,11 +9185,13 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # rebuild without a full page refresh.
                 try:
                     await _send_active_gen_state(websocket, conv_id)
+                    await _probe_followed_generation(websocket, conv_id, data)
+                    await _send_pending_permissions_to_socket(websocket, conv_id)
                 except Exception as e:
                     print(f"[WS] request_snapshot failed for conv={conv_id}: {e!r}")
                 continue
 
-            if action == "cancel":
+            if action in {"cancel", "interrupt"}:
                 # New clients identify the visible generation. Legacy clients
                 # omit both selectors and retain the old cancel-all behavior.
                 cancelled_keys = _active_generation_keys_for_cancel(
@@ -5144,110 +9200,232 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     draft_msg_id=data.get("draft_msg_id"),
                 )
                 if not cancelled_keys:
-                    await websocket.send_json(
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
                         {
                             "type": "error",
                             "error": "The selected generation is no longer active",
                             "gen_id": data.get("gen_id"),
                             "draft_msg_id": data.get("draft_msg_id"),
-                        }
+                        },
                     )
                     continue
                 cancelled_snapshots = {
                     key: dict(_generation_snapshots.get(key) or {})
                     for key in cancelled_keys
                 }
+                selected_draft_id = data.get("draft_msg_id")
+                if selected_draft_id is None and len(cancelled_keys) == 1:
+                    selected_draft_id = (
+                        cancelled_snapshots.get(cancelled_keys[0]) or {}
+                    ).get("draft_msg_id")
+                await _pause_serial_queue_for_cancel(
+                    conv_id,
+                    draft_msg_id=(
+                        int(selected_draft_id)
+                        if selected_draft_id is not None else None
+                    ),
+                )
                 cancelled_tasks = []
+                cancelled_task_by_key = {}
                 for key in cancelled_keys:
-                    task = _active_generations.pop(key, None)
+                    task = _active_generations.get(key)
                     if task:
-                        task.cancel()
+                        _request_generation_stop(task, action)
                         cancelled_tasks.append(task)
-                # Clean up pending permissions from memory and DB
-                for rid in list(_pending_hook_permissions):
-                    pending = _pending_hook_permissions[rid]
-                    pending_gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
-                    if pending.get("conv_id") == conv_id and (
-                        data.get("gen_id") is None
-                        or str(pending_gen_id) == str(data.get("gen_id"))
-                    ):
-                        _pending_hook_permissions.pop(rid, None)
-                        await db.delete_pending_permission(rid)
-                # Wait for tasks to finish their CancelledError handler (saves partial content).
-                # Pop snapshots — the task handlers save/delete drafts themselves.
+                        cancelled_task_by_key[key] = task
+                # Wake exact pending approvals as lifecycle cancellations.
+                # A generation stop is not a user denial of each tool request.
                 for key in cancelled_keys:
-                    _generation_snapshots.pop(key, None)
+                    await _resolve_pending_permissions_for_scope(
+                        conv_id,
+                        f"gen:{key[2]}",
+                        message=(
+                            "Loom permission request was cancelled because the owning "
+                            f"agent turn was {action}ed before a user decision."
+                        ),
+                    )
+                # Keep this lane registered until provider teardown actually finishes.
+                # Provider handlers remove their own snapshots only after exit.
                 if cancelled_tasks:
                     try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*cancelled_tasks, return_exceptions=True),
+                        done, _pending = await asyncio.wait(
+                            cancelled_tasks,
                             timeout=8.0,
                         )
+                        if done:
+                            await asyncio.gather(*done, return_exceptions=True)
                     except asyncio.TimeoutError:
-                        pass  # tasks hung — already cleaned up, continue
-                # Send one scoped event per cancelled generation. The task's
+                        pass  # still registered; queue remains blocked
+                # Send one scoped event per stopped generation. The task's
                 # own CancelledError handler may also emit this; the client
                 # filters/idempotently clears only the stream it owns.
                 for key in cancelled_keys:
+                    task = _active_generations.get(key) or cancelled_task_by_key.get(key)
+                    if task is not None and not task.done():
+                        continue
+                    if task is not None and getattr(task, "_stop_event_sent", False):
+                        continue
                     snapshot = cancelled_snapshots.get(key) or {}
+                    event_type = (
+                        "interrupted" if action == "interrupt" else "cancelled"
+                    )
                     await _ws_send(
                         conv_id,
                         {
-                            "type": "cancelled",
+                            "type": event_type,
+                            "disposition": action,
                             "gen_id": key[2],
                             "parent_id": snapshot.get("parent_id", key[1]),
                             "draft_msg_id": snapshot.get("draft_msg_id"),
+                            "client_instance_id": snapshot.get("client_instance_id"),
                         },
                     )
+                continue
+
+            if action == "subscribe_run":
+                run_id = canonical_run_id(data.get("run_id") or data.get("gen_id"))
+                allowed = bool(
+                    run_id
+                    and await _websocket_can_subscribe_run(websocket, conv_id, run_id)
+                    and _event_router.subscribe(websocket, run_id)
+                )
+                subscription = LoomEventEnvelope.from_payload(
+                    {"type": "run_subscription", "run_id": run_id,
+                     "subscribed": allowed},
+                    conversation_id=conv_id, run_id=run_id,
+                    scope="conversation",
+                    sequence=_event_sequencer.next(None, conv_id),
+                )
+                await websocket.send_json(subscription.as_dict())
+                if allowed:
+                    await _send_pending_permissions_to_socket(websocket, conv_id)
+                continue
+
+            if action == "unsubscribe_run":
+                run_id = canonical_run_id(data.get("run_id") or data.get("gen_id"))
+                removed = bool(run_id and _event_router.unsubscribe(websocket, run_id))
+                subscription = LoomEventEnvelope.from_payload(
+                    {"type": "run_subscription", "run_id": run_id,
+                     "subscribed": False, "removed": removed},
+                    conversation_id=conv_id, run_id=run_id,
+                    scope="conversation",
+                    sequence=_event_sequencer.next(None, conv_id),
+                )
+                await websocket.send_json(subscription.as_dict())
                 continue
 
             if action == "permission_response":
                 request_id = data.get("request_id", "")
                 # Resolve the hook-based pending permission
                 pending = _pending_hook_permissions.get(request_id)
-                if pending:
-                    allow = bool(data.get("allow", False))
-                    pending_conv_id = int(pending.get("conv_id") or conv_id)
-                    permission_key = pending.get("permission_key") or _permission_fingerprint(
-                        pending.get("tool_name", ""),
-                        pending.get("tool_input", {}),
-                        pending.get("approval_method", ""),
-                    )
-                    permission_scope = pending.get("permission_scope") or _permission_scope_for_active_generation(pending_conv_id)
-                    always = bool(data.get("always")) and bool(
-                        pending.get("supports_allow_all", True)
-                    )
-                    if allow and always:
-                        _auto_approve_permissions.setdefault((pending_conv_id, permission_scope), set()).add(permission_key)
-                    pending["response"] = {
-                        "allow": allow,
-                        "always": always,
-                    }
-                    pending["event"].set()
-                    # Also clean up from DB
-                    await db.delete_pending_permission(request_id)
-                    await _ws_broadcast_all(
-                        {
-                            "type": "permission_resolved",
-                            "request_id": request_id,
-                            "allowed": allow,
-                            "conv_id": pending_conv_id,
-                        }
-                    )
+                if pending and pending.get("response") is None:
+                    if int(pending.get("conv_id") or conv_id) != conv_id:
+                        continue
+                    origin = str(pending.get("client_instance_id") or "")
+                    page = str(getattr(websocket, "_client_instance_id", "") or "")
+                    if origin and origin != page:
+                        if _find_client_websocket(conv_id, origin) is not None or not await _permission_socket_can_recover(
+                            websocket, conv_id, pending.get("run_id"), pending.get("draft_msg_id")
+                        ):
+                            continue
+                    if str(pending.get("permission_scope") or "").startswith("agent:"):
+                        if not await _child_permission_response_authorized(websocket, conv_id, pending):
+                            continue
+                        # Another observer may have answered during validation.
+                        if pending.get("response") is not None:
+                            continue
+                    await _answer_pending_permission(request_id, data, websocket=websocket)
                 continue
 
             if action == "compact":
-                # Manual compaction: launch CC with /compact as the prompt
-                # using --resume to compact the existing session
-                asyncio.create_task(
-                    _handle_compact(websocket, conv_id, data)
-                )
+                try:
+                    await _launch_generation_task(
+                        websocket, conv_id, data, websocket_client_instance_id)
+                except (GenerationLaneOccupied, HTTPException) as exc:
+                    await _ws_reply(websocket, conv_id, {
+                        "type": "error", "error": getattr(exc, "detail", str(exc)),
+                    })
                 continue
 
             print(f"[WS] Received action={action} for conv={conv_id}")
             if action in ("generate", "regenerate"):
-                global _gen_seq
                 parent_id = data.get("parent_id")
+                client_instance_id = (
+                    data.get("client_instance_id") or websocket_client_instance_id
+                )
+                if client_instance_id:
+                    data["client_instance_id"] = client_instance_id
+
+                # A generation is bound to the persisted message/thread it
+                # extends. Browser focus, active flags, and socket origin are
+                # never valid topology inputs.
+                if parent_id is None:
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
+                        {
+                            "type": "error",
+                            "error": "A generation requires an explicit persisted parent message",
+                        },
+                    )
+                    continue
+                generation_parent = await db.get_message(parent_id)
+                if not generation_parent or int(
+                    generation_parent.get("conversation_id") or 0
+                ) != int(conv_id):
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
+                        {
+                            "type": "error",
+                            "error": "The generation parent does not belong to this conversation",
+                        },
+                    )
+                    continue
+                generation_thread_id = generation_parent.get("loom_thread_id")
+                if not generation_thread_id:
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
+                        {
+                            "type": "error",
+                            "error": "The generation parent has no Loom thread identity",
+                        },
+                    )
+                    continue
+                requested_thread_id = data.get("loom_thread_id")
+                if requested_thread_id and str(requested_thread_id) != str(
+                    generation_thread_id
+                ):
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
+                        {
+                            "type": "error",
+                            "error": "The generation target changed threads before launch",
+                        },
+                    )
+                    continue
+                if client_instance_id:
+                    launch_cursor = await db.get_client_loom_cursor(
+                        conv_id, client_instance_id
+                    )
+                    if not launch_cursor or not (
+                        str(launch_cursor.get("thread_id")) == str(generation_thread_id)
+                        and str(launch_cursor.get("leaf_message_id")) == str(parent_id)
+                    ):
+                        await _ws_reply(
+                            websocket,
+                            conv_id,
+                            {
+                                "type": "error",
+                                "error": "This tab moved before the generation launched; no run was started",
+                            },
+                        )
+                        continue
+                data["loom_thread_id"] = generation_thread_id
 
                 # Check conversation mode to decide parallel policy
                 conv = await db.get_conversation(conv_id)
@@ -5259,7 +9437,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # here fixes a latent Braid bug — it was previously treated like
                 # Weave/OODA and allowed to spawn parallel CC subprocesses.)
                 is_subprocess_agent = mode in (
-                    "claude", "local", "hermes", "dream",
+                    "claude", "local",
                     "gemini", "codex", "goose", "umans", "openrouter",
                 )
                 parallel_same_checkout = bool(
@@ -5267,11 +9445,13 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 )
 
                 if parallel_same_checkout and action == "generate" and "parent_id" not in data:
-                    await websocket.send_json(
+                    await _ws_reply(
+                        websocket,
+                        conv_id,
                         {
                             "type": "error",
                             "error": "parent_id is required when parallel agents are enabled so Loom cannot launch on the wrong branch",
-                        }
+                        },
                     )
                     continue
 
@@ -5282,29 +9462,46 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                         for k, t in _active_generations.items()
                     )
                     if cc_busy:
-                        # Same client retrying → cancel old; different client → reject
+                        # A socket is transport, not run ownership. Use the
+                        # immutable launch client id for duplicate suppression;
+                        # reconnecting or focusing another socket cannot adopt
+                        # or cancel the run.
                         old_key = next(
                             k
                             for k, t in _active_generations.items()
                             if k[0] == conv_id and not t.done()
                         )
                         old_task = _active_generations[old_key]
-                        if websocket is getattr(old_task, "_origin_ws", None):
+                        same_launch_client = bool(
+                            client_instance_id
+                            and str(getattr(old_task, "_client_instance_id", ""))
+                            == str(client_instance_id)
+                        )
+                        if same_launch_client:
                             if action == "generate" and (
                                 parent_id is None or parent_id == old_key[1]
                             ):
                                 await _send_active_gen_state(websocket, conv_id)
                                 continue
-                            old_task.cancel()
-                            _active_generations.pop(old_key, None)
-                        else:
-                            await websocket.send_json(
-                                {
-                                    "type": "error",
-                                    "error": "An agent generation is already running on another branch. Wait for it to finish or cancel it first.",
-                                }
-                            )
-                            continue
+                        # A send/regenerate request is never an implicit cancel.
+                        # Releasing the task entry before provider teardown let a
+                        # second Codex process enter a non-parallel lane while the
+                        # first process was still editing the checkout.  Only the
+                        # explicit cancel action may stop a run, and its handler
+                        # keeps the lane occupied until provider cleanup finishes.
+                        await _ws_reply(
+                            websocket,
+                            conv_id,
+                            {
+                                "type": "error",
+                                "error": (
+                                    "An agent generation is already running in this "
+                                    "conversation. Queue a continuation or cancel the "
+                                    "active run explicitly before launching another."
+                                ),
+                            },
+                        )
+                        continue
                 elif action == "regenerate":
                     # Regenerate: cancel any existing gen on same parent
                     for k in [
@@ -5316,18 +9513,31 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     ]:
                         _active_generations.pop(k).cancel()
 
-                # Weave/OODA generate: allow parallel, even on same parent
-                _gen_seq += 1
-                gen_key = (conv_id, parent_id, _gen_seq)
-                data["_gen_id"] = (
-                    _gen_seq  # unique ID so client can filter parallel streams
+                # Weave/OODA generate: allow parallel, even on same parent.
+                # Durable queued continuations enter through this same helper.
+                generation_count = max(
+                    1, min(5, int(data.get("generation_count") or 1))
                 )
-                task = asyncio.create_task(
-                    _handle_generation_with_workspace_safety(websocket, conv_id, data)
-                )
-                task._origin_ws = websocket
-                task._gen_key = gen_key
-                _active_generations[gen_key] = task
+                if mode != "weave":
+                    generation_count = 1
+                for _ in range(generation_count):
+                    try:
+                        await _launch_generation_task(
+                            websocket, conv_id, data, client_instance_id
+                        )
+                    except GenerationLaneOccupied:
+                        await _ws_reply(
+                            websocket,
+                            conv_id,
+                            {
+                                "type": "error",
+                                "error": (
+                                    "This conversation's provider lane is already "
+                                    "occupied; the second launch was not started."
+                                ),
+                            },
+                        )
+                        break
 
     except WebSocketDisconnect:
         print(f"[WS] Client disconnected conv={conv_id}")
@@ -5335,12 +9545,26 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
         clients = _active_websockets.get(conv_id)
         if clients:
             clients.discard(websocket)
+            _event_router.unregister(websocket)
             if not clients:
                 _active_websockets.pop(conv_id, None)
     except Exception as e:
+        _event_router.unregister(websocket)
         print(f"[WS] Error conv={conv_id}: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_json({"type": "error", "error": str(e)})
+            await _ws_reply(websocket, conv_id, {"type": "error", "error": str(e)})
+
+
+async def _queued_generation_scheduler_loop():
+    """Recovery loop for reconnects, races, and server-restored queues."""
+    while True:
+        try:
+            await _dispatch_ready_queued_generations()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[QUEUE] Scheduler pass failed: {exc!r}")
+        await asyncio.sleep(1)
 
 
 def _model_family(model_id: str) -> str | None:
@@ -5444,11 +9668,90 @@ def _cc_result_error_detail(result_info: dict) -> str:
     """Return the best human-readable CC error detail without treating it as output."""
     if not isinstance(result_info, dict):
         return ""
-    for key in ("error", "result_text"):
+    # A successful result's prose is never an error message, even if an
+    # earlier tool/event failed. Otherwise the whole answer is duplicated
+    # into a synthetic interruption note and poisons session recovery.
+    keys = ("error", "result_text") if result_info.get("is_error") else ("error",)
+    for key in keys:
         value = result_info.get(key)
+        if isinstance(value, dict):
+            value = value.get("message") or json.dumps(value)
+        elif isinstance(value, list):
+            value = "\n".join(str(item) for item in value)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _failed_session_attestation(attestation, result, session_id, mode, error):
+    """Keep failure provenance separate from harness/model verification."""
+    record = dict(attestation or {})
+    result = result or {}
+    record["session_recovery"] = recovery_evidence(
+        session_id, mode, error,
+        terminal_confirmed=(
+            result.get("terminal_confirmed") is True
+            and bool(session_id)
+            and result.get("session_id") == session_id
+        ),
+        error_code=result.get("error_code"),
+    )
+    return record
+
+
+async def _recheck_completed_codex_boundary(branch, decision, model, project_dir):
+    """Recover a falsely failed *nearest* boundary using native status evidence.
+
+    No source row is rewritten, no older session is searched for, and neither
+    the browser nor assistant prose can certify completion. A newer successful
+    native turn must belong to this immutable snapshot and postdate the draft.
+    """
+    if decision.reason != "assistant_failed":
+        return decision
+    boundary = next((m for m in branch if m.get("id") == decision.message_id), {})
+    if boundary.get("cc_session_mode") != "codex" or not boundary.get("cc_session_id"):
+        return decision
+    try:
+        attestation = boundary.get("model_attestation") or {}
+        if isinstance(attestation, str):
+            attestation = json.loads(attestation)
+        evidence = attestation.get("session_recovery") or {}
+        session_id = boundary["cc_session_id"]
+        created = float(boundary.get("created_at") or 0)
+        if (attestation.get("status") != "verified" or evidence.get("terminal_confirmed") is not True
+                or evidence.get("session_id") != session_id or evidence.get("session_mode") != "codex"
+                or created <= 0):
+            return decision
+        native = await codex_client.read_codex_last_turn(session_id, project_dir)
+        if (not native or not native.get("id") or native.get("status") != "completed" or native.get("error")
+                or float(native.get("completedAt") or 0) < created):
+            return decision
+        if (float(native.get("startedAt") or 0) < int(created)
+                or float(native.get("completedAt") or 0) < float(native.get("startedAt") or 0)):
+            return decision
+        candidate = select_resume_session([{**boundary, "turn_lifecycle_state": "completed"}],
+                                          "codex", target_model=model)
+        if candidate.can_resume:
+            return ResumeDecision(candidate.session_id, "verified_completed_recovery", decision.message_id)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return decision
+
+
+async def _handoff_payload_budget(branch, model, harness, *, backend=None):
+    # An early compaction decision; adapters recheck their final rendered
+    # payload after wrappers/attachments. Never call this for native resumes.
+    from replay_budget import assess_payload
+    from loom_agent_prompt import load_loom_agent_prompt
+    budget = await assess_payload(
+        _build_claude_history_prompt(branch, None), model=model, harness=harness,
+        instructions=load_loom_agent_prompt(), backend=backend,
+        image_count=sum(len(_parse_image_paths(m.get("image_path"))) for m in branch if m.get("image_path")),
+    )
+    # A guessed remote limit must not trigger lossy source compaction. Codex
+    # can expose a larger configured window when its app-server initializes;
+    # the adapter's final admission check remains authoritative for this run.
+    return None if budget.context_source.startswith("conservative") else budget
 
 
 def _cc_has_streamed_output(full_text: str, content_blocks: list[dict]) -> bool:
@@ -5505,7 +9808,7 @@ def _append_cc_interrupt_note(
         )
         if n_tools:
             note = (
-                f"\n\n---\n[Turn interrupted: agent exited after {n_tools} tool call(s) "
+                f"\n\n---\n[Turn interrupted: agent stopped after {n_tools} tool call(s) "
                 f"without producing a final response - {detail}]"
             )
         else:
@@ -5518,6 +9821,34 @@ def _append_cc_interrupt_note(
         content_blocks.append({"type": "text", "text": updated})
     else:
         _append_cc_text_block(content_blocks, note)
+    return updated
+
+
+def _append_provider_failure_note(
+    full_text: str,
+    content_blocks: list[dict],
+    provider: str,
+    detail: str,
+) -> str:
+    """Preserve useful partial work while making terminal failure explicit."""
+    provider_label = str(provider or "Provider").strip()
+    error_detail = str(detail or "provider exited unexpectedly").strip()
+    note = f"\n\n---\n[{provider_label} turn failed: {error_detail}]"
+    if full_text:
+        updated = full_text.rstrip() + note
+    else:
+        n_tools = sum(
+            1
+            for block in content_blocks or []
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        )
+        if n_tools:
+            note = (
+                f"\n\n---\n[{provider_label} turn failed after {n_tools} tool call(s) "
+                f"without a final response: {error_detail}]"
+            )
+        updated = note.strip()
+    _append_cc_text_block(content_blocks, note if full_text or content_blocks else updated)
     return updated
 
 
@@ -5543,16 +9874,35 @@ async def _patch_marker_with_summary(conv_id: int, marker_id: int, new_session: 
             (new_content, marker_id),
         )
         await _dbh.commit()
+        # The summary itself is durable message content. Never broadcast it to
+        # every window in the conversation; send metadata only so a window
+        # already rendering this marker can refetch its exact cursor branch.
         await _ws_send(
             conv_id,
-            {
-                "type": "compact_summary_ready",
-                "marker_id": marker_id,
-                "summary": summary,
-            },
+            {"type": "branch_content_changed", "message_id": marker_id},
         )
     except Exception as e:
         print(f"[Handoff] Failed to patch marker {marker_id} with summary: {e}")
+
+
+def _compactable_anthropic_source(
+    branch: list[dict],
+) -> tuple[ResumeDecision, dict | None]:
+    """Return the nearest assistant only when it is a resumable Claude turn.
+
+    Automatic handoff compaction is a Claude-native operation. In particular,
+    a long Codex or Goose branch can continue in its own native session without
+    replaying Loom history, so its cumulative branch size is irrelevant here.
+    """
+    decision = select_resume_session(branch, "claude")
+    source_message = next(
+        (msg for msg in branch if msg.get("id") == decision.message_id),
+        None,
+    )
+    source_model = (source_message or {}).get("cc_model_used") or ""
+    if not decision.can_resume or not model_context.is_anthropic(source_model):
+        return decision, None
+    return decision, source_message
 
 
 async def _run_compact_handoff(
@@ -5577,13 +9927,9 @@ async def _run_compact_handoff(
     # an older Claude session after another harness has spoken would create a
     # summary that silently omits the intervening turn.
     branch = await db.get_branch_to_root(parent_leaf_id)
-    resume_decision = select_resume_session(branch, "claude")
-    source_message = next(
-        (msg for msg in branch if msg.get("id") == resume_decision.message_id),
-        None,
-    )
+    resume_decision, source_message = _compactable_anthropic_source(branch)
     prev_model = (source_message or {}).get("cc_model_used") or ""
-    if not resume_decision.can_resume or not model_context.is_anthropic(prev_model):
+    if source_message is None:
         await _ws_send(
             conv_id,
             {
@@ -5685,7 +10031,10 @@ async def _run_compact_handoff(
                 )
 
     if marker_id and new_session:
-        asyncio.create_task(_patch_marker_with_summary(conv_id, marker_id, new_session))
+        _spawn_background_task(
+            _patch_marker_with_summary(conv_id, marker_id, new_session),
+            f"compact marker summary {marker_id}",
+        )
         await _ws_send(
             conv_id,
             {"type": "status", "text": f"Handoff complete — continuing on {target_model}"},
@@ -5700,198 +10049,87 @@ async def _run_compact_handoff(
 
 
 async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
-    """Trigger manual CC compaction via /compact on an existing session.
+    """Create a shared checkpoint, without mutating a native session or cursor.
 
-    Finds the most recent CC session ID for the conversation, then launches
-    a CC subprocess with `-p "/compact" --resume <session_id>` and streams
-    compact_boundary events back to the UI.
+    Called through generation admission so shutdown/cancel/serial ownership are
+    identical to other agent work. Publication rechecks the requesting cursor.
     """
+    parent_id = data.get("parent_id")
+    thread_id = str(data.get("loom_thread_id") or "")
+    envelope = {"parent_id": parent_id, "loom_thread_id": thread_id, "checkpoint_only": True}
+    success = False
+
+    async def reply(event):
+        if websocket is not None:
+            try:
+                await _ws_reply(websocket, conv_id, {**event, **envelope})
+                return
+            except (WebSocketDisconnect, RuntimeError, OSError):
+                pass  # A browser disconnect cannot abort durable preparation.
+        await _ws_send(conv_id, {**event, **envelope})
+
     try:
         conv = await db.get_conversation(conv_id)
-        if not conv:
-            await _ws_send(conv_id, {"type": "error", "error": "Conversation not found"})
-            return
+        if not conv or conv.get("mode") not in _AGENT_WORKSPACE_MODES:
+            raise ValueError("Manual checkpoints require an agent conversation; Weave is unchanged")
+        if conv.get('backstage_parent_id'):
+            raise ValueError("Specialized operator compaction is not part of this checkpoint operation")
+        client_id = str(data.get("client_instance_id") or "")
+        cursor = await db.get_client_loom_cursor(conv_id, client_id) if client_id else None
+        parent = await db.get_message(parent_id) if parent_id is not None else None
+        if not parent or parent.get("conversation_id") != conv_id:
+            raise ValueError("The compaction parent is not in this conversation")
+        if not cursor or not (
+            cursor["thread_id"] == thread_id == parent.get("loom_thread_id")
+            and cursor["leaf_message_id"] == parent_id
+            and cursor["revision"] == data.get("cursor_revision")
+        ):
+            raise ValueError("This tab moved before compaction started; retry from the selected branch")
+        # Never summarize a currently streaming/unfinished draft. A parallel
+        # branch may proceed independently because activation changes no source.
+        if parent.get("role") == "assistant" and (
+            not str(parent.get("content") or "").strip()
+            or parent.get("turn_lifecycle_state") in {"running", "preparing", "streaming"}
+        ):
+            raise ValueError("Wait for or interrupt the selected turn before compacting")
+        from context_runtime import manual_checkpoint
 
-        mode = conv.get("mode", "weave") if conv else "weave"
-        if mode == "hermes":
-            await _ws_send(conv_id, {"type": "error", "error": "/compact is not supported in Hermes mode yet"})
-            return
-        if mode != "claude":
-            await _ws_send(conv_id, {"type": "error", "error": "/compact is only available in Claude mode"})
-            return
+        async def status(text):
+            await reply({"type": "status", "text": text})
 
-        # Resolve from the active branch, never from the conversation-global
-        # cache: that cache may point to a session from before a provider switch.
-        session_id = None
-        resume_reason = "empty_branch"
-        leaf = await db.get_active_leaf(conv_id)
-        if leaf:
-            branch = await db.get_branch_to_root(leaf["id"])
-            resume_decision = select_resume_session(branch, "claude")
-            session_id = resume_decision.session_id
-            resume_reason = resume_decision.reason
-
-        if not session_id:
-            await _ws_send(
-                conv_id,
-                {
-                    "type": "error",
-                    "error": (
-                        "No compatible nearest Claude session to compact "
-                        f"({resume_reason}); continue once to rebuild from Loom history"
-                    ),
-                },
-            )
-            return
-
-        project_dir = conv.get("project_dir") or "."
-        cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
-        cc_effort = conv.get("cc_effort") or "high"
-
-       # Determine provider (same logic as _handle_claude_generation).
-        # Pinned full IDs (e.g. `claude-opus-4-6`) count as Anthropic too —
-        # routed through model_context.is_anthropic to keep the shape in sync.
-        is_anthropic = model_context.is_anthropic(cc_model)
-        is_llama = cc_model.endswith(".gguf")
-        is_umans = is_umans_model(cc_model)
-        use_llama = conv.get("_use_llama", False) or is_llama
-        use_umans = conv.get("_use_umans", False) or is_umans
-        if is_anthropic or is_gemini_model(cc_model) or is_codex_model(cc_model):
-            use_llama = False
-            use_umans = False
-        if use_umans:
-            use_llama = False
-
-        await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
-
-        # Launch CC with /compact as the prompt, resuming the existing session
-        # No --fork-session: we want to compact the session in place
-        compact_prompt = data.get("focus") or ""
-        prompt = f"/compact {compact_prompt}".strip() if compact_prompt else "/compact"
-
-        server_port = int(os.environ.get("LOOM_PORT", 3000))
-        proc, event_stream = await claude_client.run_claude(
-            prompt=prompt,
-            cwd=project_dir,
-            conv_id=conv_id,
-            server_port=server_port,
-            model=cc_model,
-            requested_model=cc_model,
-            effort=cc_effort,
-            resume_session_id=session_id,
-            fork_session=False,  # compact in place, don't fork
-            use_llama=use_llama,
-            use_umans=use_umans,
+        branch = await db.get_branch_to_root(parent_id)
+        branch_ids = {message["id"] for message in branch}
+        if any(row.get("draft_msg_id") in branch_ids for row in await db.list_active_generations()):
+            raise ValueError("The selected branch still has an active provider; interrupt or wait before compacting")
+        await status("Preparing a shared branch checkpoint...")
+        checkpoint = await manual_checkpoint(branch, cursor, status=status, focus=data.get("focus") or "")
+        success = True
+        await status(f"Checkpoint saved for {len(checkpoint.covered_ids)} messages; next turn will use it")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        asyncio.current_task()._generation_terminal_override = "error"
+        # Network exceptions may contain URLs or payload details. Keep those out
+        # of browser/log output; known validation errors are deliberately safe.
+        detail = str(exc) if isinstance(exc, ValueError) else (
+            "Configured local checkpoint backend unavailable or failed; history and native sessions are unchanged"
         )
-
-        # Get the current leaf — compact marker becomes its child,
-        # forking the conversation at this point
-        leaf = await db.get_active_leaf(conv_id)
-        compact_parent_id = leaf["id"] if leaf else None
-
-        got_compact = False
-        async for evt in event_stream:
-            etype = evt.get("type", "")
-
-            if etype == "compact_boundary":
-                got_compact = True
-                pre_tokens = evt.get("pre_tokens")
-                token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
-                content = f"[CC context compactified (manual){token_info}]"
-                compact_session = evt.get("session_id", "") or ""
-                if compact_session:
-                    await db.update_conversation_fields(
-                        conv_id, claude_session_id=compact_session
-                    )
-                marker = await db.add_message(
-                    conv_id, "system",
-                    content,
-                    parent_id=compact_parent_id,
-                    is_active=True,
-                    cc_session_id=compact_session or None,
-                )
-                # Switch active branch to the compact marker
-                await db.set_active_branch(conv_id, marker["id"])
-                await _ws_send(conv_id, {
-                    "type": "compact_boundary",
-                    "trigger": "manual",
-                    "pre_tokens": pre_tokens,
-                    "marker_id": marker["id"],
-                })
-                if compact_session:
-                    asyncio.create_task(
-                        _patch_marker_with_summary(conv_id, marker["id"], compact_session)
-                    )
-
-            elif etype == "result":
-                new_session_id = evt.get("session_id", "")
-                if new_session_id:
-                    await db.update_conversation_fields(
-                        conv_id, claude_session_id=new_session_id
-                    )
-                cost = evt.get("cost_usd", 0)
-                if cost:
-                    old_cost = conv.get("total_cost_usd") or 0
-                    await db.update_conversation_fields(
-                        conv_id, total_cost_usd=old_cost + cost
-                    )
-
-            elif etype == "api_retry":
-                attempt = evt.get("attempt", 1)
-                max_retries = evt.get("max_retries", 5)
-                error = evt.get("error", "unknown")
-                await _ws_send(conv_id, {
-                    "type": "status",
-                    "text": f"API retry {attempt}/{max_retries} ({error})...",
-                })
-
-        if got_compact:
-            await _ws_send(conv_id, {"type": "status", "text": "Context compacted successfully"})
-        else:
-            await _ws_send(conv_id, {"type": "status", "text": "Compaction completed (no boundary event received)"})
-        # Clear the status bar and trigger a message reload to show the new branch
-        await asyncio.sleep(1.5)
-        await _ws_send(conv_id, {"type": "compact_done"})
-
-    except Exception as e:
-        print(f"[Compact] Error: {e}")
-        import traceback; traceback.print_exc()
-        await _ws_send(conv_id, {"type": "status", "text": f"Compaction failed: {e}"})
-        await asyncio.sleep(2)
-        await _ws_send(conv_id, {"type": "compact_done"})
-        await _ws_send(conv_id, {"type": "error", "error": f"Compaction failed: {e}"})
+        await reply({"type": "error", "error": detail})
+    finally:
+        await reply({"type": "compact_done", "success": success})
 
 
 def is_codex_model(model: str) -> bool:
-    if not model:
-        return False
-    ml = model.lower()
-    return (
-        ml.startswith("codex")
-        or ml.startswith("gpt-5")
-        or ml == "gpt-4o"
-        or ml.startswith("o3")
-        or ml.startswith("o4")
-    )
+    return model_registry.resolve(model).get("mode") == "codex"
 
 
 def is_gemini_model(model: str) -> bool:
-    if not model:
-        return False
-    ml = model.lower()
-    return ml.startswith("gemini") or model in (
-        "Claude Sonnet 4.6 (Thinking)",
-        "Claude Opus 4.6 (Thinking)",
-        "GPT-OSS 120B (Medium)"
-    )
+    return model_registry.resolve(model).get("mode") == "gemini"
 
 
 def is_umans_model(model: str) -> bool:
     """Check if model ID is an Umans AI model (e.g. umans-coder, umans-flash)."""
-    if not model:
-        return False
-    ml = model.lower()
-    return ml.startswith("umans-")
+    return model_registry.resolve(model).get("mode") == "umans"
 
 
 def is_goose_model(model: str) -> bool:
@@ -6007,38 +10245,13 @@ async def _ensure_dream_shim_running() -> tuple[bool, str]:
     return False, f"Dream shim started but did not answer at {url}/health"
 
 
-# Providers with a verified NROL operator lockdown port. Extended as each
-# port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
 # parity". "claude" covers the whole claude_client launch family (incl.
 # local llama, which reuses the same CLI flags and tool stripping); "umans"
 # is its own entry because it is a distinct (if trivial) port — umans models
 # also launch through claude_client but are tracked separately so the parity
 # matrix stays an explicit signpost for future debuggers.
-NROL_OPERATOR_PROVIDERS = {"claude", "codex", "gemini", "umans"}
 
 
-def _nrol_operator_block_reason(cc_model: str) -> str | None:
-    """Refuse operator traffic on providers without a lockdown port.
-
-    The nrol-ao MCP commit gate is provider-agnostic, but an unported
-    provider runs with its full default toolset (shell, file writes) in the
-    operator workspace — the side-channel the lockdown exists to close.
-    """
-    provider = (
-        "gemini" if is_gemini_model(cc_model)
-        else "codex" if is_codex_model(cc_model)
-        else "goose" if is_goose_model(cc_model)
-        else "dream" if is_dream_claude_model(cc_model)
-        else "umans" if is_umans_model(cc_model)
-        else "claude"
-    )
-    if provider in NROL_OPERATOR_PROVIDERS:
-        return None
-    return (
-        f"NROL operator mode is not ported to provider '{provider}' yet "
-        f"(model {cc_model!r}); pick a supported model instead. See "
-        'mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator parity".'
-    )
 
 
 def models_match(a: str, b: str) -> bool:
@@ -6091,6 +10304,70 @@ def _normalize_turn_model_attestation(attestation: dict) -> dict:
     return normalized
 
 
+def _attach_preparation_provenance(attestation: dict, task=None) -> dict:
+    """Attach every preparatory inference to the visible turn identity.
+
+    A provider attestation proves only the user-facing generation.  It must not
+    turn the whole turn green while a hidden preparation call used a different
+    or unverified model.  Accepted preparation calls already contain the
+    destination route and provider-attested model; preserve that chain here and
+    fail the aggregate status closed when it disagrees with the selected model.
+    """
+    candidate = dict(attestation)
+    task = task or asyncio.current_task()
+    trace = getattr(task, "_context_trace", None) if task else None
+    raw_calls = (
+        trace.get("preparation_attempts") or trace.get("preparation_calls")
+        if isinstance(trace, dict) else None
+    )
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return candidate
+
+    selected = (
+        candidate.get("requested_model")
+        or candidate.get("launch_model")
+        or candidate.get("effective_model")
+    )
+    preparation = []
+    chain_verified = True
+    for index, raw in enumerate(raw_calls, 1):
+        if not isinstance(raw, dict):
+            chain_verified = False
+            continue
+        route = raw.get("route") if isinstance(raw.get("route"), dict) else {}
+        route_model = route.get("model")
+        attested_model = raw.get("attested_model")
+        accepted = raw.get("accepted") is True
+        matches = bool(
+            selected and route_model and attested_model
+            and models_match(str(selected), str(route_model))
+            and models_match(str(route_model), str(attested_model))
+        )
+        chain_verified = chain_verified and accepted and matches
+        preparation.append({
+            "phase": "context_preparation",
+            "call": index,
+            "harness": route.get("harness"),
+            "requested_model": route_model,
+            "effective_model": attested_model,
+            "backend": route.get("backend"),
+            "status": "verified" if accepted and matches else "unverified",
+        })
+
+    candidate["preparation"] = {
+        "call_count": len(raw_calls),
+        "operation_id": trace.get("operation_id") if isinstance(trace, dict) else None,
+        "status": "verified" if chain_verified and len(preparation) == len(raw_calls) else "unverified",
+        "calls": preparation,
+    }
+    if not chain_verified or len(preparation) != len(raw_calls):
+        candidate["status"] = "unverified"
+        candidate["identity_warning"] = (
+            "One or more context-preparation calls were not verified as the selected destination model"
+        )
+    return candidate
+
+
 async def _record_turn_model_attestation(
     conv_id: int,
     draft_msg_id: int,
@@ -6101,7 +10378,15 @@ async def _record_turn_model_attestation(
     """Persist and broadcast the strongest model identity evidence for a turn."""
     if not isinstance(attestation, dict):
         return None
-    candidate = _normalize_turn_model_attestation(attestation)
+    candidate = _attach_preparation_provenance(
+        _normalize_turn_model_attestation(attestation)
+    )
+    payload_budget = getattr(asyncio.current_task(), "_replay_budget", None)
+    if payload_budget:
+        candidate["payload_budget"] = payload_budget
+    context_plan = getattr(asyncio.current_task(), "_context_plan", None)
+    if context_plan:
+        candidate["context_plan"] = context_plan
     existing = None
     message = await db.get_message(draft_msg_id)
     if message and message.get("model_attestation"):
@@ -6160,14 +10445,23 @@ def _model_attestation_status_text(attestation: dict) -> str:
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     """Handle a generation request over WebSocket — routes by conversation mode."""
     parent_id = data.get("parent_id")
-    if parent_id is not None:
-        parent_msg = await db.get_message(parent_id)
-        if not parent_msg or parent_msg.get("conversation_id") != conv_id:
-            print(f"[WS-WARN] parent_id {parent_id} does not belong to conv_id {conv_id}! Fallback to active leaf.")
-            leaf = await db.get_active_leaf(conv_id)
-            data["parent_id"] = leaf["id"] if leaf else None
+    if parent_id is None:
+        raise ValueError("Generation requires an explicit persisted parent message")
+    parent_msg = await db.get_message(parent_id)
+    if not parent_msg or int(parent_msg.get("conversation_id") or 0) != int(conv_id):
+        raise ValueError("Generation parent does not belong to this conversation")
+    parent_thread_id = parent_msg.get("loom_thread_id")
+    if not parent_thread_id:
+        raise ValueError("Generation parent has no Loom thread identity")
+    if data.get("loom_thread_id") and str(data["loom_thread_id"]) != str(
+        parent_thread_id
+    ):
+        raise ValueError("Generation thread identity does not match its parent")
+    data["loom_thread_id"] = parent_thread_id
 
     conv = await db.get_conversation(conv_id)
+    if reason := model_registry.retirement_reason((conv or {}).get("mode"), data.get("cc_model") or (conv or {}).get("cc_model")):
+        raise HTTPException(410, reason)
     if conv and conv.get("local_model") and config.llama_model:
         local_model = conv["local_model"]
         if models_match(local_model, config.llama_model):
@@ -6190,11 +10484,6 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     mode = conv.get("mode", "weave") if conv else "weave"
     if mode in {"claude", "codex", "gemini", "openrouter", "umans", "goose"}:
         requested_cc_model = data.get("cc_model") or conv.get("cc_model") or ""
-        if mode == "goose":
-            goose_routed_model = _goose_selector_for_model(requested_cc_model)
-            if goose_routed_model:
-                requested_cc_model = goose_routed_model
-                data["cc_model"] = goose_routed_model
         target_mode = _mode_for_cc_model(requested_cc_model)
         if target_mode is None:
             await _ws_send(
@@ -6216,33 +10505,10 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
             conv["mode"] = target_mode
             conv["cc_model"] = requested_cc_model
             mode = target_mode
-            await db.update_conversation_fields(
-                conv_id, mode=target_mode, cc_model=requested_cc_model
-            )
-
-    # ── Hermes-class routing: Prometheus (incognito) vs attendants (ensouled) ──
-    # mode "hermes" → llama attendant; mode "dream" → dream attendant. Both are
-    # ensouled (carry a soul, model-bound). A conversation-level `incognito` flag
-    # overrides either to Prometheus (incognito, always-warm, cloud-fallback) —
-    # no soul, no memory, always functional. An ensouled turn whose model is down
-    # REFUSES with a Loom-specific error: no generation, no silent fallback to
-    # Prometheus (silent de-souling mid-conversation is the exact contamination
-    # the design exists to prevent). The user must toggle incognito explicitly
-    # to take the always-functional no-soul path.
-    if mode in ("hermes", "dream"):
-        if conv.get("incognito"):
-            await _handle_prometheus_generation(websocket, conv_id, conv, data)
-            return
-        # Ensouled: refuse if the bound model server is down. ONLY probe llama
-        # here — llama-server answers /v1/models instantly even under load.
-        # The dream sidecar is single-GPU-serialized: a /health probe during
-        # cold-load or generation blocks behind the GPU lock, adding seconds
-        # to TTFT (the 2s→12s regression) AND false-negatives (busy ≠ down).
-        # Dream's own request fails fast if the sidecar is truly down, so no
-        # pre-probe is needed — the refuse path is llama-only.
-        if mode == "hermes" and not await _probe_llama_live():
-            await _refuse_ensouled_model_down(websocket, conv_id, "llama", config.llama_model)
-            return
+            if not _truthy_setting(conv.get("parallel_agents_enabled")):
+                await db.update_conversation_fields(
+                    conv_id, mode=target_mode, cc_model=requested_cc_model
+                )
 
     if mode in ("claude", "gemini", "codex", "openrouter"):
         await _handle_claude_generation(websocket, conv_id, conv, data)
@@ -6258,14 +10524,6 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     if mode == "umans":
         await _handle_umans_generation(websocket, conv_id, conv, data)
-        return
-
-    if mode == "hermes":
-        await _handle_hermes_generation(websocket, conv_id, conv, data)
-        return
-
-    if mode == "dream":
-        await _handle_dream_generation(websocket, conv_id, conv, data)
         return
 
     # NOTE: A dream-model short-circuit used to live here, routing weave convs
@@ -6297,19 +10555,31 @@ async def _handle_claude_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
     """Handle Claude Code CLI generation with session resume support."""
+    if asyncio.current_task() is not None:
+        asyncio.current_task()._context_plan = None
+        asyncio.current_task()._context_replay_region = ""
     print(f"[CC-GEN] Entered: conv_id={conv_id}, action={data.get('action')}, parent_id={data.get('parent_id')}, cc_model={data.get('cc_model')}, _use_llama={conv.get('_use_llama')}")
     proc = None
     is_gemini = False
     is_codex = False
+    draft_msg_id = None
+    full_text = ""
+    content_blocks: list[dict] = []
+    new_session_id = ""
+    resume_session_id = None
+    cc_session_mode = ""
+    actual_model = ""
+    cc_model = ""
+    model_attestation = None
+    _gen_start_t = _time.time()
+    first_token_ms = None
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
         _describe_msg_id = None
-        draft_msg_id = None
 
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
+        if parent_id is None:
+            raise ValueError("Claude generation requires an explicit parent message")
 
         project_dir = conv.get("project_dir") or "."
         canvas_enabled = bool(conv.get("canvas_enabled"))
@@ -6347,7 +10617,7 @@ async def _handle_claude_generation(
             and data["cc_permission_mode"] != conv.get("cc_permission_mode")
         ):
             generation_settings["cc_permission_mode"] = cc_permission_mode
-        if generation_settings:
+        if generation_settings and not _truthy_setting(conv.get("parallel_agents_enabled")):
             await db.update_conversation_fields(conv_id, **generation_settings)
 
         # Identify provider based on model name. Accepts aliases (sonnet/opus/
@@ -6402,46 +10672,12 @@ async def _handle_claude_generation(
 
         # Operator conversations only launch on providers with a ported
         # lockdown — the model picker can otherwise route a locked-down conv
-        # to a client that knows nothing about nrol_operator.
-        if conv.get("nrol_operator"):
-            blocked = _nrol_operator_block_reason(cc_model)
-            if blocked:
-                await _ws_send(conv_id, {"type": "error", "error": blocked})
-                return
+        pass
 
         if conv.get("mode") != target_mode:
             print(f"[CC] Updating conversation {conv_id} mode from {conv.get('mode')} to {target_mode}")
             await db.update_conversation_fields(conv_id, mode=target_mode)
             conv["mode"] = target_mode
-
-        # --- Compact-handoff gate ---
-        # Fast check: if the target model is a 1M Anthropic, skip. Otherwise
-        # sum the branch's token estimate and compare against a per-provider
-        # threshold. If we trip, run /compact on the latest 1M session and fork
-        # a new branch under a compact marker — leaving the old branch intact.
-        handoff_forced_session = None
-        if (
-            action == "generate"
-            and parent_id
-            and not use_dream
-            and not model_context.is_1m_anthropic(cc_model)
-        ):
-            branch_tokens = await db.sum_branch_tokens(parent_id)
-            if model_context.needs_handoff(cc_model, branch_tokens):
-                threshold = model_context.handoff_threshold(cc_model)
-                await _ws_send(
-                    conv_id,
-                    {
-                        "type": "status",
-                        "text": f"Branch is {branch_tokens:,} tokens (> {threshold:,} for {cc_model}) — preparing handoff...",
-                    },
-                )
-                marker_id, new_session, new_parent = await _run_compact_handoff(
-                    conv_id, conv, parent_id, cc_model, cc_effort, project_dir
-                )
-                if marker_id:
-                    parent_id = new_parent or marker_id
-                    handoff_forced_session = new_session
 
         # --- Session resume logic ---
         # Every turn uses --resume + --fork-session. Each assistant message
@@ -6452,28 +10688,25 @@ async def _handle_claude_generation(
         resume_session_id = None
         fork_session = True  # always fork — every turn creates a new snapshot
         use_resume = False
+        resume_reason = "no_prior_session"
+        continuity_decision = ResumeDecision(None, "no_assistant_session")
         branch = []
-
-        # Group models that use Claude Code sessions
-        is_cc_compatible = not (is_gemini or is_codex)
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
 
-        if handoff_forced_session and is_cc_compatible:
-            # CC-compatible handoff (Anthropic/Local/Umans) — resume the fresh compacted
-            # session rather than walking back to a pre-compact session that
-            # the target window can't hold.
-            resume_session_id = handoff_forced_session
-            use_resume = True
-            print(f"[CC] Handoff resume: id={resume_session_id} model={cc_model}")
-        elif handoff_forced_session:
-            # Cross-provider handoff (Gemini / Codex) — fall through to history
-            # replay, which will truncate at the compact marker.
-            print(f"[CC] Handoff replay for {cc_model}")
-        elif parent_id and branch:
-            resume_decision = select_resume_session(branch, cc_session_mode)
+        if parent_id and branch:
+            resume_decision = select_resume_session(branch, cc_session_mode, target_model=cc_model)
+            if is_codex:
+                resume_decision = await _recheck_completed_codex_boundary(
+                    branch, resume_decision, cc_model, project_dir,
+                )
+            if not conv.get('backstage_parent_id'):
+                from context_runtime import respect_manual_boundary
+                resume_decision = await respect_manual_boundary(branch, resume_decision)
+            continuity_decision = resume_decision
             resume_session_id = resume_decision.session_id
+            resume_reason = resume_decision.reason
             if not resume_session_id:
                 print(
                     f"[CC] Native session rebuild: reason={resume_decision.reason} "
@@ -6494,30 +10727,22 @@ async def _handle_claude_generation(
             # so agy gets prior turns as text. resume_session_id/use_resume
             # stay set so the client override (gemini_client.py:489) still
             # fires and logs. See [[agy-operator-turn2-no-response]].
-            if is_gemini and conv.get("nrol_operator"):
-                print(f"[CC] agy-operator turn: rebuilding full history as text "
-                      f"(fresh-conv launch has no resume memory)")
-                if parent_id:
-                    branch = await db.get_branch_to_root(parent_id)
-                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-            else:
-                # When resuming, we only need the latest user message — CC has the rest
-                # Find the last user message in the branch
-                latest_user_content = ""
-                if branch:
-                    for msg in reversed(branch):
-                        if msg["role"] == "user":
-                            latest_user_content = msg["content"]
-                            break
+            latest_user_content = ""
+            if branch:
+                for msg in reversed(branch):
+                    if msg["role"] == "user":
+                        latest_user_content = msg["content"]
+                        break
 
-                prompt = latest_user_content or "(continue)"
+            prompt = latest_user_content or "(continue)"
         else:
             # No session resume — build full history from branch
             print(f"[CC] No session resume, building full history from branch, parent_id={parent_id}, is_gemini={is_gemini}")
             if parent_id:
                 branch = await db.get_branch_to_root(parent_id)
                 print(f"[CC] Retrieved branch with {len(branch)} messages")
-                prompt = _build_claude_history_prompt(branch, project_dir)
+                prompt = await _prepare_agent_handoff(branch, conv, cc_model, cc_session_mode,
+                                                      project_dir=project_dir)
                 if not prompt:
                     if is_gemini or is_codex:
                         print(f"[CC] WARNING: Empty prompt from branch for Gemini/Codex!")
@@ -6531,31 +10756,23 @@ async def _handle_claude_generation(
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
 
-        # Ensure canvas CLAUDE.md, CANVAS_GUIDE.md, and .gitignore exist if canvas is enabled
-        if canvas_enabled and project_dir != ".":
-            canvas_dir = Path(project_dir) / "canvas"
-            canvas_dir.mkdir(parents=True, exist_ok=True)
-            gitignore = canvas_dir / ".gitignore"
-            if not gitignore.exists():
-                gitignore.write_text(
-                    "# Canvas output is generated per-conversation — don't commit it\n"
-                    "*\n"
-                    "!.gitignore\n",
-                    encoding="utf-8",
-                )
-            canvas_claude_md = canvas_dir / "CLAUDE.md"
-            if not canvas_claude_md.exists():
-                canvas_claude_md.write_text(
-                    CANVAS_CLAUDE_MD,
-                    encoding="utf-8",
-                )
-            canvas_guide = canvas_dir / "CANVAS_GUIDE.md"
-            guide_source = Path(__file__).parent / "CANVAS_GUIDE.md"
-            if not canvas_guide.exists() and guide_source.is_file():
-                canvas_guide.write_text(
-                    guide_source.read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
+        if not conv.get('backstage_parent_id'):
+            if use_resume:
+                from context_runtime import renew_native_retrieval
+                prompt = await renew_native_retrieval(prompt, branch)
+            prompt = add_continuity_notice(
+                prompt,
+                continuity_decision,
+                branch,
+                cc_session_mode,
+                target_model=cc_model,
+            )
+
+        session_continuity = {
+            "status": "forked" if use_resume else "rebuilt",
+            "reason": resume_reason,
+            "source_session_id": resume_session_id if use_resume else None,
+        }
 
         # Retrieve describe context from DB (vision model only, never sent to chat model)
         _describe_context = None
@@ -6673,24 +10890,11 @@ async def _handle_claude_generation(
                     _has_img = any(note.startswith("[Image") for note in file_notes)
                     _hdr = "[Attached files — image descriptions already provided, do NOT read image files.]" if _has_img else f"[User attached {len(file_notes)} file(s). See attached_files/ for the files.]"
                     prompt += f"\n\n{_hdr}\n{files_str}"
-        # Create draft message in DB immediately so it survives navigation/restarts.
-        # If parent already has an empty assistant child (stale draft), reuse it.
+        # Create a newly authorized draft for this exact generation. Never
+        # revive an old empty assistant child: it belongs to an earlier run
+        # and cannot prove ownership of this provider lane.
         _draft_parent = _describe_msg_id or parent_id
-        draft_msg = None
-        if _draft_parent:
-            existing_children = await db.get_children(_draft_parent)
-            for child in existing_children:
-                if (
-                    child["role"] == "assistant"
-                    and not child.get("content", "").strip()
-                ):
-                    draft_msg = child
-                    print(f"[CC] Reusing stale draft msg {child['id']}")
-                    break
-        if not draft_msg:
-            draft_msg = await db.add_message(
-                conv_id, "assistant", "", parent_id=_draft_parent
-            )
+        draft_msg = await _create_generation_draft(conv_id, conv, _draft_parent)
         draft_msg_id = draft_msg["id"]
         await db.update_message_content(draft_msg_id, cc_model_used=cc_model)
         await db.set_active_branch(conv_id, draft_msg_id)
@@ -6728,9 +10932,9 @@ async def _handle_claude_generation(
         else:
             launch_label = f"Launching Claude Code ({cc_model})..."
         if use_resume:
-            launch_label += " (resuming session)"
+            launch_label += " (forking native session)"
         else:
-            launch_label += " (building history)"
+            launch_label += f" (rebuilding history: {resume_reason})"
         await _ws_send(
             conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id}
         )
@@ -6741,6 +10945,7 @@ async def _handle_claude_generation(
                 "parent_id": parent_id,
                 "draft_msg_id": draft_msg_id,
                 "cc_model": cc_model,
+                "session_continuity": session_continuity,
             },
         )
         # Mirror the FE's _streamStartTime so the persisted generation_ms
@@ -6754,6 +10959,7 @@ async def _handle_claude_generation(
         actual_model = ""
 
         # Launch CC — with resume if available, with fallback on failure
+        prompt = add_canvas_notice(prompt, conv)
         try:
             if use_dream:
                 ok, info = await _ensure_dream_shim_running()
@@ -6775,7 +10981,8 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
+                    is_first_turn=not use_resume,
                 )
             elif is_codex:
                 proc, event_stream = await codex_client.run_codex(
@@ -6789,7 +10996,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
                     permission_request_handler=handle_cc_permission,
                 )
             else:
@@ -6800,6 +11007,7 @@ async def _handle_claude_generation(
                     server_port=config.port,
                     model=provider_model,
                     requested_model=cc_model,
+                    context_replay_history=_local_replay_region(branch) if use_llama else "",
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
@@ -6809,15 +11017,28 @@ async def _handle_claude_generation(
                     use_dream=use_dream,
                     use_openrouter=use_openrouter,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
                 )
         except Exception as e:
-            if use_resume:
+            if use_resume and (resume_rejected(e) or context_exhausted(e)):
                 # Fallback: retry without --resume (session may be stale/deleted)
                 print(f"[CC] Resume failed ({e}), falling back to full history")
                 await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
                 branch = await db.get_branch_to_root(parent_id) if parent_id else []
-                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+                prompt = await _prepare_agent_handoff(branch, conv, cc_model, cc_session_mode,
+                                                      project_dir=project_dir, reason="native_resume_launch_failed")
+                prompt = add_continuity_notice(
+                    prompt,
+                    ResumeDecision(
+                        None,
+                        "native_resume_launch_failed",
+                        continuity_decision.message_id,
+                    ),
+                    branch,
+                    cc_session_mode,
+                    target_model=cc_model,
+                )
+                prompt = add_canvas_notice(prompt, conv)
                 if is_gemini:
                     proc, event_stream = await gemini_client.run_gemini(
                         prompt,
@@ -6827,7 +11048,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
-                        nrol_operator=bool(conv.get("nrol_operator")),
+                        
                     )
                 elif is_codex:
                     proc, event_stream = await codex_client.run_codex(
@@ -6838,7 +11059,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
-                        nrol_operator=bool(conv.get("nrol_operator")),
+                        
                         permission_request_handler=handle_cc_permission,
                     )
                 else:
@@ -6849,6 +11070,7 @@ async def _handle_claude_generation(
                         server_port=config.port,
                         model=provider_model,
                         requested_model=cc_model,
+                        context_replay_history=_local_replay_region(branch) if use_llama else "",
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_llama=use_llama,
@@ -6856,13 +11078,19 @@ async def _handle_claude_generation(
                         use_dream=use_dream,
                         use_openrouter=use_openrouter,
                         backstage_parent_id=conv.get("backstage_parent_id"),
-                        nrol_operator=bool(conv.get("nrol_operator")),
+                        
                     )
                 use_resume = False
+                session_continuity = {
+                    "status": "rebuilt",
+                    "reason": "native_resume_launch_failed",
+                    "source_session_id": resume_session_id,
+                }
             else:
                 raise
 
         _active_claude_procs[conv_id] = proc
+        _track_generation_provider(proc)
 
         # Persist the generation so server-restart can reap or (phase 2) rescue.
         # session_id is filled in later when CC emits session_info.
@@ -6884,6 +11112,7 @@ async def _handle_claude_generation(
         new_session_id = ""
         actual_model = ""  # what CC actually ran (may differ from cc_model if CC fell back)
         model_attestation: dict | None = None
+        first_token_ms: int | None = None
         total_input_tokens = 0
         total_output_tokens = 0
         got_error = False
@@ -6896,6 +11125,12 @@ async def _handle_claude_generation(
             attestation = evt.get("model_attestation")
             if not isinstance(attestation, dict):
                 return
+            attestation = {
+                **attestation,
+                "session_continuity": session_continuity["status"],
+                "session_continuity_reason": session_continuity["reason"],
+                "source_session_id": session_continuity.get("source_session_id"),
+            }
             recorded = await _record_turn_model_attestation(
                 conv_id,
                 draft_msg_id,
@@ -6906,17 +11141,35 @@ async def _handle_claude_generation(
             if recorded is None:
                 return
             model_attestation = recorded
+            # The typed `model_attestation` event (broadcast by
+            # _record_turn_model_attestation) updates the header chip next to
+            # the role label. Do NOT also broadcast this as a `status` text:
+            # that paints the "Verified by ..." sentence into the footer
+            # beneath the looming animation, which no other provider does.
+
+        async def _record_first_provider_output(event_type: str) -> None:
+            """Persist the user's actual wait to the first model-originated event."""
+            nonlocal first_token_ms
+            if first_token_ms is not None or event_type not in {
+                "text_delta", "thinking_delta", "tool_start"
+            }:
+                return
+            first_token_ms = int((_time.time() - _gen_start_t) * 1000)
+            await db.update_message_content(
+                draft_msg_id, time_to_first_token_ms=first_token_ms
+            )
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local, time_to_first_token_ms=first_token_ms
+                )
             await _ws_send(
                 conv_id,
-                {
-                    "type": "status",
-                    "text": _model_attestation_status_text(recorded),
-                    "parent_id": parent_id,
-                },
+                {"type": "first_token", "elapsed_ms": first_token_ms},
             )
 
-        async for evt in event_stream:
+        async for evt in turn_recovery.events(event_stream):
             etype = evt["type"]
+            await _record_first_provider_output(etype)
 
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
@@ -7034,10 +11287,13 @@ async def _handle_claude_generation(
             elif etype == "tool_result":
                 result_content = evt.get("content", "")
                 tool_id = evt.get("tool_id", "")
-                image_url = evt.get("image_url")
+                # Tool observations are not chat attachment selections.
+                image_url = None
                 for block in reversed(content_blocks):
                     if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
                         block["result"] = result_content
+                        block["outcome_recorded"] = evt.get("outcome_recorded", True) is True
+                        block["is_error"] = bool(evt.get("is_error"))
                         if image_url:
                             block["image_url"] = image_url
                         break
@@ -7087,6 +11343,8 @@ async def _handle_claude_generation(
                 # output_tokens IS per-call delta so summing is correct there.
                 total_input_tokens = evt.get("input_tokens", 0)
                 total_output_tokens += evt.get("output_tokens", 0)
+                await db.update_message_content(draft_msg_id, turn_input_tokens=total_input_tokens,
+                                                turn_output_tokens=total_output_tokens)
                 await _ws_send(
                     conv_id,
                     {
@@ -7146,8 +11404,9 @@ async def _handle_claude_generation(
                     },
                 )
                 if compact_session:
-                    asyncio.create_task(
-                        _patch_marker_with_summary(conv_id, marker["id"], compact_session)
+                    _spawn_background_task(
+                        _patch_marker_with_summary(conv_id, marker["id"], compact_session),
+                        f"compact marker summary {marker['id']}",
                     )
 
             elif etype == "api_retry":
@@ -7208,9 +11467,21 @@ async def _handle_claude_generation(
                     {"type": "cc_synthetic_error", **synthetic_error},
                 )
 
+            elif etype == "error":
+                got_error = True
+                result_info = {
+                    **result_info,
+                    "is_error": True,
+                    "error": evt.get("message") or evt.get("error") or "Provider error",
+                    "launch_failed": bool(evt.get("launch_failed")),
+                    "resume_failed": bool(evt.get("resume_failed")),
+                }
             elif etype == "result":
                 result_info = evt
-                got_error = evt.get("is_error", False)
+                got_error = coordination.result_failed(
+                    got_error, is_codex and evt.get("terminal_confirmed") is True,
+                    bool(evt.get("is_error")),
+                )
                 # Use result text as fallback if no text came from assistant events
                 # Don't adopt error text as full_text — it would block the retry fallback
                 if not full_text and _cc_should_adopt_result_text(evt):
@@ -7233,27 +11504,82 @@ async def _handle_claude_generation(
         # If --resume failed, retry with full history fallback. Some local
         # backends can also accept a resumed session and exit 0 while producing
         # an empty content block; treat that as a poisoned/stale resume too.
-        # CC may emit error text before the result event, so don't gate explicit
-        # errors on `not full_text`.
+        # Context exhaustion can recover at a recorded tool boundary. Other
+        # resume failures still require an empty attempt; never replay unknown
+        # tool effects or treat arbitrary tool text as terminal evidence.
         empty_resume = (
             use_resume
             and not got_error
             and not full_text.strip()
             and not content_blocks
+            and bool(result_info)
         )
-        if use_resume and (got_error or empty_resume):
+        recovery = turn_recovery.decide(_cc_result_error_detail(result_info) if got_error or result_info.get("is_error") else "", content_blocks,
+            attempts=getattr(asyncio.current_task(), "_context_recovery_attempts", 0),
+            enabled=not conv.get('backstage_parent_id'))
+        recovering_partial = recovery.allowed and _cc_has_streamed_output(full_text, content_blocks)
+        if recovery.reason == "unresolved_tool_outcome":
+            result_info["error"] = _cc_result_error_detail(result_info) + " Automatic recovery paused: a tool outcome is unresolved or reported an error. Retained evidence requires reconciliation before repeating actions."
+        launch_failed = bool(result_info.get("launch_failed"))
+        safe_resume_failure = (
+            use_resume
+            and not _cc_has_streamed_output(full_text, content_blocks)
+            and (
+                launch_failed
+                or resume_rejected(_cc_result_error_detail(result_info))
+                or empty_resume
+            )
+        )
+        if recovery.allowed or safe_resume_failure:
+            session_continuity = {
+                "status": "rebuilt",
+                "reason": (
+                    recovery.reason if recovery.allowed else
+                    (
+                        "native_resume_empty_response" if empty_resume else
+                        (
+                            "native_resume_launch_failed" if launch_failed else
+                            "native_resume_runtime_error"
+                        )
+                    )
+                ),
+                "source_session_id": (new_session_id or resume_session_id) if recovery.allowed else resume_session_id,
+            }
             error_detail = result_info.get("result_text", "") or result_info.get("error", "")
             if empty_resume:
                 print("[CC] Resume returned empty response, retrying with full history")
                 status_text = "Session returned no response — retrying with full history..."
+            elif launch_failed:
+                print(f"[CC] Resume launch failed, retrying with full history: {error_detail[:200]}")
+                status_text = "Session resume failed — retrying with full history..."
             else:
                 print(f"[CC] Resume returned error, retrying with full history: {error_detail[:200]}")
                 status_text = "Session error — retrying with full history..."
+            if recovering_partial:
+                status_text = "Context exhausted — preserving recorded outcomes and preparing continuation..."
             await _ws_send(conv_id, {"type": "status", "text": status_text})
-            branch = await db.get_branch_to_root(parent_id) if parent_id else []
-            fallback_prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+            await _teardown_child_provider(proc, "gemini" if is_gemini else "codex" if is_codex else "claude")
+            if recovering_partial:
+                await db.update_message_content(draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
+                    cc_session_id=new_session_id or None, cc_session_mode=cc_session_mode, cc_model_used=cc_model,
+                    turn_lifecycle_state="partial_failed")
+            branch = await db.get_branch_to_root(draft_msg_id if recovering_partial else parent_id) if parent_id else []
+            fallback_prompt = await _prepare_agent_handoff(branch, conv, cc_model, cc_session_mode,
+                                                           project_dir=project_dir,
+                                                           reason=session_continuity["reason"], frozen_tail=recovering_partial)
+            fallback_prompt = add_continuity_notice(
+                fallback_prompt,
+                ResumeDecision(
+                    None,
+                    session_continuity["reason"],
+                    continuity_decision.message_id,
+                ),
+                branch,
+                cc_session_mode,
+                target_model=cc_model,
+            )
             # Re-attach images
-            if branch:
+            if branch and not recovering_partial:
                 last_user_msg = None
                 for msg in reversed(branch):
                     if msg["role"] == "user":
@@ -7362,6 +11688,10 @@ async def _handle_claude_generation(
                         _hdr = "[Attached files — image descriptions already provided, do NOT read image files.]" if _has_img else f"[User attached {len(file_notes)} file(s). See attached_files/ for the files.]"
                         fallback_prompt += f"\n\n{_hdr}\n{files_str}"
 
+            fallback_prompt = add_canvas_notice(fallback_prompt, conv)
+            recovery_event_prefix = ""
+            if recovery.allowed:
+                recovery_event_prefix = turn_recovery.claim(recovery, asyncio.current_task(), proc)
             if is_gemini:
                 proc, event_stream = await gemini_client.run_gemini(
                     fallback_prompt,
@@ -7372,7 +11702,7 @@ async def _handle_claude_generation(
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
                 )
             elif is_codex:
                 proc, event_stream = await codex_client.run_codex(
@@ -7384,7 +11714,7 @@ async def _handle_claude_generation(
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
                     permission_request_handler=handle_cc_permission,
                 )
             else:
@@ -7395,6 +11725,7 @@ async def _handle_claude_generation(
                     server_port=config.port,
                     model=provider_model,
                     requested_model=cc_model,
+                    context_replay_history=_local_replay_region(branch) if use_llama else "",
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     use_llama=use_llama,
@@ -7402,20 +11733,26 @@ async def _handle_claude_generation(
                     use_dream=use_dream,
                     use_openrouter=use_openrouter,
                     backstage_parent_id=conv.get("backstage_parent_id"),
-                    nrol_operator=bool(conv.get("nrol_operator")),
+                    
                 )
             _active_claude_procs[conv_id] = proc
+            _track_generation_provider(proc)
 
-            full_text = ""
-            content_blocks = []
+            if not recovering_partial:
+                full_text = ""
+                content_blocks = []
             current_block = None
             result_info = {}
+            got_error = False
             new_session_id = ""
-            total_input_tokens = 0
-            total_output_tokens = 0
+            if not recovering_partial:
+                total_input_tokens = 0
+                total_output_tokens = 0
 
-            async for evt in event_stream:
+            async for evt in turn_recovery.events(event_stream):
+                evt = turn_recovery.namespace_event(evt, recovery_event_prefix)
                 etype = evt["type"]
+                await _record_first_provider_output(etype)
                 if etype == "session_info":
                     new_session_id = evt.get("session_id", "") or new_session_id
                     model_name = evt.get("model", cc_model)
@@ -7489,6 +11826,34 @@ async def _handle_claude_generation(
                             "tool_id": evt.get("tool_id", ""),
                         },
                     )
+                elif etype == "ask_user_question":
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "ask_user_question",
+                            "questions": evt.get("questions", []),
+                            "tool_id": evt.get("tool_id", ""),
+                        },
+                    )
+                elif etype == "plan_ready":
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "plan_ready",
+                            "plan": evt.get("plan", ""),
+                            "plan_file": evt.get("plan_file", ""),
+                            "tool_id": evt.get("tool_id", ""),
+                        },
+                    )
+                    conv_title = conv.get("title", "Conversation")
+                    await _ws_broadcast_all(
+                        {
+                            "type": "plan_landed",
+                            "conv_id": conv_id,
+                            "conv_title": conv_title,
+                            "plan_file": evt.get("plan_file", ""),
+                        }
+                    )
                 elif etype == "tool_result":
                     result_content = evt.get("content", "")
                     tool_id = evt.get("tool_id", "")
@@ -7500,39 +11865,14 @@ async def _handle_claude_generation(
                             and block.get("tool_id") == tool_id
                         ):
                             block["result"] = result_content
+                            block["outcome_recorded"] = evt.get("outcome_recorded", True) is True
+                            block["is_error"] = bool(evt.get("is_error"))
                             matched_block = block
                             break
                     current_block = None
 
-                    # Check if this tool created/referenced an image file
-                    image_url = evt.get("image_url")
-                    if not image_url and matched_block:
-                        tool_input_str = matched_block.get("input", "")
-                        # Scan tool input for image paths
-                        import re as _re
-
-                        for candidate in _re.findall(
-                            r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)",
-                            tool_input_str,
-                            _re.IGNORECASE,
-                        ):
-                            candidate_path = (Path(project_dir) / candidate).resolve()
-                            if candidate_path.exists() and candidate_path.is_file():
-                                image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
-                                break
-                        # Also check the result text for image paths
-                        if not image_url:
-                            for candidate in _re.findall(
-                                r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)",
-                                result_content,
-                                _re.IGNORECASE,
-                            ):
-                                candidate_path = (
-                                    Path(project_dir) / candidate
-                                ).resolve()
-                                if candidate_path.exists() and candidate_path.is_file():
-                                    image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
-                                    break
+                    # Tool inputs/results are evidence, not attachment intent.
+                    image_url = None
 
                     tool_result_msg = {
                         "type": "tool_result",
@@ -7567,6 +11907,8 @@ async def _handle_claude_generation(
                     # cached prefix so summing input double-counts.
                     total_input_tokens = evt.get("input_tokens", 0)
                     total_output_tokens += evt.get("output_tokens", 0)
+                    await db.update_message_content(draft_msg_id, turn_input_tokens=total_input_tokens,
+                                                    turn_output_tokens=total_output_tokens)
                     await _ws_send(
                         conv_id,
                         {
@@ -7594,8 +11936,15 @@ async def _handle_claude_generation(
                         conv_id,
                         {"type": "cc_synthetic_error", **synthetic_error},
                     )
+                elif etype == "error":
+                    got_error = True
+                    result_info = {**result_info, "is_error": True, "error": evt.get("message") or evt.get("error") or "Provider error"}
                 elif etype == "result":
                     result_info = evt
+                    got_error = coordination.result_failed(
+                        got_error, is_codex and evt.get("terminal_confirmed") is True,
+                        bool(evt.get("is_error")),
+                    )
                     if not full_text and _cc_should_adopt_result_text(evt):
                         full_text = evt["result_text"]
                         content_blocks.append({"type": "text", "text": full_text})
@@ -7645,7 +11994,16 @@ async def _handle_claude_generation(
             content = f"[Error: {error_msg}]"
             if rate_limit_data:
                 content += _format_rate_limit_note(rate_limit_data)
-            await db.update_message_content(draft_msg_id, content=content)
+            failed_session = result_info.get("session_id") or new_session_id or None
+            model_attestation = _failed_session_attestation(
+                model_attestation, result_info, failed_session, cc_session_mode, error_msg,
+            )
+            asyncio.current_task()._generation_terminal_override = "failed"
+            await db.update_message_content(
+                draft_msg_id, content=content, cc_session_id=failed_session,
+                cc_session_mode=cc_session_mode, cc_model_used=cc_model,
+                turn_lifecycle_state="failed", model_attestation=json.dumps(model_attestation),
+            )
             await _ws_send(conv_id, {"type": "error", "error": error_msg})
             await _ws_send(
                 conv_id,
@@ -7656,7 +12014,8 @@ async def _handle_claude_generation(
         # Partial output: agent died mid-turn (hook timeout, crash, etc.)
         # Save whatever text/tools streamed before death so the user isn't
         # left with a blank message — they can read what happened and retry.
-        if result_info.get("is_error") and _cc_has_streamed_output(full_text, content_blocks):
+        failed_turn = got_error or result_info.get("is_error") or not result_info or not full_text.strip()
+        if failed_turn and _cc_has_streamed_output(full_text, content_blocks):
             full_text = _append_cc_interrupt_note(full_text, content_blocks, result_info)
 
         # CC streamed an error response (e.g. "You've hit your org's monthly
@@ -7690,6 +12049,13 @@ async def _handle_claude_generation(
         input_tokens = total_input_tokens
         new_session_id = result_info.get("session_id", "") or new_session_id
         duration_ms = result_info.get("duration_ms", 0)
+        if failed_turn:
+            model_attestation = _failed_session_attestation(
+                model_attestation, result_info, new_session_id, cc_session_mode,
+                _cc_result_error_detail(result_info) or ("rate limit" if rate_limit_data else ""),
+            )
+            asyncio.current_task()._generation_terminal_override = "partial_failed"
+            await db.update_message_content(draft_msg_id, turn_lifecycle_state="partial_failed")
 
         # Record what CC actually ran (from session_info), not just what we asked
         # for. If CC silently downgraded (usage cap, availability), surface it.
@@ -7746,11 +12112,13 @@ async def _handle_claude_generation(
             cc_session_id=new_session_id or None,
             cc_session_mode=cc_session_mode,
             cc_model_used=model_used_field,
+            turn_lifecycle_state="completed" if recovering_partial and not failed_turn else None,
             model_attestation=(
                 json.dumps(model_attestation, separators=(",", ":"))
                 if model_attestation else None
             ),
             generation_ms=_gen_ms,
+            time_to_first_token_ms=first_token_ms,
         )
         msg = await db.get_message(draft_msg_id)
         if not msg:
@@ -7798,53 +12166,13 @@ async def _handle_claude_generation(
             "duration_ms": duration_ms,
         }
 
-        # Detect image paths in the response text and tool blocks
-        import re as _re
-
-        detected_images = []
-        seen_paths = set()
-        def _block_text(value) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, str):
-                return value
-            try:
-                return json.dumps(value, default=str)
-            except Exception:
-                return str(value)
-
-        all_text = (
-            full_text
-            + " "
-            + " ".join(
-                _block_text(b.get("input")) + " " + _block_text(b.get("result"))
-                for b in content_blocks
-                if b.get("type") == "tool_use"
-            )
-        )
-        base_path = Path(project_dir).resolve()
-        for candidate in _re.findall(
-            r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)", all_text, _re.IGNORECASE
-        ):
-            candidate_path = (base_path / candidate).resolve()
-            if (
-                str(candidate_path).startswith(str(base_path))
-                and candidate_path.exists()
-                and candidate_path.is_file()
-            ):
-                if candidate_path not in seen_paths:
-                    seen_paths.add(candidate_path)
-                    detected_images.append(
-                        f"/api/conversations/{conv_id}/file?path={candidate}"
-                    )
-
         end_msg = {
             "type": "stream_end",
             "message": dict(msg),
             "cost": cost_info,
         }
-        if detected_images:
-            end_msg["images"] = detected_images
+        if failed_turn:
+            await _ws_send(conv_id, {"type": "error", "error": _cc_result_error_detail(result_info) or "Provider exited before completing the turn", "turn_lifecycle_state": "partial_failed"})
         await _ws_send(conv_id, end_msg)
         # Notify all connected clients (cross-conversation bell)
         conv_title = conv.get("title", "Conversation")
@@ -7872,29 +12200,19 @@ async def _handle_claude_generation(
                     await claude_client.cancel_claude(proc)
             except Exception:
                 pass
-        if draft_msg_id and (full_text or content_blocks):
-            # Save accumulated work to draft before cancelling.
-            # Persist cc_session_id so the next turn's --resume walk finds this
-            # draft instead of skipping back past the cancelled prompt (which
-            # would cause amnesia + force a full-history rebuild).
-            _gen_ms_cancel = int((_time.time() - _gen_start_t) * 1000)
-            await db.update_message_content(
-                draft_msg_id,
-                content=full_text,
-                content_blocks=json.dumps(content_blocks) if content_blocks else None,
-                cc_session_id=new_session_id or resume_session_id or None,
-                cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
-                model_attestation=(
-                    json.dumps(model_attestation, separators=(",", ":"))
-                    if model_attestation else None
-                ),
-                generation_ms=_gen_ms_cancel,
-            )
-            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or resume_session_id or 'none'})")
-        elif draft_msg_id:
-            # No content produced — delete empty draft to avoid phantoms
-            await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
+        await _finalize_user_stopped_generation(
+            conv_id,
+            draft_msg_id,
+            partial_text=full_text,
+            content_blocks=content_blocks,
+            session_id=new_session_id or resume_session_id or None,
+            session_mode=cc_session_mode,
+            model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
+            model_attestation=model_attestation,
+            generation_ms=int((_time.time() - _gen_start_t) * 1000),
+            time_to_first_token_ms=first_token_ms,
+        )
+        raise
     except Exception as e:
         if _active_claude_procs.get(conv_id) is proc:
             _active_claude_procs.pop(conv_id, None)
@@ -7902,14 +12220,40 @@ async def _handle_claude_generation(
         import traceback
 
         traceback.print_exc()
+        if draft_msg_id:
+            lifecycle = "partial_failed" if _cc_has_streamed_output(full_text, content_blocks) else "failed"
+            asyncio.current_task()._generation_terminal_override = lifecycle
+            await db.update_message_content(draft_msg_id, turn_lifecycle_state=lifecycle)
         # Save accumulated work to draft so it's not lost
         if draft_msg_id and (full_text or content_blocks):
             await db.update_message_content(
                 draft_msg_id,
                 content=full_text or "[Generation interrupted]",
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                cc_session_id=new_session_id or resume_session_id or None,
+                cc_session_mode=cc_session_mode,
+                cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
+                model_attestation=(
+                    json.dumps(model_attestation, separators=(",", ":"))
+                    if model_attestation else None
+                ),
+                time_to_first_token_ms=first_token_ms,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on error")
+        elif draft_msg_id:
+            await db.update_message_content(
+                draft_msg_id,
+                content=f"[Error: {e}]",
+                cc_session_id=new_session_id or resume_session_id or None,
+                cc_session_mode=cc_session_mode,
+                cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
+                model_attestation=(
+                    json.dumps(model_attestation, separators=(",", ":"))
+                    if model_attestation else None
+                ),
+                generation_ms=int((_time.time() - _gen_start_t) * 1000),
+                time_to_first_token_ms=first_token_ms,
+            )
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
         _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
@@ -7918,24 +12262,58 @@ async def _handle_claude_generation(
             _generation_snapshots.pop(_gen_key, None)
             _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
         await _send_generation_idle_if_quiescent(conv_id)
-        # Drop the orphan-tracking row — the generation finished (success,
-        # cancel, or error), so there's nothing to reap on next startup.
+        # Drop tracking only after owned processes acknowledge exit. A terminal
+        # result by itself is not proof that there is nothing left to reap.
         try:
-            if 'draft_msg_id' in locals() and draft_msg_id:
+            if 'draft_msg_id' in locals() and draft_msg_id and _generation_providers_exited():
                 await db.unregister_active_generation(draft_msg_id)
         except Exception:
             pass
         # Clean up only this generation's pending permissions. A sibling agent
         # in the same conversation may still be waiting for its own decision.
         finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
-        for rid in list(_pending_hook_permissions):
-            pending = _pending_hook_permissions[rid]
-            if (
-                pending.get("conv_id") == conv_id
-                and pending.get("permission_scope") == finished_scope
-            ):
-                _pending_hook_permissions.pop(rid, None)
-                await db.delete_pending_permission(rid)
+        await _resolve_pending_permissions_for_scope(
+            conv_id,
+            finished_scope,
+            message=(
+                "Loom permission request was cancelled because the owning "
+                "Claude-compatible agent turn ended before a user decision."
+            ),
+        )
+
+
+async def _prepare_agent_handoff(branch, conv, model, harness, *, project_dir=None, reason="handoff", frozen_tail=False):
+    """Single fresh-context path for all ordinary agent harnesses.
+
+    Specialized operators retain their explicit context/lockdown contract.
+    Normal native resumes do not call this function.
+    """
+    if conv.get('backstage_parent_id'):
+        return _build_claude_history_prompt(branch, project_dir) or "(continue)"
+    from context_runtime import prepare_branch
+    backend = None
+    if harness == "goose":
+        backend = goose_client.split_goose_model(model)[0]
+    elif conv.get("_use_llama") or str(model).endswith(".gguf"):
+        backend = "llama"
+    elif harness == "openrouter-claude":
+        backend = "openrouter"
+    elif harness == "dream-claude":
+        backend = "dream"
+
+    async def status(text):
+        task = asyncio.current_task()
+        gen_key = getattr(task, "_gen_key", None)
+        if gen_key:
+            _update_gen_snapshot(gen_key, phase="context_preparation", status_text=text)
+        await _ws_send(conv["id"], {"type": "generation_preparing", "text": text,
+            "phase": "context_preparation",
+            "parent_id": gen_key[1] if gen_key else None})
+
+    workspace = str(project_dir or conv.get("project_dir") or ".")
+    return await prepare_branch(branch, model=model, harness=harness, backend=backend,
+                                reason=reason, status=status, frozen_tail=frozen_tail,
+                                workspace=workspace)
 
 
 def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -> str:
@@ -7979,6 +12357,19 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
                         attached_files.append(ip)
             history_parts.append(f"Human: {msg['content']}")
         elif msg["role"] == "assistant":
+            if msg.get("turn_lifecycle_state") in {"failed", "partial_failed", "interrupted"}:
+                history_parts.append(f"Assistant: {partial_replay_text(msg)}")
+                continue
+            # The final assistant content is the portable provider handoff.
+            # content_blocks contains the same answer plus potentially megabytes
+            # of shell/MCP inputs and outputs. Replaying those blocks instead of
+            # the final answer can inflate a modest branch beyond a fresh
+            # harness's context window. Fall back to blocks only for historical
+            # tool-only/partial turns that have no saved assistant text.
+            assistant_content = str(msg.get("content") or "").strip()
+            if assistant_content:
+                history_parts.append(f"Assistant: {assistant_content}")
+                continue
             blocks = None
             if msg.get("content_blocks"):
                 try:
@@ -8013,7 +12404,7 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
                         parts.append(tool_summary)
                 history_parts.append(f"Assistant: {chr(10).join(parts)}")
             else:
-                history_parts.append(f"Assistant: {msg['content']}")
+                history_parts.append("Assistant: [No saved assistant text]")
 
     if not history_parts:
         base = ""
@@ -8028,6 +12419,25 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
         files_str = "\n".join(f"  • {Path(ip).name} (in attached_files/)" for ip in attached_files)
         return f"[Attached files:]\n{files_str}\n\n{base}" if base else f"[Attached files:]\n{files_str}"
     return base
+
+
+def _local_replay_region(branch: list[dict]) -> str:
+    """Identify only the renderer-owned history, never tags in current input."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if getattr(task, "_context_plan", None) is not None:
+        return getattr(task, "_context_replay_region", "")
+    if not branch or branch[-1].get("role") != "user":
+        return ""
+    rendered = _build_claude_history_prompt(branch, None)
+    suffix = "\n\n" + str(branch[-1].get("content") or "")
+    if rendered.startswith("<conversation_history>\n") and rendered.endswith(suffix):
+        region = rendered[:-len(suffix)]
+        if region.endswith("\n</conversation_history>"):
+            return region
+    return ""
 
 
 def _copy_latest_user_attachments_for_goose(
@@ -8081,11 +12491,36 @@ def _append_attachment_notes(prompt: str, file_notes: list[str]) -> str:
     return f"{prompt}\n\n{header}\n{files_str}" if prompt else f"{header}\n{files_str}"
 
 
+async def _append_prior_acp_permission_feedback(
+    prompt: str,
+    branch: list[dict],
+) -> str:
+    """Add branch-local permission notes that ACP could not carry in-place."""
+    latest_user = next(
+        (message for message in reversed(branch) if message.get("role") == "user"),
+        None,
+    )
+    prior_draft_id = (latest_user or {}).get("parent_id")
+    if prior_draft_id is None:
+        return prompt
+    resolutions = await db.get_permission_resolutions_for_draft(int(prior_draft_id))
+    acp_resolutions = [
+        resolution
+        for resolution in resolutions
+        if str(resolution.get("source") or "") in {"goose_acp", "hermes_acp"}
+    ]
+    return add_permission_feedback_notice(prompt, acp_resolutions)
+
+
 async def _handle_goose_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
     """Handle Goose mode through ACP over stdio."""
     import time as _time
+
+    if asyncio.current_task() is not None:
+        asyncio.current_task()._context_plan = None
+        asyncio.current_task()._context_replay_region = ""
 
     draft_msg_id = None
     full_text = ""
@@ -8096,8 +12531,11 @@ async def _handle_goose_generation(
     output_tokens = 0
     got_error = False
     last_error = ""
+    last_error_stage = ""
+    last_error_retryable = False
     result_info: dict = {}
     model_attestation: dict | None = None
+    first_token_ms: int | None = None
     start_t = _time.time()
     proc = None
 
@@ -8114,9 +12552,8 @@ async def _handle_goose_generation(
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
+        if parent_id is None:
+            raise ValueError("Goose generation requires an explicit parent message")
 
         project_dir = conv.get("project_dir") or "."
         if project_dir != "." and not os.path.isdir(project_dir):
@@ -8149,37 +12586,11 @@ async def _handle_goose_generation(
             settings_updates["cc_effort"] = cc_effort
         if cc_permission_mode != conv.get("cc_permission_mode"):
             settings_updates["cc_permission_mode"] = cc_permission_mode
-        if settings_updates:
+        if settings_updates and not _truthy_setting(conv.get("parallel_agents_enabled")):
             await db.update_conversation_fields(conv_id, **settings_updates)
-        if conv.get("nrol_operator"):
-            blocked = _nrol_operator_block_reason(cc_model)
-            if blocked:
-                await _ws_send(conv_id, {"type": "error", "error": blocked})
-                return
+        pass
 
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        if (
-            action == "generate"
-            and parent_id
-            and not model_context.is_1m_anthropic(cc_model)
-        ):
-            branch_tokens = await db.sum_branch_tokens(parent_id)
-            if model_context.needs_handoff(cc_model, branch_tokens):
-                threshold = model_context.handoff_threshold(cc_model)
-                await _ws_send(
-                    conv_id,
-                    {
-                        "type": "status",
-                        "text": f"Branch is {branch_tokens:,} tokens (> {threshold:,} for {cc_model}) - preparing handoff...",
-                    },
-                )
-                marker_id, _new_session, new_parent = await _run_compact_handoff(
-                    conv_id, conv, parent_id, cc_model, cc_effort, project_dir
-                )
-                if marker_id:
-                    parent_id = new_parent or marker_id
-                    branch = await db.get_branch_to_root(parent_id) if parent_id else []
-
         resume_session_id = None
         use_resume = False
         resume_decision = select_resume_session(
@@ -8190,6 +12601,8 @@ async def _handle_goose_generation(
                 goose_client.model_label(recorded) == goose_client.model_label(target)
             ),
         )
+        from context_runtime import respect_manual_boundary
+        resume_decision = await respect_manual_boundary(branch, resume_decision)
         resume_session_id = resume_decision.session_id
         use_resume = resume_decision.can_resume
         if not use_resume:
@@ -8198,16 +12611,35 @@ async def _handle_goose_generation(
                 f"boundary_msg={resume_decision.message_id}"
             )
 
+        session_continuity = {
+            "status": "forked" if use_resume else "rebuilt",
+            "reason": resume_decision.reason,
+            "source_session_id": resume_session_id if use_resume else None,
+        }
+
         if use_resume:
             latest_user = next((m for m in reversed(branch) if m.get("role") == "user"), None)
             prompt = (latest_user or {}).get("content") or "(continue)"
         else:
-            prompt = _build_claude_history_prompt(branch, None) or "(continue)"
+            prompt = await _prepare_agent_handoff(branch, conv, cc_model, "goose")
+
+        prompt = await _append_prior_acp_permission_feedback(prompt, branch)
+
+        if use_resume:
+            from context_runtime import renew_native_retrieval
+            prompt = await renew_native_retrieval(prompt, branch)
+        prompt = add_continuity_notice(
+            prompt,
+            resume_decision,
+            branch,
+            "goose",
+            target_model=cc_model,
+        )
 
         goose_image_paths, goose_file_notes = _copy_latest_user_attachments_for_goose(branch, project_dir)
         prompt = _append_attachment_notes(prompt, goose_file_notes)
 
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg = await _create_generation_draft(conv_id, conv, parent_id)
         draft_msg_id = draft_msg["id"]
         await db.update_message_content(draft_msg_id, cc_model_used=cc_model)
         await db.set_active_branch(conv_id, draft_msg_id)
@@ -8238,13 +12670,20 @@ async def _handle_goose_generation(
         )
         await _ws_send(
             conv_id,
-            {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id, "cc_model": cc_model},
+            {
+                "type": "stream_start",
+                "parent_id": parent_id,
+                "draft_msg_id": draft_msg_id,
+                "cc_model": cc_model,
+                "session_continuity": session_continuity,
+            },
         )
 
         async def _register_goose_proc() -> None:
             if proc is None:
                 return
             _active_goose_procs[conv_id] = proc
+            _track_generation_provider(proc)
             try:
                 await db.register_active_generation(
                     draft_msg_id=draft_msg_id,
@@ -8281,6 +12720,7 @@ async def _handle_goose_generation(
             start_fork_session: bool = False,
         ):
             nonlocal proc
+            start_prompt = add_canvas_notice(start_prompt, conv)
             proc, start_stream = await goose_client.run_goose(
                 start_prompt,
                 conv_id=conv_id,
@@ -8290,28 +12730,58 @@ async def _handle_goose_generation(
                 goose_exe=config.goose_exe or None,
                 permission_mode=cc_permission_mode,
                 branch=branch,
+                context_replay_history=_local_replay_region(branch),
                 resume_session_id=start_resume_session_id,
                 fork_session=start_fork_session,
-                nrol_operator=bool(conv.get("nrol_operator")),
+                
                 builtins=config.goose_builtins,
                 effort=cc_effort,
                 image_paths=goose_image_paths,
+                is_first_turn=not bool(start_resume_session_id),
+                progress_timeout_seconds=config.goose_progress_timeout_seconds,
             )
             await _register_goose_proc()
             return start_stream
 
-        async def _consume_goose_stream(event_stream, *, emit_error_events: bool) -> None:
+        async def _mark_goose_first_output(event_type: str) -> None:
+            nonlocal first_token_ms
+            if first_token_ms is not None or event_type not in {
+                "text_delta", "thinking_delta", "tool_start", "tool_result"
+            }:
+                return
+            first_token_ms = int((_time.time() - start_t) * 1000)
+            await db.update_message_content(
+                draft_msg_id, time_to_first_token_ms=first_token_ms
+            )
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local, time_to_first_token_ms=first_token_ms
+                )
+            await _ws_send(
+                conv_id,
+                {"type": "first_token", "elapsed_ms": first_token_ms},
+            )
+
+        async def _consume_goose_stream(event_stream, recovery_event_prefix="") -> None:
             nonlocal full_text, content_blocks, current_block
             nonlocal new_session_id, input_tokens, output_tokens
             nonlocal got_error, last_error, result_info
+            nonlocal last_error_stage, last_error_retryable
             nonlocal model_attestation
 
-            async for evt in event_stream:
+            async for evt in turn_recovery.events(event_stream):
+                evt = turn_recovery.namespace_event(evt, recovery_event_prefix)
                 etype = evt.get("type")
                 if etype == "session_info":
                     new_session_id = evt.get("session_id") or new_session_id
                     attestation = evt.get("model_attestation")
                     if isinstance(attestation, dict):
+                        attestation = {
+                            **attestation,
+                            "session_continuity": session_continuity["status"],
+                            "session_continuity_reason": session_continuity["reason"],
+                            "source_session_id": session_continuity.get("source_session_id"),
+                        }
                         recorded = await _record_turn_model_attestation(
                             conv_id,
                             draft_msg_id,
@@ -8344,6 +12814,7 @@ async def _handle_goose_generation(
                     text = evt.get("text", "")
                     if not text:
                         continue
+                    await _mark_goose_first_output(etype)
                     full_text += text
                     if current_block and current_block.get("type") == "text":
                         current_block["text"] += text
@@ -8354,6 +12825,7 @@ async def _handle_goose_generation(
                 elif etype == "thinking_delta":
                     text = evt.get("text", "")
                     if text:
+                        await _mark_goose_first_output(etype)
                         if current_block and current_block.get("type") == "thinking":
                             current_block["text"] += text
                         else:
@@ -8361,6 +12833,7 @@ async def _handle_goose_generation(
                             content_blocks.append(current_block)
                         await _ws_send(conv_id, {"type": "thinking_chunk", "content": text})
                 elif etype == "tool_start":
+                    await _mark_goose_first_output(etype)
                     current_block = {
                         "type": "tool_use",
                         "name": evt.get("name", "goose_tool"),
@@ -8375,34 +12848,41 @@ async def _handle_goose_generation(
                         current_block["input"] += evt.get("json", "")
                     await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt.get("json", ""), "tool_id": evt.get("tool_id", "")})
                 elif etype == "tool_result":
+                    await _mark_goose_first_output(etype)
                     tool_id = evt.get("tool_id", "")
                     result = evt.get("content", "")
                     for block in reversed(content_blocks):
                         if block.get("type") == "tool_use" and block.get("tool_id") == tool_id:
                             block["result"] = result
+                            block["outcome_recorded"] = evt.get("outcome_recorded", True) is True
+                            block["is_error"] = bool(evt.get("is_error"))
                             break
                     current_block = None
                     await _ws_send(conv_id, {"type": "tool_result", "content": result, "tool_id": tool_id, "is_error": evt.get("is_error", False)})
                 elif etype == "usage":
                     input_tokens += int(evt.get("input_tokens") or 0)
                     output_tokens += int(evt.get("output_tokens") or 0)
+                    await db.update_message_content(draft_msg_id, turn_input_tokens=input_tokens,
+                                                    turn_output_tokens=output_tokens)
                     await _ws_send(conv_id, {"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens})
                 elif etype == "permission_request":
                     pass
                 elif etype == "error":
                     got_error = True
-                    last_error = _goose_error_text(evt.get("error"))
-                    if emit_error_events:
-                        await _ws_send(conv_id, {
-                            "type": "error",
-                            "provider": "goose",
-                            "stage": "generation",
-                            "requested_model": cc_model,
-                            "error": last_error,
-                        })
+                    last_error = _goose_error_text(evt.get("error") or evt.get("message"), "")
+                    last_error_stage = str(evt.get("stage") or "generation")
+                    last_error_retryable = bool(evt.get("retryable"))
                 elif etype == "result":
                     result_info = evt
                     new_session_id = evt.get("session_id") or new_session_id
+                    stop_reason = str(evt.get("stop_reason") or "").strip().lower()
+                    if evt.get("is_error") or stop_reason in {"error", "failed", "incomplete"}:
+                        got_error = True
+                        if not last_error:
+                            last_error = _goose_error_text(
+                                _cc_result_error_detail(evt),
+                                f"Goose ended with {stop_reason}",
+                            )
 
                 if _gen_key_local:
                     _update_gen_snapshot(
@@ -8419,74 +12899,196 @@ async def _handle_goose_generation(
                 start_resume_session_id=resume_session_id if use_resume else None,
                 start_fork_session=use_resume,
             )
-            await _consume_goose_stream(event_stream, emit_error_events=not use_resume)
+            await _consume_goose_stream(event_stream)
         except Exception as exc:
-            if not use_resume:
+            if not use_resume and not context_exhausted(exc):
                 raise
             got_error = True
             last_error = _goose_error_text(exc)
+            last_error_stage = "generation"
+            last_error_retryable = goose_client.is_retryable_goose_failure(last_error)
 
-        empty_resume = use_resume and not got_error and not _cc_has_streamed_output(full_text, content_blocks)
-        if use_resume and (got_error or empty_resume):
+        # ACP may wrap a pre-inference context rejection in assistant text.
+        # Normalize that exact terminal envelope before deciding whether real
+        # output occurred. Never erase partial work or tool activity to retry.
+        clean_text, wrapped_error = goose_client.split_goose_terminal_failure(full_text)
+        if wrapped_error:
+            full_text = clean_text
+            last_error = wrapped_error
+            got_error = True
+            cleaned_blocks = []
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    clean, wrapped = goose_client.split_goose_terminal_failure(block.get("text") or "")
+                    if wrapped:
+                        if clean:
+                            cleaned_blocks.append({**block, "text": clean})
+                        continue
+                cleaned_blocks.append(block)
+            content_blocks = cleaned_blocks
+        streamed_before_failure = _cc_has_streamed_output(full_text, content_blocks)
+        empty_resume = use_resume and bool(result_info) and not got_error and not streamed_before_failure
+        safe_resume_failure = use_resume and got_error and (resume_rejected(last_error) or context_exhausted(last_error)) and not streamed_before_failure
+        recovery = turn_recovery.decide(last_error if got_error else "", content_blocks,
+            attempts=getattr(asyncio.current_task(), "_context_recovery_attempts", 0),
+            enabled=not conv.get('backstage_parent_id'))
+        recovering_partial = recovery.allowed and streamed_before_failure
+        if recovery.reason == "unresolved_tool_outcome":
+            last_error += " Automatic recovery paused: a tool outcome is unresolved or reported an error. Retained evidence requires reconciliation before repeating actions."
+        if recovery.allowed or (use_resume and (safe_resume_failure or empty_resume)):
+            session_continuity = {
+                "status": "rebuilt",
+                "reason": (
+                    "native_resume_empty_response"
+                    if empty_resume else "native_resume_runtime_error"
+                ),
+                "source_session_id": resume_session_id,
+            }
+            if recovery.allowed:
+                session_continuity["reason"] = recovery.reason
+                session_continuity["source_session_id"] = new_session_id or resume_session_id
             if empty_resume:
                 status_text = "Goose session returned no response - retrying with full history..."
             else:
                 status_text = "Goose session failed - rebuilding from history..."
+            if recovering_partial:
+                status_text = "Context exhausted — preserving recorded outcomes and preparing continuation..."
             await _ws_send(conv_id, {"type": "status", "text": status_text, "parent_id": parent_id})
+            if proc is not None:
+                await _teardown_child_provider(proc, "goose")
             await _retire_goose_proc()
-            full_text = ""
-            content_blocks = []
+            if recovering_partial:
+                await db.update_message_content(draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
+                    cc_session_id=new_session_id or None, cc_session_mode="goose", cc_model_used=cc_model,
+                    turn_lifecycle_state="partial_failed")
+                branch = await db.get_branch_to_root(draft_msg_id)
+            else:
+                full_text = ""
+                content_blocks = []
             current_block = None
             new_session_id = ""
-            input_tokens = 0
-            output_tokens = 0
+            if not recovering_partial:
+                input_tokens = 0
+                output_tokens = 0
             got_error = False
             last_error = ""
+            last_error_stage = ""
+            last_error_retryable = False
             result_info = {}
             if _gen_key_local:
                 _update_gen_snapshot(
                     _gen_key_local,
-                    full_text="",
-                    content_blocks=[],
-                    input_tokens=0,
-                    output_tokens=0,
+                    full_text=full_text,
+                    content_blocks=content_blocks,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     cc_model=cc_model,
                     mode="goose",
                 )
-            prompt = _build_claude_history_prompt(branch, None) or "(continue)"
-            prompt = _append_attachment_notes(prompt, goose_file_notes)
-            event_stream = await _start_goose(prompt)
-            await _consume_goose_stream(event_stream, emit_error_events=True)
-
-        if not _cc_has_streamed_output(full_text, content_blocks):
-            error_msg = (
-                _goose_error_text(last_error, "")
-                or _goose_error_text(_cc_result_error_detail(result_info), "")
-                or "Goose exited with no response"
+            prompt = await _prepare_agent_handoff(branch, conv, cc_model, "goose",
+                                                  reason=session_continuity["reason"], frozen_tail=recovering_partial)
+            prompt = await _append_prior_acp_permission_feedback(prompt, branch)
+            prompt = add_continuity_notice(
+                prompt,
+                ResumeDecision(
+                    None,
+                    session_continuity["reason"],
+                    resume_decision.message_id,
+                ),
+                branch,
+                "goose",
+                target_model=cc_model,
             )
-            content = f"[Error: {error_msg}]"
+            prompt = _append_attachment_notes(prompt, goose_file_notes)
+            recovery_event_prefix = ""
+            if recovery.allowed:
+                recovery_event_prefix = turn_recovery.claim(recovery, asyncio.current_task(), proc)
+            event_stream = await _start_goose(prompt)
+            await _consume_goose_stream(event_stream, recovery_event_prefix)
+
+        # Goose v41 reports several provider failures as an ordinary assistant
+        # message ending in its canonical retry footer. Remove that envelope
+        # from the useful partial text and treat it as terminal evidence.
+        clean_text, wrapped_error = goose_client.split_goose_terminal_failure(full_text)
+        if wrapped_error:
+            full_text = clean_text
+            last_error = wrapped_error
+            got_error = True
+            last_error_stage = last_error_stage or "provider_response"
+            last_error_retryable = (
+                last_error_retryable
+                or goose_client.is_retryable_goose_failure(wrapped_error)
+            )
+            for index in range(len(content_blocks) - 1, -1, -1):
+                block = content_blocks[index]
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                clean_block, block_error = goose_client.split_goose_terminal_failure(
+                    block.get("text") or ""
+                )
+                if block_error:
+                    if clean_block:
+                        block["text"] = clean_block
+                    else:
+                        content_blocks.pop(index)
+                    break
+
+        if not full_text.strip() and not got_error:
+            got_error = True
+            last_error = (
+                _goose_error_text(_cc_result_error_detail(result_info), "")
+                or "Goose ended without producing a final response"
+            )
+
+        if got_error:
+            error_msg = _goose_error_text(last_error, "Goose generation failed")
+            had_partial = _cc_has_streamed_output(full_text, content_blocks)
+            content = (
+                _append_provider_failure_note(
+                    full_text,
+                    content_blocks,
+                    "Goose",
+                    error_msg,
+                )
+                if had_partial
+                else f"[Error: {error_msg}]"
+            )
+            lifecycle = "partial_failed" if had_partial else "failed"
             gen_ms = int((_time.time() - start_t) * 1000)
+            model_attestation = _failed_session_attestation(
+                model_attestation, result_info, new_session_id, "goose", error_msg,
+            )
             await db.update_message_content(
                 draft_msg_id,
                 content=content,
+                content_blocks=json.dumps(content_blocks) if content_blocks else None,
                 turn_input_tokens=input_tokens,
                 turn_output_tokens=output_tokens,
                 cc_session_id=new_session_id or None,
                 cc_session_mode="goose",
                 cc_model_used=cc_model,
                 generation_ms=gen_ms,
+                time_to_first_token_ms=first_token_ms,
+                turn_lifecycle_state=lifecycle,
+                model_attestation=json.dumps(model_attestation),
             )
             await db.set_active_branch(conv_id, draft_msg_id)
-            if not got_error:
-                await _ws_send(conv_id, {
-                    "type": "error",
-                    "provider": "goose",
-                    "stage": "generation",
-                    "requested_model": cc_model,
-                    "error": error_msg,
-                })
             msg = await db.get_message(draft_msg_id)
-            await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+            task = asyncio.current_task()
+            if task is not None:
+                task._generation_terminal_override = lifecycle
+            await _ws_send(conv_id, {
+                "type": "error",
+                "provider": "goose",
+                "stage": last_error_stage or "generation",
+                "requested_model": cc_model,
+                "error": error_msg,
+                "retryable": last_error_retryable,
+                "lifecycle": lifecycle,
+                "message_id": draft_msg_id,
+                "draft_msg_id": draft_msg_id,
+                "message": dict(msg) if msg else None,
+            })
             return
 
         gen_ms = int((_time.time() - start_t) * 1000)
@@ -8499,7 +13101,9 @@ async def _handle_goose_generation(
             cc_session_id=new_session_id or None,
             cc_session_mode="goose",
             cc_model_used=cc_model,
+            turn_lifecycle_state="completed" if recovering_partial else None,
             generation_ms=gen_ms,
+            time_to_first_token_ms=first_token_ms,
         )
         await db.set_active_branch(conv_id, draft_msg_id)
         msg = await db.get_message(draft_msg_id)
@@ -8514,41 +13118,70 @@ async def _handle_goose_generation(
         })
 
     except asyncio.CancelledError:
-        if draft_msg_id:
-            if full_text.strip() or content_blocks:
-                try:
-                    await db.update_message_content(
-                        draft_msg_id,
-                        content=full_text,
-                        content_blocks=json.dumps(content_blocks) if content_blocks else None,
-                        cc_session_id=new_session_id or None,
-                        cc_session_mode="goose",
-                        cc_model_used=cc_model if "cc_model" in locals() else None,
-                    )
-                except Exception:
-                    pass
-            else:
-                await db.delete_branch(draft_msg_id)
+        if proc is not None:
+            try:
+                await goose_client.cancel_goose(proc)
+            except Exception:
+                pass
+        await _finalize_user_stopped_generation(
+            conv_id,
+            draft_msg_id,
+            partial_text=full_text,
+            content_blocks=content_blocks,
+            session_id=new_session_id or resume_session_id or None,
+            session_mode="goose",
+            model_used=cc_model if "cc_model" in locals() else None,
+            model_attestation=model_attestation,
+            generation_ms=int((_time.time() - start_t) * 1000),
+            time_to_first_token_ms=first_token_ms,
+        )
         raise
     except Exception as exc:
         error_msg = _goose_error_text(exc)
         print(f"[Goose] Error: {error_msg}")
+        saved_msg = None
+        if draft_msg_id:
+            had_partial = _cc_has_streamed_output(full_text, content_blocks)
+            failed_content = (
+                _append_provider_failure_note(
+                    full_text,
+                    content_blocks,
+                    "Goose",
+                    error_msg,
+                )
+                if had_partial
+                else f"[Error: {error_msg}]"
+            )
+            lifecycle = "partial_failed" if had_partial else "failed"
+            await db.update_message_content(
+                draft_msg_id,
+                content=failed_content,
+                content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                cc_session_id=new_session_id or None,
+                cc_session_mode="goose",
+                cc_model_used=locals().get("cc_model"),
+                generation_ms=int((_time.time() - start_t) * 1000),
+                time_to_first_token_ms=first_token_ms,
+                turn_lifecycle_state=lifecycle,
+            )
+            saved_msg = await db.get_message(draft_msg_id)
+            task = asyncio.current_task()
+            if task is not None:
+                task._generation_terminal_override = lifecycle
         await _ws_send(conv_id, {
             "type": "error",
             "provider": "goose",
             "stage": "launch_or_stream",
             "requested_model": locals().get("cc_model") or locals().get("requested_model"),
             "error": error_msg,
+            "retryable": goose_client.is_retryable_goose_failure(error_msg),
+            "lifecycle": (
+                (saved_msg or {}).get("turn_lifecycle_state") if saved_msg else "failed"
+            ),
+            "message_id": draft_msg_id,
+            "draft_msg_id": draft_msg_id,
+            "message": dict(saved_msg) if saved_msg else None,
         })
-        if draft_msg_id:
-            await db.update_message_content(
-                draft_msg_id,
-                content=f"[Error: {error_msg}]",
-                cc_model_used=locals().get("cc_model"),
-                generation_ms=int((_time.time() - start_t) * 1000),
-            )
-            msg = await db.get_message(draft_msg_id)
-            await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
     finally:
         _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key:
@@ -8568,19 +13201,20 @@ async def _handle_goose_generation(
                 pass
         if draft_msg_id:
             try:
-                await db.unregister_active_generation(draft_msg_id)
+                if _generation_providers_exited():
+                    await db.unregister_active_generation(draft_msg_id)
             except Exception:
                 pass
         await _send_generation_idle_if_quiescent(conv_id)
         finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
-        for rid in list(_pending_hook_permissions):
-            pending = _pending_hook_permissions[rid]
-            if (
-                pending.get("conv_id") == conv_id
-                and pending.get("permission_scope") == finished_scope
-            ):
-                _pending_hook_permissions.pop(rid, None)
-                await db.delete_pending_permission(rid)
+        await _resolve_pending_permissions_for_scope(
+            conv_id,
+            finished_scope,
+            message=(
+                "Loom permission request was cancelled because the owning "
+                "Goose turn ended before a user decision."
+            ),
+        )
 
 
 async def _handle_local_generation(
@@ -8642,16 +13276,16 @@ async def _handle_dream_completion(
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
+        if parent_id is None:
+            raise ValueError("Dream generation requires an explicit parent message")
 
         project_dir = conv.get("project_dir") or "."
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
         prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+        prompt = await _append_prior_acp_permission_feedback(prompt, branch)
         model = conv.get("local_model") or config.dream_model or None
 
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg = await _create_generation_draft(conv_id, conv, parent_id)
         draft_msg_id = draft_msg["id"]
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
                                  "draft_msg_id": draft_msg_id,
@@ -8709,19 +13343,15 @@ async def _handle_dream_completion(
                                  "message_id": draft_msg_id, "preview": preview})
 
     except asyncio.CancelledError:
-        if draft_msg_id:
-            if full_text.strip() or content_blocks:
-                try:
-                    await db.update_message_content(
-                        draft_msg_id,
-                        content=full_text,
-                        content_blocks=json.dumps(content_blocks) if content_blocks else None,
-                    )
-                except Exception:
-                    pass
-            else:
-                await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
+        await _finalize_user_stopped_generation(
+            conv_id,
+            draft_msg_id,
+            partial_text=full_text,
+            content_blocks=content_blocks,
+            model_used=f"dream:{model}" if "model" in locals() and model else "dream:default",
+            generation_ms=int((_time.time() - start_t) * 1000),
+        )
+        raise
     except Exception as e:
         if draft_msg_id and (full_text.strip() or content_blocks):
             try:
@@ -8744,1329 +13374,6 @@ async def _handle_dream_completion(
         await _send_generation_idle_if_quiescent(conv_id)
 
 
-def _dream_openai_base_url() -> str:
-    """Dream endpoint as an OpenAI-compatible base URL (with /v1)."""
-    host = (getattr(config, "dream_host", "") or "").strip() or "http://localhost:18081"
-    if not host.startswith(("http://", "https://")):
-        host = f"http://{host}"
-    # On Windows, "localhost" resolves IPv6-first and the sidecar only listens
-    # on IPv4 — every HTTP request eats a ~2s ::1 connect fallback. Hermes makes
-    # ~10 such requests per agent init, which is where Dream Space's 20s/turn
-    # went. Pin to 127.0.0.1.
-    host = host.replace("//localhost", "//127.0.0.1")
-    host = host.rstrip("/")
-    return host if host.endswith("/v1") else f"{host}/v1"
-
-
-def _ensure_dream_hermes_home() -> str:
-    """Create/maintain a SEPARATE Hermes home for Dream Space.
-
-    Dream Space runs the full Hermes ACP loop (tools, memory, sessions,
-    SOUL.md) with the model provider pointed at the Dream DiffusionGemma
-    endpoint. It gets its own home so its state.db / sessions / memories are
-    independent from the llama-backed Hermes agent. SOUL.md + .env are seeded
-    from the llama Hermes home on FIRST creation only; after that the Dream
-    soul is independent so the Dream agent can be instructed separately.
-    """
-    home = os.getenv("DREAM_HERMES_HOME", "").strip()
-    if not home:
-        base_home = Path(config.hermes_home)
-        home = str(base_home.with_name(f"{base_home.name}-dream"))
-    root = Path(home)
-    root.mkdir(parents=True, exist_ok=True)
-
-    model = (getattr(config, "dream_model", "") or "diffusion-gemma").strip()
-    context = int(getattr(config, "dream_context_size", 131072) or 131072)
-    cfg = (
-        "# Hermes Agent config generated by Loom for Dream Space.\n"
-        "# This home points Hermes' custom OpenAI-compatible provider at the\n"
-        "# Dream DiffusionGemma endpoint; the llama-backed Hermes home is\n"
-        "# separate and unaffected.\n\n"
-        "model:\n"
-        f'  default: "{model}"\n'
-        '  provider: "custom"\n'
-        f'  base_url: "{_dream_openai_base_url()}"\n'
-        f"  context_length: {context}\n\n"
-        "memory:\n"
-        "  memory_enabled: true\n"
-        "  user_profile_enabled: true\n"
-        "  nudge_interval: 0\n"
-        "  flush_min_turns: 0\n\n"
-        "skills:\n"
-        "  creation_nudge_interval: 0\n\n"
-        "curator:\n"
-        "  enabled: false\n\n"
-        "session_reset:\n"
-        "  mode: none\n"
-    )
-    cfg_path = root / "config.yaml"
-    try:
-        old = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
-    except Exception:
-        old = ""
-    if old != cfg:
-        cfg_path.write_text(cfg, encoding="utf-8")
-
-    # Seed Hermes' context-length probe cache. The diffusion server exposes no
-    # context-length metadata, so Hermes' per-agent-init probe fails after ~6.5s
-    # every single turn ("probe-down" in agent.log). A cache hit skips the probe
-    # entirely — same mechanism the llama home relies on. Key format matches
-    # what Hermes writes on a successful probe: "<model>@<base_url>/".
-    cache_entry = f"{model}@{_dream_openai_base_url()}/: {context}"
-    cache_path = root / "context_length_cache.yaml"
-    try:
-        cache_old = cache_path.read_text(encoding="utf-8") if cache_path.exists() else ""
-    except Exception:
-        cache_old = ""
-    if cache_entry not in cache_old:
-        if cache_old.strip().startswith("context_lengths:"):
-            cache_path.write_text(cache_old.rstrip("\n") + f"\n  {cache_entry}\n", encoding="utf-8")
-        else:
-            cache_path.write_text(f"context_lengths:\n  {cache_entry}\n", encoding="utf-8")
-
-    # Seed SOUL.md + .env from the llama Hermes home on first creation only.
-    # After that the Dream SOUL.md is independent — edits to the llama Hermes
-    # soul do NOT propagate, so the Dream agent can be instructed separately.
-    base_home = Path(config.hermes_home)
-    for fname in ("SOUL.md", ".env"):
-        dst = root / fname
-        if dst.exists():
-            continue  # Dream soul is independent once seeded
-        src = base_home / fname
-        try:
-            if src.exists():
-                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-        except Exception:
-            pass  # Hermes will auto-seed defaults if missing
-
-    return str(root)
-
-
-def _read_umans_api_key() -> str:
-    """Read the Umans API key from env or the repo .env file.
-
-    Mirrors claude_client.py:893-908 — Prometheus' cloud fallback needs the key
-    written into config.yaml (api_key), and that read has to happen at the same
-    layer (server.py) rather than inside the Anthropic-SDK env-injection path.
-    """
-    key = os.environ.get("UMANS_API_KEY", "").strip()
-    if key:
-        return key
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                if k.strip() == "UMANS_API_KEY":
-                    return v.strip()
-        except Exception:
-            pass
-    return ""
-
-
-def _prometheus_home_path() -> str:
-    """Resolve the Prometheus home dir — config.hermes_home + '-prometheus' suffix.
-
-    Sibling of the dream home suffix at server.py:6563. Stays under %LOCALAPPDATA%
-    (off OneDrive) because state.db sync corruption is the OneDrive failure mode
-    (config.py:114 precedent for the base home).
-    """
-    home = os.getenv("PROMETHEUS_HERMES_HOME", "").strip()
-    if home:
-        return home
-    base_home = Path(config.hermes_home)
-    return str(base_home.with_name(f"{base_home.name}-prometheus"))
-
-
-def _ensure_prometheus_home() -> str:
-    """Create/maintain the incognito Prometheus Hermes home DIR + probe cache.
-
-    This does NOT write config.yaml — that is owned entirely by
-    _write_prometheus_config (the only caller that knows the chosen backend).
-    Previously this also seeded config.yaml with a backend guess, which caused a
-    double-write on the dream path: _ensure_prometheus_home(cloud=False) wrote a
-    LLAMA config (its `else` branch), then _write_prometheus_config immediately
-    overwrote it with the dream config — redundant I/O + a brief window where
-    config.yaml held llama values. Now config.yaml is written exactly once, by
-    the writer that has the real backend.
-
-    Seeds the context-length probe cache for ALL THREE possible backends (cloud +
-    llama + dream) so a warm re-init on any of them skips the 6.5s probe. The
-    cache is backend-agnostic (one file, three keys), so it's correct to seed
-    here regardless of which backend is currently routed.
-    """
-    root = Path(_prometheus_home_path())
-    root.mkdir(parents=True, exist_ok=True)
-
-    # Seed the context-length probe cache for ALL THREE possible backends. Hermes'
-    # probe fails after ~6.5s every turn on endpoints that expose no context
-    # metadata (Umans + local llama + dream all qualify); a cache hit skips it
-    # entirely. Key format matches what Hermes writes on a successful probe:
-    # "<model>@<base_url>/". The router can land Prometheus on any of the three,
-    # so all three are seeded — a missing dream entry would stall every
-    # dream-backend Prometheus turn on the probe.
-    cache_entries = []
-    # Cloud entry — always seed; Prometheus is cloud-functional by default.
-    cloud_model = config.prometheus_cloud_model
-    cloud_url = config.prometheus_cloud_base_url.rstrip("/")
-    cache_entries.append(f"{cloud_model}@{cloud_url}/: {config.prometheus_cloud_context}")
-    # Local llama entry — seed so a router flip to local skips the probe too.
-    local_model = config.llama_model
-    local_url = config.llama_host_url().rstrip("/") + "/v1"
-    local_ctx = int(getattr(config, "max_context_tokens", 32768) or 32768)
-    cache_entries.append(f"{local_model}@{local_url}/: {local_ctx}")
-    # Dream entry — seed so a router flip to dream (dream up, llama down) skips
-    # the probe. The dream /v1 base_url is the DiffusionGemma sidecar endpoint.
-    dream_model = (getattr(config, "dream_model", "") or "diffusion-gemma").strip()
-    dream_url = _dream_openai_base_url()
-    dream_ctx = int(getattr(config, "dream_context_size", 131072) or 131072)
-    cache_entries.append(f"{dream_model}@{dream_url}/: {dream_ctx}")
-
-    cache_path = root / "context_length_cache.yaml"
-    try:
-        cache_old = cache_path.read_text(encoding="utf-8") if cache_path.exists() else ""
-    except Exception:
-        cache_old = ""
-    if not cache_old.strip().startswith("context_lengths:"):
-        cache_old = "context_lengths:\n"
-    # Dedup by exact key match. The key is the "<model>@<base_url>/" portion
-    # (everything before the ": <context>" value). base_url contains "://" so a
-    # naive split-on-first-colon reduces the key to "<model>@https" and falsely
-    # matches any same-scheme URL. We parse the existing lines into a set of
-    # present keys (stripped of indentation) and compare exactly — so a model
-    # that's a prefix of another (e.g. "llama" vs "llama-large") does NOT cause
-    # the longer entry to be skipped as a duplicate.
-    def _cache_key(entry: str) -> str:
-        return entry.rsplit(": ", 1)[0] if ": " in entry else entry
-    present_keys: set[str] = set()
-    for line in cache_old.splitlines():
-        s = line.strip()
-        if s and not s.startswith("context_lengths:") and ": " in s:
-            present_keys.add(_cache_key(s))
-    missing = [e for e in cache_entries if _cache_key(e) not in present_keys]
-    if missing:
-        cache_path.write_text(
-            cache_old.rstrip("\n") + "\n" + "\n".join(f"  {e}" for e in missing) + "\n",
-            encoding="utf-8",
-        )
-
-    # NO SOUL.md seed — Prometheus is incognito by design. Do not copy from the
-    # llama Hermes home (the dream generator does at server.py:6619-6629; Prometheus
-    # deliberately skips this so it carries no persistent identity).
-
-    return str(root)
-
-
-async def _probe_llama_live(timeout: float = 2.0) -> bool:
-    """Is llama-server up? GET /v1/models (mirrors admin_server.py:436)."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(f"{config.llama_host_url()}/v1/models")
-            return r.status_code == 200
-    except Exception:
-        return False
-
-
-async def _probe_dream_live(timeout: float = 2.0) -> bool:
-    """Is the dream sidecar up? GET /health (mirrors admin_server.py:961)."""
-    try:
-        host = config.dream_host if config.dream_host else "http://127.0.0.1:8787"
-        if host and not host.startswith(("http://", "https://")):
-            host = f"http://{host}"
-        host = host.replace("//localhost", "//127.0.0.1")
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(f"{host.rstrip('/')}/health")
-            return r.status_code == 200
-    except Exception:
-        return False
-
-
-async def _prometheus_pick_backend() -> dict:
-    """Probe local model liveness → decide Prometheus' backend.
-
-    Returns {backend: "llama"|"dream"|"cloud", base_url, model, api_key, context}.
-    Preference order: llama > dream > cloud. The local attendant for whichever
-    model is up is the natural Prometheus backend (same /v1, already warm);
-    cloud is the always-functional fallback when neither local model is up.
-    """
-    if await _probe_llama_live():
-        return {
-            "backend": "llama",
-            "base_url": config.llama_host_url().rstrip("/") + "/v1",
-            "model": config.llama_model,
-            "api_key": "",
-            "context": int(getattr(config, "max_context_tokens", 32768) or 32768),
-        }
-    if await _probe_dream_live():
-        return {
-            "backend": "dream",
-            "base_url": _dream_openai_base_url(),
-            "model": (getattr(config, "dream_model", "") or "diffusion-gemma").strip(),
-            "api_key": "",
-            "context": int(getattr(config, "dream_context_size", 131072) or 131072),
-        }
-    return {
-        "backend": "cloud",
-        "base_url": config.prometheus_cloud_base_url.rstrip("/"),
-        "model": config.prometheus_cloud_model,
-        "api_key": _read_umans_api_key(),
-        "context": config.prometheus_cloud_context,
-    }
-
-
-def _write_prometheus_config(backend: dict) -> str:
-    """Rewrite Prometheus' config.yaml for the chosen backend. Returns home path.
-
-    Sole owner of config.yaml. _ensure_prometheus_home (called below) only
-    ensures the home dir + probe cache exist — it no longer writes config.yaml
-    itself, which avoids a double-write + transient-wrong-config race on the
-    dream path (see _ensure_prometheus_home docstring).
-    """
-    home = _ensure_prometheus_home()
-    root = Path(home)
-    model = backend["model"]
-    base_url = backend["base_url"]
-    context = backend["context"]
-    api_key = backend.get("api_key", "") or ""
-
-    cfg = (
-        "# Hermes Agent config generated by Loom for Prometheus.\n"
-        "# Prometheus is the incognito, always-warm runtime: no soul, no memory,\n"
-        "# no SOUL.md. The base_url below is set by the cloud-fallback router\n"
-        f"# (current backend: {backend['backend']}).\n\n"
-        "model:\n"
-        f'  default: "{model}"\n'
-        '  provider: "custom"\n'
-        f'  base_url: "{base_url}"\n'
-        f"  context_length: {context}\n"
-        + (f'  api_key: "{api_key}"\n' if api_key else "  api_key: \"\"\n")
-        + "\n"
-        "memory:\n"
-        "  memory_enabled: false\n"
-        "  user_profile_enabled: false\n"
-        "  nudge_interval: 0\n"
-        "  flush_min_turns: 0\n\n"
-        "skills:\n"
-        "  creation_nudge_interval: 0\n\n"
-        "curator:\n"
-        "  enabled: false\n\n"
-        "session_reset:\n"
-        "  mode: none\n"
-    )
-    (root / "config.yaml").write_text(cfg, encoding="utf-8")
-    return home
-
-
-def _backend_signature(backend: dict) -> str:
-    """A stable signature of the chosen backend's *connection* identity.
-
-    Used as the .loom_backend marker so ANY meaningful change — base_url (e.g.
-    llama_host moved from :8000 to :8001 while still "llama"), model, context
-    length, or api_key (cloud key rotated) — triggers a warm-runtime reload. The
-    coarse `backend` label alone is insufficient: a same-class base_url change
-    would rewrite config.yaml but leave the warm process pointed at the dead old
-    endpoint (Hermes reads base_url at process init, not on set_model).
-
-    api_key is hashed (not stored in the marker as plaintext) — the marker is a
-    sidecar file in the home dir, not secrets storage, but we still avoid writing
-    keys to disk when a boolean presence is enough to detect rotation.
-    """
-    import hashlib
-    key = (backend.get("api_key") or "").strip()
-    key_sig = "set" if key else "empty"
-    if key:
-        # Short hash so a rotated key is detectable without storing it.
-        key_sig = "set:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
-    return "|".join([
-        backend.get("backend", ""),
-        backend.get("base_url", ""),
-        backend.get("model", ""),
-        str(backend.get("context", "")),
-        key_sig,
-    ])
-
-
-async def route_prometheus_backend(*, force: bool = False) -> dict:
-    """Decide Prometheus' backend, rewrite its config, clear the warm runtime if
-    the backend signature changed.
-
-    Called on Prometheus turn dispatch (incognito conversations) and from the
-    admin Prometheus-restart endpoint. Returns the chosen backend dict so the
-    caller can pass the right model id into run_hermes.
-
-    If the warm Prometheus runtime was pointing at a different backend signature
-    (base_url / model / context / api_key — not just the coarse label), we stop
-    it (stop_runtime_by_home) so the next turn re-inits against the new config —
-    Hermes reads base_url at process init, not on session/set_model, so a warm
-    process wouldn't actually move otherwise. Probe cache makes re-init cheap.
-
-    `force=True` (admin Restart button) always clears the warm runtime + bumps
-    the marker, even when the signature is unchanged — that's the explicit
-    "restart" intent, vs. the routing path's "only reload if changed".
-    """
-    backend = await _prometheus_pick_backend()
-    home = _write_prometheus_config(backend)
-    sig = _backend_signature(backend)
-    marker = Path(home) / ".loom_backend"
-    prev = ""
-    try:
-        if marker.exists():
-            prev = marker.read_text(encoding="utf-8").strip()
-    except Exception:
-        pass
-    needs_reload = force or prev != sig
-    if needs_reload:
-        # stop_runtime_by_home refuses to kill a runtime with an active turn
-        # (hermes_client.stop_runtime_by_home) — a backend flip must NOT corrupt
-        # a live Prometheus turn. It returns False in that case. CRITICAL: only
-        # write the new signature marker if the clear actually succeeded (or
-        # there was no warm runtime to clear). Writing the marker on a refused
-        # stop would mark the new backend as current while the OLD warm process
-        # keeps running — so later turns see signature-match and reuse the stale
-        # process pointed at the dead old endpoint indefinitely.
-        cleared = True
-        if hermes_client is not None:
-            cleared = await hermes_client.stop_runtime_by_home(home)
-            # cleared is False when a runtime existed but had an active turn.
-            # No runtime → stop_runtime_by_home returns False too, but in that
-            # case there's nothing stale to reuse, so the marker is safe to bump.
-            had_runtime = hermes_client.find_runtime_by_home(home) is not None
-            cleared = cleared or not had_runtime
-        if cleared:
-            try:
-                marker.write_text(sig, encoding="utf-8")
-            except Exception:
-                pass
-    # `reloaded` is True only when we actually cleared the warm runtime (or there
-    # was none to clear) AND bumped the marker. A refused stop (active turn)
-    # leaves reloaded=False so the caller knows the warm process is stale and
-    # the next turn will re-attempt the reload.
-    return {**backend, "home": home, "reloaded": needs_reload and cleared}
-
-
-async def _refuse_ensouled_model_down(
-    websocket: WebSocket, conv_id: int, backend: str, model_name: str
-):
-    """Refuse an ensouled Hermes turn whose model server is down.
-
-    NO generation, NO silent fallback to Prometheus. The error names the down
-    model and points the user to the two paths: start it (via admin) or toggle
-    incognito for an always-functional no-soul path. Silent fallback would lose
-    the soul mid-conversation — the exact contamination the design prevents.
-
-    Called BEFORE the attendant handler creates a draft message, so we emit only
-    an error event (no stream_start/result pair) — there's no ghost node to close.
-    The `ensouled_refusal` flag lets the UI render this distinctly from a generic
-    transport error.
-    """
-    label = "llama-server" if backend == "llama" else "the Dream sidecar"
-    err = (
-        f"The {label} backing this conversation's soul is down (model: "
-        f"{model_name}). This ensouled conversation refuses to generate rather "
-        f"than silently fall back to a soulless path. Either start {label} via "
-        f"the admin dashboard, or toggle this conversation to Incognito to route "
-        f"through Prometheus (always-functional, no soul, cloud fallback)."
-    )
-    await _ws_send(conv_id, {"type": "error", "error": err, "ensouled_refusal": True,
-                             "backend": backend, "model": model_name})
-
-
-async def _handle_prometheus_generation(
-    websocket: WebSocket, conv_id: int, conv: dict, data: dict
-):
-    """Handle an incognito Hermes turn via Prometheus (always-warm, cloud-fallback).
-
-    Sibling of _handle_hermes_generation, but: (1) routes the backend first
-    (local /v1 if a model is up, else Umans cloud), (2) runs against the
-    Prometheus home (no soul, no memory, no SOUL.md), (3) always opens a fresh
-    session each turn — Prometheus is incognito, so it does NOT carry session
-    history across turns the way ensouled attendants do.
-    """
-    if hermes_client is None:
-        await _ws_send(conv_id, {
-            "type": "error",
-            "error": f"Prometheus unavailable: Hermes adapter failed to import ({_HERMES_IMPORT_ERROR})",
-        })
-        return
-
-    import time as _time
-    draft_msg_id = None
-    full_text = ""
-    content_blocks: list[dict] = []
-    proc = None
-    start_t = _time.time()
-    try:
-        action = data.get("action")
-        parent_id = data.get("parent_id")
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
-
-        project_dir = conv.get("project_dir") or "."
-        if project_dir != "." and not os.path.isdir(project_dir):
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": f"Working directory not found: {project_dir}"})
-            return
-
-        branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-
-        # Route the backend: probe local models, rewrite Prometheus config, clear
-        # the warm runtime if the backend moved. Returns home + chosen model.
-        backend = await route_prometheus_backend()
-        prometheus_home = backend["home"]
-        model = f"custom:{backend['model']}" if backend.get("model") else None
-
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
-        draft_msg_id = draft_msg["id"]
-        await db.update_message_content(
-            draft_msg_id,
-            cc_model_used=f"prometheus:{backend.get('model') or 'unknown'}",
-        )
-        backend_tag = backend["backend"]
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
-                                 "draft_msg_id": draft_msg_id,
-                                 "cc_model": f"prometheus:{backend.get('model') or ''}",
-                                 "local_model": backend["model"],
-                                 "prometheus_backend": backend_tag})
-        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key_local:
-            _update_gen_snapshot(
-                _gen_key_local,
-                full_text="",
-                content_blocks=content_blocks,
-                started_at=start_t,
-                draft_msg_id=draft_msg_id,
-                parent_id=parent_id,
-                cc_model=backend.get("model") or "",
-                mode="prometheus",
-            )
-        await _ws_send(conv_id, {"type": "status",
-                                 "text": f"Prometheus generating ({backend_tag})…"})
-
-        try:
-            proc, event_stream = await hermes_client.run_hermes(
-                prompt,
-                conv_id=conv_id,
-                model=model,
-                cwd=project_dir,
-                loom_port=config.port,
-                hermes_exe=config.hermes_executable(),
-                hermes_home=prometheus_home,
-                branch=branch,
-                # Prometheus is incognito: no session resume across turns. A
-                # fresh session each turn is correct — there's no soul/memory to
-                # preserve server-side, and history is replayed via the prompt.
-                resume_session_id=None,
-                fork_session=False,
-                is_first_turn=True,
-            )
-        except Exception as e:
-            if draft_msg_id:
-                await db.delete_branch(draft_msg_id)
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": f"Failed to start Prometheus: {e}"})
-            return
-
-        # Register the active generation so it shows in the admin active-gens
-        # panel AND is reaped as a tracked orphan if the server restarts mid-turn
-        # (mirrors _handle_hermes_generation at server.py:7737). The finally block
-        # below unregisters it; without this register, the unregister is a no-op
-        # and a crashed Prometheus turn leaves an invisible orphan.
-        try:
-            await db.register_active_generation(
-                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
-                project_dir=project_dir, mode="prometheus",
-            )
-        except Exception as e:
-            print(f"[Prometheus] Failed to register active generation: {e}")
-
-        async for event in event_stream:
-            etype = event.get("type", "")
-            if etype == "session_info":
-                attestation = event.get("model_attestation")
-                if isinstance(attestation, dict):
-                    await _record_turn_model_attestation(
-                        conv_id,
-                        draft_msg_id,
-                        parent_id,
-                        attestation,
-                        _gen_key_local,
-                    )
-                session_id = event.get("session_id") or ""
-                if session_id:
-                    try:
-                        await db.update_active_generation_session(draft_msg_id, session_id)
-                    except Exception:
-                        pass
-            elif etype == "text_delta":
-                delta = event.get("text", "")
-                full_text += delta
-                if content_blocks and content_blocks[-1].get("type") == "text":
-                    content_blocks[-1]["text"] += delta
-                else:
-                    content_blocks.append({"type": "text", "text": delta})
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": delta})
-            elif etype == "error":
-                await _ws_send(conv_id, event)
-            elif etype == "result":
-                # Persist the assistant turn.
-                if draft_msg_id and full_text.strip():
-                    await db.update_message_content(draft_msg_id, content=full_text)
-                await _ws_send(conv_id, event)
-            else:
-                await _ws_send(conv_id, event)
-            if _gen_key_local:
-                _update_gen_snapshot(
-                    _gen_key_local,
-                    full_text=full_text,
-                    content_blocks=content_blocks,
-                )
-
-        if draft_msg_id and not full_text.strip():
-            try:
-                await db.delete_branch(draft_msg_id)
-            except Exception:
-                pass
-    except asyncio.CancelledError:
-        # On Python 3.14+, asyncio.CancelledError is NOT an Exception subclass,
-        # so the `except Exception` block below does NOT catch it — without this
-        # explicit handler, cancellation would skip the partial-save/delete
-        # cleanup and leave an empty draft or lose accumulated full_text. Re-raise
-        # after cleanup so the cancellation propagates to the task caller.
-        if draft_msg_id and full_text.strip():
-            try:
-                await db.update_message_content(draft_msg_id, content=full_text)
-            except Exception:
-                pass
-        elif draft_msg_id:
-            try:
-                await db.delete_branch(draft_msg_id)
-            except Exception:
-                pass
-        raise
-    except Exception as e:
-        if draft_msg_id and full_text.strip():
-            try:
-                await db.update_message_content(draft_msg_id, content=full_text)
-            except Exception:
-                pass
-        elif draft_msg_id:
-            await db.delete_branch(draft_msg_id)
-        print(f"[Prometheus] generation error conv={conv_id}: {e}")
-        await _ws_send(conv_id, {"type": "error", "error": str(e)})
-    finally:
-        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key:
-            _active_generations.pop(_gen_key, None)
-            _generation_snapshots.pop(_gen_key, None)
-        await _send_generation_idle_if_quiescent(conv_id)
-        try:
-            if draft_msg_id:
-                await db.unregister_active_generation(draft_msg_id)
-        except Exception:
-            pass
-
-
-async def _handle_dream_generation(
-    websocket: WebSocket, conv_id: int, conv: dict, data: dict
-):
-    """Handle Dream Space — an agentic Hermes loop powered by Dream Engine.
-
-    Full Hermes ACP (tools, memory, sessions, SOUL.md) with the model backend
-    pointed at the Dream DiffusionGemma endpoint via a separate Hermes home.
-    Sibling of _handle_hermes_generation — same event handling, different home.
-    """
-    if hermes_client is None:
-        await _ws_send(conv_id, {
-            "type": "error",
-            "error": f"Dream Space unavailable: Hermes adapter failed to import ({_HERMES_IMPORT_ERROR})",
-        })
-        return
-
-    import time as _time
-    import json
-    draft_msg_id = None
-    full_text = ""
-    proc = None
-    start_t = _time.time()
-    try:
-        action = data.get("action")
-        parent_id = data.get("parent_id")
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
-
-        project_dir = conv.get("project_dir") or "."
-        if project_dir != "." and not os.path.isdir(project_dir):
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": f"Working directory not found: {project_dir}"})
-            return
-
-        # Build the prompt from the branch.
-        branch = await db.get_branch_to_root(parent_id) if parent_id else []
-
-        resume_session_id = None
-        use_resume = False
-        fork_session = True  # Always fork to keep branch history isolated
-
-        resume_decision = select_resume_session(branch, "dream")
-        resume_session_id = resume_decision.session_id
-        if not resume_session_id:
-            print(
-                f"[DREAM] Native session rebuild: reason={resume_decision.reason} "
-                f"boundary_msg={resume_decision.message_id}"
-            )
-
-        if resume_session_id:
-            use_resume = True
-            latest_user_content = ""
-            for msg in reversed(branch):
-                if msg["role"] == "user":
-                    latest_user_content = msg["content"]
-                    break
-            prompt = latest_user_content or "(continue)"
-        else:
-            prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-
-        # Dream home is separate from the llama Hermes home, but pass the model
-        # explicitly so Hermes does not need to infer it from provider defaults.
-        dream_home = _ensure_dream_hermes_home()
-        model = f"custom:{config.dream_model}" if config.dream_model else None
-
-        # Draft message so the tree shows a ghost node while streaming.
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
-        draft_msg_id = draft_msg["id"]
-        await db.update_message_content(
-            draft_msg_id,
-            cc_model_used=f"dream:{config.dream_model}",
-        )
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
-                                 "draft_msg_id": draft_msg_id,
-                                 "cc_model": f"dream:{config.dream_model}",
-                                 "local_model": config.dream_model})
-        await _ws_send(conv_id, {"type": "status", "text": "Dream Space generating…"})
-
-        try:
-            proc, event_stream = await hermes_client.run_hermes(
-                prompt,
-                conv_id=conv_id,
-                model=model,
-                cwd=project_dir,
-                loom_port=config.port,
-                hermes_exe=config.hermes_executable(),
-                hermes_home=dream_home,
-                branch=branch,
-                resume_session_id=resume_session_id if use_resume else None,
-                fork_session=fork_session,
-                # Resume turns fork a session that already holds the conversation
-                # history server-side; re-injecting <loom_branch_info> would feed
-                # the model every prior message twice. Fresh sessions (use_resume
-                # False) get the full orientation block.
-                is_first_turn=not use_resume,
-                isolated=bool(conv.get("parallel_agents_enabled")),
-            )
-        except Exception as e:
-            if use_resume:
-                print(f"[Dream] Resume failed ({e}), falling back to full history")
-                await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
-                use_resume = False
-                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-                try:
-                    proc, event_stream = await hermes_client.run_hermes(
-                        prompt,
-                        conv_id=conv_id,
-                        model=model,
-                        cwd=project_dir,
-                        loom_port=config.port,
-                        hermes_exe=config.hermes_executable(),
-                        hermes_home=dream_home,
-                        branch=branch,
-                        # Fallback opens a fresh session/new — it needs the full
-                        # branch orientation since there is no forked history.
-                        is_first_turn=True,
-                        isolated=bool(conv.get("parallel_agents_enabled")),
-                    )
-                except Exception as e2:
-                    if draft_msg_id:
-                        await db.delete_branch(draft_msg_id)
-                    await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Dream Space: {e2}"})
-                    return
-            else:
-                if draft_msg_id:
-                    await db.delete_branch(draft_msg_id)
-                await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Dream Space: {e}"})
-                return
-
-        _active_hermes_procs[conv_id] = proc
-        try:
-            await db.register_active_generation(
-                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
-                project_dir=project_dir, mode="dream",
-            )
-        except Exception as e:
-            print(f"[Dream] Failed to register active generation: {e}")
-
-        content_blocks: list[dict] = []
-        current_block = None
-        new_session_id = ""
-        total_input_tokens = 0
-        total_output_tokens = 0
-        result_info: dict = {}
-        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key_local:
-            _update_gen_snapshot(
-                _gen_key_local,
-                full_text="",
-                content_blocks=content_blocks,
-                started_at=start_t,
-                draft_msg_id=draft_msg_id,
-                parent_id=parent_id,
-                cc_model=config.dream_model or "",
-                mode="dream",
-            )
-
-        async for evt in event_stream:
-            etype = evt.get("type")
-            if etype == "session_info":
-                new_session_id = evt.get("session_id", "") or new_session_id
-                attestation = evt.get("model_attestation")
-                if isinstance(attestation, dict):
-                    await _record_turn_model_attestation(
-                        conv_id,
-                        draft_msg_id,
-                        parent_id,
-                        attestation,
-                        _gen_key_local,
-                    )
-                try:
-                    await db.update_active_generation_session(draft_msg_id, new_session_id)
-                except Exception:
-                    pass
-                resolved = (evt.get("model") or "").strip()
-                for prefix in ("custom:",):
-                    if resolved.startswith(prefix):
-                        resolved = resolved[len(prefix):].strip()
-                        break
-                if resolved and not conv.get("local_model"):
-                    conv["local_model"] = resolved
-                    try:
-                        await db.update_conversation_fields(conv_id, local_model=resolved)
-                    except Exception:
-                        pass
-                    await _ws_send(conv_id, {"type": "conv_field_update", "local_model": resolved})
-            elif etype == "hermes_commands":
-                cmds = evt.get("commands") or []
-                if cmds:
-                    await _ws_send(conv_id, {"type": "hermes_commands", "commands": cmds})
-            elif etype == "text_delta":
-                full_text += evt["text"]
-                if current_block and current_block["type"] == "text":
-                    current_block["text"] += evt["text"]
-                else:
-                    current_block = {"type": "text", "text": evt["text"]}
-                    content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
-            elif etype == "thinking_delta":
-                if current_block and current_block["type"] == "thinking":
-                    current_block["text"] += evt["text"]
-                else:
-                    current_block = {"type": "thinking", "text": evt["text"]}
-                    content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
-            elif etype == "tool_start":
-                current_block = {"type": "tool_use", "name": evt["name"],
-                                 "tool_id": evt.get("tool_id", ""), "input": "", "result": ""}
-                content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "tool_start", "name": evt["name"],
-                                         "tool_id": evt.get("tool_id", "")})
-            elif etype == "tool_input_delta":
-                if current_block and current_block["type"] == "tool_use":
-                    current_block["input"] += evt["json"]
-                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt["json"],
-                                         "tool_id": evt.get("tool_id", "")})
-            elif etype == "tool_result":
-                tool_id = evt.get("tool_id", "")
-                image_url = evt.get("image_url")
-                for block in reversed(content_blocks):
-                    if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
-                        block["result"] = evt.get("content", "")
-                        if image_url:
-                            block["image_url"] = image_url
-                        break
-                current_block = None
-                tool_result_msg = {
-                    "type": "tool_result",
-                    "content": evt.get("content", ""),
-                    "tool_id": tool_id
-                }
-                if image_url:
-                    tool_result_msg["image_url"] = image_url
-                if evt.get("is_error"):
-                    tool_result_msg["is_error"] = True
-                await _ws_send(conv_id, tool_result_msg)
-                await db.update_message_content(draft_msg_id, content=full_text,
-                                                content_blocks=json.dumps(content_blocks))
-            elif etype == "usage":
-                total_input_tokens = evt.get("input_tokens", 0) or total_input_tokens
-                total_output_tokens += evt.get("output_tokens", 0)
-                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens,
-                                         "output_tokens": total_output_tokens})
-            elif etype == "hermes_usage_update":
-                used = evt.get("used")
-                if used is not None:
-                    await _ws_send(conv_id, {"type": "context_info", "total_tokens": used})
-            elif etype == "plan_update":
-                await _ws_send(conv_id, {"type": "status", "text": "Dream Space updated its plan."})
-            elif etype == "error":
-                await _ws_send(conv_id, {"type": "status", "text": f"Dream: {evt.get('error', '')}"})
-            elif etype == "result":
-                result_info = evt
-                new_session_id = evt.get("session_id", "") or new_session_id
-            if _gen_key_local:
-                _update_gen_snapshot(
-                    _gen_key_local,
-                    full_text=full_text,
-                    content_blocks=content_blocks,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
-                )
-
-        if _active_hermes_procs.get(conv_id) is proc:
-            _active_hermes_procs.pop(conv_id, None)
-
-        if not full_text.strip() and not content_blocks:
-            if draft_msg_id:
-                await db.delete_branch(draft_msg_id)
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": "Dream returned an empty response — try again"})
-            return
-
-        gen_ms = int((_time.time() - start_t) * 1000)
-        await db.update_message_content(
-            draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
-            cc_session_id=new_session_id or None,
-            cc_session_mode="dream",
-            cc_model_used=f"dream:{config.dream_model}",
-            generation_ms=gen_ms,
-        )
-        await db.set_active_branch(conv_id, draft_msg_id)
-        msg = await db.get_message(draft_msg_id)
-        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
-        preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
-        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id,
-                                 "conv_title": conv.get("title", "Conversation"),
-                                 "message_id": draft_msg_id, "preview": preview})
-
-    except asyncio.CancelledError:
-        if proc is not None:
-            try:
-                await hermes_client.cancel_hermes(proc)
-            except Exception:
-                pass
-        if draft_msg_id:
-            if full_text.strip():
-                try:
-                    await db.update_message_content(draft_msg_id, content=full_text)
-                except Exception:
-                    pass
-            else:
-                await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
-    except Exception as e:
-        if draft_msg_id and full_text.strip():
-            try:
-                await db.update_message_content(draft_msg_id, content=full_text)
-            except Exception:
-                pass
-        elif draft_msg_id:
-            await db.delete_branch(draft_msg_id)
-        print(f"[Dream] generation error conv={conv_id}: {e}")
-        await _ws_send(conv_id, {"type": "error", "error": str(e)})
-    finally:
-        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key:
-            _active_generations.pop(_gen_key, None)
-            _generation_snapshots.pop(_gen_key, None)
-        await _send_generation_idle_if_quiescent(conv_id)
-
-        # Clear the SQLite active generation row so it doesn't clutter the
-        # admin "Active Generations" panel with dead sessions.
-        try:
-            if 'draft_msg_id' in locals() and draft_msg_id:
-                await db.unregister_active_generation(draft_msg_id)
-        except Exception:
-            pass
-
-
-async def _handle_hermes_generation(
-    websocket: WebSocket, conv_id: int, conv: dict, data: dict
-):
-    """Handle Hermes mode — drive a per-turn `hermes acp` subprocess.
-
-    Sibling of _handle_claude_generation (NOT templated off it — none of CC's
-    compact-handoff / cross-provider-resume / cc_model plumbing applies). v1 is
-    history-replay: every turn opens a fresh ACP session and the full branch is
-    rendered into the prompt, so Loom's fork-every-turn invariant holds trivially.
-
-    Not wired into _handle_generation's dispatch yet — that, plus DB-mode
-    acceptance and the admin status probe, is Phase 3.
-    """
-    if hermes_client is None:
-        await _ws_send(conv_id, {
-            "type": "error",
-            "error": f"Hermes unavailable: adapter failed to import ({_HERMES_IMPORT_ERROR})",
-        })
-        return
-
-    import time as _time
-    draft_msg_id = None
-    full_text = ""
-    proc = None
-    start_t = _time.time()
-    try:
-        action = data.get("action")
-        parent_id = data.get("parent_id")
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
-
-        project_dir = conv.get("project_dir") or "."
-        if project_dir != "." and not os.path.isdir(project_dir):
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": f"Working directory not found: {project_dir}"})
-            return
-
-        # Build the prompt from the branch.
-        branch = await db.get_branch_to_root(parent_id) if parent_id else []
-
-        resume_session_id = None
-        use_resume = False
-        fork_session = True  # Always fork to keep branch history isolated, parallel to Claude Code
-
-        resume_decision = select_resume_session(branch, "hermes")
-        resume_session_id = resume_decision.session_id
-        if not resume_session_id:
-            print(
-                f"[HERMES] Native session rebuild: reason={resume_decision.reason} "
-                f"boundary_msg={resume_decision.message_id}"
-            )
-
-        if resume_session_id:
-            use_resume = True
-            latest_user_content = ""
-            for msg in reversed(branch):
-                if msg["role"] == "user":
-                    latest_user_content = msg["content"]
-                    break
-            prompt = latest_user_content or "(continue)"
-        else:
-            prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-
-        model = conv.get("local_model") or None  # None -> Hermes uses its config.yaml default
-
-        # Draft message so the tree shows a ghost node while streaming.
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
-        draft_msg_id = draft_msg["id"]
-        await db.update_message_content(
-            draft_msg_id,
-            cc_model_used=f"hermes:{model or 'default'}",
-        )
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
-                                 "draft_msg_id": draft_msg_id,
-                                 "cc_model": f"hermes:{model or 'default'}",
-                                 "local_model": model or ""})
-
-        try:
-            proc, event_stream = await hermes_client.run_hermes(
-                prompt,
-                conv_id=conv_id,
-                model=model,
-                cwd=project_dir,
-                loom_port=config.port,
-                hermes_exe=config.hermes_executable(),
-                hermes_home=config.hermes_home,
-                branch=branch,
-                resume_session_id=resume_session_id if use_resume else None,
-                fork_session=fork_session,
-                # Resume turns fork a session that already holds the conversation
-                # history server-side; re-injecting <loom_branch_info> would feed
-                # the model every prior message twice. Fresh sessions (use_resume
-                # False) get the full orientation block.
-                is_first_turn=not use_resume,
-                isolated=bool(conv.get("parallel_agents_enabled")),
-            )
-        except Exception as e:
-            if use_resume:
-                print(f"[Hermes] Resume failed ({e}), falling back to full history")
-                await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
-                use_resume = False
-                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-                try:
-                    proc, event_stream = await hermes_client.run_hermes(
-                        prompt,
-                        conv_id=conv_id,
-                        model=model,
-                        cwd=project_dir,
-                        loom_port=config.port,
-                        hermes_exe=config.hermes_executable(),
-                        hermes_home=config.hermes_home,
-                        branch=branch,
-                        # Fallback opens a fresh session/new — it needs the full
-                        # branch orientation since there is no forked history.
-                        is_first_turn=True,
-                        isolated=bool(conv.get("parallel_agents_enabled")),
-                    )
-                except Exception as e2:
-                    if draft_msg_id:
-                        await db.delete_branch(draft_msg_id)
-                    await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e2}"})
-                    return
-            else:
-                if draft_msg_id:
-                    await db.delete_branch(draft_msg_id)
-                await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e}"})
-                return
-
-        _active_hermes_procs[conv_id] = proc
-        try:
-            await db.register_active_generation(
-                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
-                project_dir=project_dir, mode="hermes",
-            )
-        except Exception as e:
-            print(f"[Hermes] Failed to register active generation: {e}")
-
-        content_blocks: list[dict] = []
-        current_block = None
-        new_session_id = ""
-        total_input_tokens = 0
-        total_output_tokens = 0
-        result_info: dict = {}
-        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key_local:
-            _update_gen_snapshot(
-                _gen_key_local,
-                full_text="",
-                content_blocks=content_blocks,
-                started_at=start_t,
-                draft_msg_id=draft_msg_id,
-                parent_id=parent_id,
-                cc_model=model or "",
-                mode="hermes",
-            )
-
-        async for evt in event_stream:
-            etype = evt.get("type")
-            if etype == "session_info":
-                new_session_id = evt.get("session_id", "") or new_session_id
-                attestation = evt.get("model_attestation")
-                if isinstance(attestation, dict):
-                    await _record_turn_model_attestation(
-                        conv_id,
-                        draft_msg_id,
-                        parent_id,
-                        attestation,
-                        _gen_key_local,
-                    )
-                try:
-                    await db.update_active_generation_session(draft_msg_id, new_session_id)
-                except Exception:
-                    pass
-                # If the conv has no pinned model, record the one Hermes actually
-                # resolved (config.yaml default) so the chat header / model picker
-                # show it instead of a bare "(local model)".
-                if not conv.get("local_model"):
-                    resolved = (evt.get("model") or "").strip()
-                    for prefix in ("custom:",):
-                        if resolved.startswith(prefix):
-                            resolved = resolved[len(prefix):].strip()
-                            break
-                    
-                    # Heuristic: if Hermes returned a mangled suffix (like '27b' for 'qwen3.6:27b'),
-                    # re-expand it so we don't save a broken model name that fails next turn.
-                    if resolved and ":" in config.llama_model:
-                        base, tag = config.llama_model.rsplit(":", 1)
-                        if resolved == tag or resolved == config.llama_model.split(":")[-1]:
-                            resolved = config.llama_model
-
-                    if resolved:
-                        conv["local_model"] = resolved
-                        try:
-                            await db.update_conversation_fields(conv_id, local_model=resolved)
-                        except Exception:
-                            pass
-                        await _ws_send(conv_id, {"type": "conv_field_update", "local_model": resolved})
-            elif etype == "hermes_commands":
-                # Forward Hermes' own slash-command list so the chat input's
-                # "/" autocomplete shows them (in place of Loom's meta commands).
-                cmds = evt.get("commands") or []
-                if cmds:
-                    await _ws_send(conv_id, {"type": "hermes_commands", "commands": cmds})
-            elif etype == "text_delta":
-                full_text += evt["text"]
-                if current_block and current_block["type"] == "text":
-                    current_block["text"] += evt["text"]
-                else:
-                    current_block = {"type": "text", "text": evt["text"]}
-                    content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
-            elif etype == "thinking_delta":
-                if current_block and current_block["type"] == "thinking":
-                    current_block["text"] += evt["text"]
-                else:
-                    current_block = {"type": "thinking", "text": evt["text"]}
-                    content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
-            elif etype == "tool_start":
-                current_block = {"type": "tool_use", "name": evt["name"],
-                                 "tool_id": evt.get("tool_id", ""), "input": "", "result": ""}
-                content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "tool_start", "name": evt["name"],
-                                         "tool_id": evt.get("tool_id", "")})
-            elif etype == "tool_input_delta":
-                if current_block and current_block["type"] == "tool_use":
-                    current_block["input"] += evt["json"]
-                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt["json"],
-                                         "tool_id": evt.get("tool_id", "")})
-            elif etype == "tool_result":
-                tool_id = evt.get("tool_id", "")
-                image_url = evt.get("image_url")
-                for block in reversed(content_blocks):
-                    if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
-                        block["result"] = evt.get("content", "")
-                        if image_url:
-                            block["image_url"] = image_url
-                        break
-                current_block = None
-                tool_result_msg = {
-                    "type": "tool_result",
-                    "content": evt.get("content", ""),
-                    "tool_id": tool_id
-                }
-                if image_url:
-                    tool_result_msg["image_url"] = image_url
-                if evt.get("is_error"):
-                    tool_result_msg["is_error"] = True
-                await _ws_send(conv_id, tool_result_msg)
-                await db.update_message_content(draft_msg_id, content=full_text,
-                                                content_blocks=json.dumps(content_blocks))
-            elif etype == "permission_request":
-                # The browser prompt/notification is driven by /api/cc-permission.
-                pass
-            elif etype == "usage":
-                total_input_tokens = evt.get("input_tokens", 0) or total_input_tokens
-                total_output_tokens += evt.get("output_tokens", 0)
-                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens,
-                                         "output_tokens": total_output_tokens})
-            elif etype == "hermes_usage_update":
-                used = evt.get("used")
-                if used is not None:
-                    await _ws_send(conv_id, {"type": "context_info", "total_tokens": used})
-            elif etype == "plan_update":
-                await _ws_send(conv_id, {"type": "status", "text": "Hermes updated its plan."})
-            elif etype == "error":
-                await _ws_send(conv_id, {"type": "status", "text": f"Hermes: {evt.get('error', '')}"})
-            elif etype == "result":
-                result_info = evt
-                new_session_id = evt.get("session_id", "") or new_session_id
-            # hermes_commands / hermes_raw_update: ignored in v1.
-            if _gen_key_local:
-                _update_gen_snapshot(
-                    _gen_key_local,
-                    full_text=full_text,
-                    content_blocks=content_blocks,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
-                )
-
-        if _active_hermes_procs.get(conv_id) is proc:
-            _active_hermes_procs.pop(conv_id, None)
-
-        if not full_text.strip() and not any(b["type"] == "tool_use" for b in content_blocks):
-            if draft_msg_id:
-                await db.delete_branch(draft_msg_id)
-            await _ws_send(conv_id, {"type": "error",
-                                     "error": "Hermes returned an empty response — try again"})
-            return
-
-        gen_ms = int((_time.time() - start_t) * 1000)
-        await db.update_message_content(
-            draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
-            cc_session_id=new_session_id or None,
-            cc_session_mode="hermes",
-            cc_model_used=f"hermes:{model}" if model else "hermes:default",
-            generation_ms=gen_ms,
-        )
-        await db.set_active_branch(conv_id, draft_msg_id)
-        msg = await db.get_message(draft_msg_id)
-        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
-        preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
-        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id,
-                                 "conv_title": conv.get("title", "Conversation"),
-                                 "message_id": draft_msg_id, "preview": preview})
-
-    except asyncio.CancelledError:
-        if proc is not None:
-            try:
-                await hermes_client.cancel_hermes(proc)
-            except Exception:
-                pass
-        if draft_msg_id:
-            if full_text.strip():
-                try:
-                    await db.update_message_content(draft_msg_id, content=full_text)
-                except Exception:
-                    pass
-            else:
-                await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
-    except Exception as e:
-        if draft_msg_id and full_text.strip():
-            try:
-                await db.update_message_content(draft_msg_id, content=full_text)
-            except Exception:
-                pass
-        elif draft_msg_id:
-            await db.delete_branch(draft_msg_id)
-        print(f"[Hermes] generation error conv={conv_id}: {e}")
-        await _ws_send(conv_id, {"type": "error", "error": str(e)})
-    finally:
-        # Clear the generation task from _active_generations
-        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
-        if _gen_key:
-            _active_generations.pop(_gen_key, None)
-            _generation_snapshots.pop(_gen_key, None)
-            _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
-        await _send_generation_idle_if_quiescent(conv_id)
-
-        # Clear the SQLite active generation row
-        try:
-            if 'draft_msg_id' in locals() and draft_msg_id:
-                await db.unregister_active_generation(draft_msg_id)
-        except Exception:
-            pass
-
-        # Clean up only this generation's pending permissions.
-        finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
-        for rid in list(_pending_hook_permissions):
-            pending = _pending_hook_permissions[rid]
-            if (
-                pending.get("conv_id") == conv_id
-                and pending.get("permission_scope") == finished_scope
-            ):
-                _pending_hook_permissions.pop(rid, None)
-                await db.delete_pending_permission(rid)
-
-        # Persistent Hermes ACP runtimes stay alive across turns. Explicit
-        # cancellation still terminates the runtime in the CancelledError path.
-        if _active_hermes_procs.get(conv_id) is proc:
-            _active_hermes_procs.pop(conv_id, None)
-
-
 async def _handle_ooda_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
@@ -10075,6 +13382,7 @@ async def _handle_ooda_generation(
 
     draft_msg_id = None
     final_prose = ""
+    first_response_ms = None
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -10082,9 +13390,8 @@ async def _handle_ooda_generation(
             f"[OODA] Starting ooda_generation conv={conv_id} action={action} parent={parent_id}"
         )
 
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
+        if parent_id is None:
+            raise ValueError("OODA generation requires an explicit parent message")
 
         # ── Setup (same as weave) ──
         character = None
@@ -10183,8 +13490,8 @@ async def _handle_ooda_generation(
             context_payload["compaction_marker_id"] = marker["id"]
         await _ws_send(conv_id, context_payload)
 
-        # Create draft message in DB so it appears as ghost node on tree
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        # Create draft message in DB so it appears as ghost node on tree.
+        draft_msg = await _create_generation_draft(conv_id, conv, parent_id)
         draft_msg_id = draft_msg["id"]
         weave_model = conv.get("local_model") or config.llama_model or ""
         await db.update_message_content(draft_msg_id, cc_model_used=weave_model)
@@ -10234,6 +13541,11 @@ async def _handle_ooda_generation(
             model=weave_model,
             return_usage=True,
         )
+        if raw_pass1:
+            # Non-streaming OODA can measure response arrival, not internal TTFT.
+            first_response_ms = await _record_first_response(
+                conv_id, draft_msg_id, _gen_key_local, _ooda_start_t, first_response_ms,
+            )
         await _record_turn_model_attestation(
             conv_id,
             draft_msg_id,
@@ -10378,6 +13690,10 @@ async def _handle_ooda_generation(
                 model=weave_model,
                 return_usage=True,
             )
+            if raw_pass2:
+                first_response_ms = await _record_first_response(
+                    conv_id, draft_msg_id, _gen_key_local, _ooda_start_t, first_response_ms,
+                )
             await _record_turn_model_attestation(
                 conv_id,
                 draft_msg_id,
@@ -10471,8 +13787,6 @@ async def _handle_ooda_generation(
             generation_ms=_ooda_gen_ms,
         )
         await db.set_active_branch(conv_id, draft_msg_id)
-        from context_manager import update_rolling_summary
-        asyncio.create_task(update_rolling_summary(conv_id))
         msg = await db.get_message(draft_msg_id)
         # Save branch-level state deltas (Tier 3)
         if ooda and ooda.get("updates"):
@@ -10491,9 +13805,16 @@ async def _handle_ooda_generation(
         )
 
     except asyncio.CancelledError:
-        if draft_msg_id:
-            await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
+        await _finalize_user_stopped_generation(
+            conv_id,
+            draft_msg_id,
+            partial_text=final_prose,
+            model_used=locals().get("weave_model"),
+            generation_ms=int(
+                (_time.time() - locals().get("_ooda_start_t", _time.time())) * 1000
+            ),
+        )
+        raise
     except Exception as e:
         if draft_msg_id and final_prose and final_prose.strip():
             await db.update_message_content(draft_msg_id, content=final_prose)
@@ -10518,6 +13839,7 @@ async def _handle_weave_generation(
     """Handle Weave (local llama) generation — original logic."""
     draft_msg_id = None
     full_response = ""
+    first_response_ms = None
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -10526,11 +13848,8 @@ async def _handle_weave_generation(
         )
         print(f"[GEN] conv={conv}")
 
-        # For regenerate, parent_id should be provided
-        # For generate, use the current active leaf
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
+        if parent_id is None:
+            raise ValueError("Weave generation requires an explicit parent message")
         system_only = bool(conv) and _truthy_setting(conv.get("system_only"))
         character = None
         if (not system_only) and conv and conv.get("character_id"):
@@ -10655,8 +13974,8 @@ async def _handle_weave_generation(
             context_payload["compaction_marker_id"] = marker["id"]
         await _ws_send(conv_id, context_payload)
 
-        # Create draft message in DB so it appears as ghost node on tree
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        # Create draft message in DB so it appears as ghost node on tree.
+        draft_msg = await _create_generation_draft(conv_id, conv, parent_id)
         draft_msg_id = draft_msg["id"]
 
         # Stream the response
@@ -10720,6 +14039,10 @@ async def _handle_weave_generation(
                         _gen_key_local,
                     )
                 elif item.get("type") == "thinking_delta":
+                    if item.get("text"):
+                        first_response_ms = await _record_first_response(
+                            conv_id, draft_msg_id, _gen_key_local, _weave_start_t, first_response_ms,
+                        )
                     _thinking_buffer += item["text"]
                     if current_block and current_block.get("type") == "thinking":
                         current_block["text"] += item["text"]
@@ -10742,8 +14065,14 @@ async def _handle_weave_generation(
                     if item.get("type") == "usage":
                         total_input_tokens = int(item.get("input_tokens") or total_input_tokens or 0)
                         total_output_tokens = int(item.get("output_tokens") or total_output_tokens or 0)
+                        await db.update_message_content(draft_msg_id, turn_input_tokens=total_input_tokens,
+                                                        turn_output_tokens=total_output_tokens)
                     await _ws_send(conv_id, item)
                 continue
+            if item:
+                first_response_ms = await _record_first_response(
+                    conv_id, draft_msg_id, _gen_key_local, _weave_start_t, first_response_ms,
+                )
             full_response += item
             if current_block and current_block.get("type") == "text":
                 current_block["text"] += item
@@ -10811,8 +14140,6 @@ async def _handle_weave_generation(
             generation_ms=_weave_gen_ms,
         )
         await db.set_active_branch(conv_id, draft_msg_id)
-        from context_manager import update_rolling_summary
-        asyncio.create_task(update_rolling_summary(conv_id))
         msg = await db.get_message(draft_msg_id)
         await _ws_send(
             conv_id,
@@ -10834,10 +14161,17 @@ async def _handle_weave_generation(
         )
 
     except asyncio.CancelledError:
-        # Clean up draft on cancel
-        if draft_msg_id:
-            await db.delete_branch(draft_msg_id)
-        await _ws_send(conv_id, {"type": "cancelled"})
+        await _finalize_user_stopped_generation(
+            conv_id,
+            draft_msg_id,
+            partial_text=full_response,
+            content_blocks=locals().get("content_blocks"),
+            model_used=locals().get("weave_model"),
+            generation_ms=int(
+                (_time.time() - locals().get("_weave_start_t", _time.time())) * 1000
+            ),
+        )
+        raise
     except Exception as e:
         # Save partial content or clean up empty draft
         if draft_msg_id and full_response.strip():
@@ -10858,20 +14192,6 @@ async def _handle_weave_generation(
 if __name__ == "__main__":
     import uvicorn
 
-    # Suppress Windows ProactorEventLoop pipe errors from CC subprocess cleanup.
-    # Patch at startup so it applies to whatever event loop uvicorn creates.
-    import asyncio.proactor_events as _pe
-
-    _orig_call_connection_lost = _pe._ProactorBasePipeTransport._call_connection_lost
-
-    def _safe_call_connection_lost(self, exc=None):
-        try:
-            _orig_call_connection_lost(self, exc)
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            pass
-
-    _pe._ProactorBasePipeTransport._call_connection_lost = _safe_call_connection_lost
-
     ssl_kwargs = {}
     if os.path.exists(config.ssl_certfile) and os.path.exists(config.ssl_keyfile):
         ssl_kwargs["ssl_certfile"] = config.ssl_certfile
@@ -10884,8 +14204,11 @@ if __name__ == "__main__":
         app,
         host=config.host,
         port=config.port,
+        ws="websockets-sansio",
         ws_ping_interval=20,
         ws_ping_timeout=20,
+        # Keep the transport peer authoritative for network/authentication gates.
+        proxy_headers=False,
         **ssl_kwargs,
     )
     server = uvicorn.Server(uv_config)

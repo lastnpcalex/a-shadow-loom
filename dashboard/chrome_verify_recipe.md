@@ -42,7 +42,6 @@ Loom uses HTTPS with self-signed certs. Use `https://localhost:3000`.
 
 ```sql
 -- Most recently updated
-SELECT id, title, mode, nrol_operator, cc_model, updated_at
 FROM conversations ORDER BY updated_at DESC LIMIT 10;
 
 -- Suspicious long generations (likely "silent for N minutes" candidates)

@@ -1,0 +1,27 @@
+#provider-usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px; }
+.quota-provider { min-width: 0; max-height: 480px; overflow-y: auto; padding: 12px; border: 1px solid var(--border, #536171); border-radius: 8px; overflow-wrap: anywhere; }
+.quota-provider h3 { margin: 0 0 12px; }
+.quota-provider small { display: block; opacity: .8; margin-top: 6px; }
+.quota-window { padding: 8px 0; }
+.quota-window span { display: block; margin: 4px 0; }
+.quota-window, .quota-provider { --quota-fill: var(--cyan, #69d5ca); }
+.quota-window.nearing, .quota-provider.nearing { --quota-fill: #efbb65; }
+.quota-window.critical, .quota-provider.critical { --quota-fill: #f67979; }
+.quota-window.stale { --quota-fill: var(--text-muted, #92929e); }
+.quota-window progress, .quota-provider > progress { width: 100%; height: 8px; display: block; margin: 6px 0; appearance: none; -webkit-appearance: none; border: 0; border-radius: 4px; overflow: hidden; background: var(--bg-tertiary); accent-color: var(--quota-fill); }
+.quota-window progress::-webkit-progress-bar, .quota-provider > progress::-webkit-progress-bar { background: var(--bg-tertiary); border-radius: 4px; }
+.quota-window progress::-webkit-progress-value, .quota-provider > progress::-webkit-progress-value { background: var(--quota-fill); border-radius: 4px; }
+.quota-window progress::-moz-progress-bar, .quota-provider > progress::-moz-progress-bar { background: var(--quota-fill); border-radius: 4px; }
+.quota-window.stale { opacity: .65; }
+#provider-usage-warning { flex: 0 0 auto; padding: 8px 16px; background: #44321f; color: #ffdb99; border-bottom: 1px solid #a98442; font-size: 13px; overflow-wrap: anywhere; }
+#provider-usage-warning[hidden] { display: none; }
+#provider-usage-warning.critical { background: #4a2428; color: #ffc0c0; border-color: #c66670; }
+#provider-usage-warning { display: flex; align-items: center; gap: 12px; }
+#provider-usage-warning span { flex: 1; min-width: 0; }
+#provider-usage-warning button { background: transparent; color: inherit; border: 1px solid currentColor; border-radius: 4px; cursor: pointer; font-size: 18px; padding: 0 7px; }
+.quota-provider h3 { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.quota-provider h3 small { font-size: 11px; font-weight: normal; }
+.quota-window strong { font-size: 12px; }
+.quota-window span { font-size: 12px; }
+.quota-details { margin-top: 8px; font-size: 12px; }
+.quota-details summary { cursor: pointer; color: var(--text-dim, var(--text-secondary)); }
