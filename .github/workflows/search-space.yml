@@ -30,6 +30,11 @@ jobs:
           test: false
           lint: false
           use-mathlib-cache: false
+      - name: Expose Elan to PowerShell
+        run: |
+          $elanBin = Join-Path $env:USERPROFILE '.elan\bin'
+          if (-not (Test-Path (Join-Path $elanBin 'lake.exe'))) { throw 'Elan did not install lake.exe' }
+          Add-Content -Path $env:GITHUB_PATH -Value $elanBin
       - name: Regenerate and compare oracle
         working-directory: formal/search_space
         run: |

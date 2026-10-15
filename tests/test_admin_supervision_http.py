@@ -49,7 +49,7 @@ async def listener(app):
 
 def restricted_app(source, paths):
     app = FastAPI()
-    app.router.routes[:] = [route for route in source.routes if route.path in paths]
+    app.router.routes[:] = [route for route in source.routes if getattr(route, 'path', None) in paths]
     assert {r.path for r in app.routes} == paths
     assert not any('restart' in r.path or 'shutdown' in r.path for r in app.routes)
     return app
