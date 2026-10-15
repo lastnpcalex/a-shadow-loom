@@ -182,9 +182,14 @@ async def test_browser_http_permissions_and_slow_cancel_are_exact_instance(tmp_p
                         'tool_input': {'path': str(tmp_path.parent / 'outside-fixture.txt')}}))
                     pending_tools.append(denied)
                     async with asyncio.timeout(8):
-                        while not server._pending_hook_permissions:
+                        while not any(p.get('tool_name') == 'Read' and p.get('response') is None
+                                      for p in server._pending_hook_permissions.values()):
+                            if denied.done():
+                                raise AssertionError(await denied)
                             await asyncio.sleep(.01)
-                    await page.evaluate('refreshSupervision()')
+                    # A reload's coalesced refresh may have started before this
+                    # permission existed. Finish it, then take a fresh snapshot.
+                    await page.evaluate('async () => { if (supervisionRefresh) await supervisionRefresh; await refreshSupervision(); }')
                     await expect(card).to_be_visible()
                     await card.locator('textarea').fill('Stay inside the fixture workspace.')
                     await card.get_by_role('button', name='Deny', exact=True).click()
