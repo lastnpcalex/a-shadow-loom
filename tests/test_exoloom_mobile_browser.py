@@ -17,8 +17,11 @@ async def mobile_browser(activity_browser):
     page = await context.new_page()
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
-    await page.route('**/app/**', lambda route: route.fulfill(
-        path=str(Path('static/index.html').resolve()), content_type='text/html'))
+    # Exercise the /app/ proxy prefix using a real loopback response. A
+    # synthetic route.fulfill document has no peer IP and newer Chromium
+    # blocks its loopback WebSocket under Local Network Access checks.
+    await page.route('**/app/**', lambda route: route.continue_(
+        url=route.request.url.replace('/app/', '/', 1)))
     origin = original.url.split('/')[0]+'//'+original.url.split('/')[2]
     await page.goto(origin+'/app/', wait_until='domcontentloaded')
     # Startup may replace the route after the shell first becomes available.
