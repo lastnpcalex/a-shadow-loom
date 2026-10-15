@@ -43,7 +43,7 @@ jobs:
           python -c "import os,pathlib; assert pathlib.Path('cases.json').read_text(encoding='utf-8') == (pathlib.Path(os.environ['RUNNER_TEMP'])/'search-cases.json').read_text(encoding='utf-8'), 'Search fixture drift'"
       - name: Install isolated acceptance dependencies
         run: |
-          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright mcp pillow pyyaml requests cryptography fastembed==0.6.1
+          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright "mcp>=1,<2" pillow pyyaml requests cryptography fastembed==0.6.1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m playwright install chromium
       - name: Search, scope, MCP transport and browser acceptance

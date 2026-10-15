@@ -65,7 +65,7 @@ jobs:
           python -c "import os,pathlib; assert pathlib.Path('cases.json').read_text(encoding='utf-8') == (pathlib.Path(os.environ['RUNNER_TEMP'])/'agent-access-cases.json').read_text(encoding='utf-8'), 'Agent access fixture drift'"
       - name: Install isolated test dependencies
         run: |
-          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright mcp pillow pyyaml requests
+          python -m pip install pytest pytest-asyncio aiosqlite httpx fastapi uvicorn python-multipart psutil websockets playwright "mcp>=1,<2" pillow pyyaml requests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m playwright install chromium
       - name: Required runtime and real-browser acceptance
@@ -78,5 +78,8 @@ jobs:
         if: always()
         with:
           name: coordination-acceptance
-          path: ${{ runner.temp }}/coordination-acceptance/report.json
+          path: |
+            ${{ runner.temp }}/coordination-acceptance/report.json
+            ${{ runner.temp }}/coordination-acceptance/*.log
+            ${{ runner.temp }}/coordination-acceptance/*.xml
           if-no-files-found: ignore
