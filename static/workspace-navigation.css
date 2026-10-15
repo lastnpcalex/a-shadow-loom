@@ -36,3 +36,14 @@ html.true-mobile #branch-nav-bar { flex: 0 0 auto; width: auto; flex-wrap: nowra
 html.true-mobile #branch-path-input { flex: 0 1 90px; width: 90px; }
 .message-branch-label { display: inline-block; flex-shrink: 0; visibility: visible; }
 .message-path-feedback { position: fixed; z-index: 1000; pointer-events: none; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-primary); color: var(--cyan); font: 12px/1.4 var(--font-main); max-width: calc(100vw - 16px); box-sizing: border-box; }
+/* Keep the Greek trail readable instead of squeezing it beside header icons. */
+html.true-mobile #app-header { flex-wrap: wrap; row-gap: 4px; }
+html.true-mobile #header-left { display: contents; }
+html.true-mobile #app-header::before { content: ''; flex-basis: 100%; order: 9; height: 0; }
+html.true-mobile #header-right { order: 10; margin-left: 0; }
+html.true-mobile #branch-nav-bar { order: 11; flex: 1 1 110px; min-width: 0; width: 0; margin-left: auto; justify-content: flex-end; }
+html.true-mobile #branch-path-input { flex: 1 1 50px; width: 50px; max-width: 110px; }
+html.true-mobile #breadcrumb-trail { order: 12; flex: 1 0 100%; max-width: 100%; width: 100%; margin: 0; box-sizing: border-box; }
+html.true-mobile #breadcrumb-trail .breadcrumb-btn,
+html.true-mobile #breadcrumb-trail .breadcrumb-copy,
+html.true-mobile #breadcrumb-trail .breadcrumb-ellipsis-wrap { flex-shrink: 0; max-width: none; }
