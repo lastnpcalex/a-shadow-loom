@@ -981,7 +981,7 @@ function resolveBranchPath(value) {
 async function navigateToBranchPath(value) {
     const address = parseMessageBranchPath(value);
     if (address && address.conversationId !== Number(State.currentConvId)) {
-        await loadConversation(address.conversationId);
+        await loadConversation(address.conversationId, { view: 'chat', initialLeafId: address.messageId });
         if (Number(State.currentConvId) !== address.conversationId) return false;
     }
     const messageId = resolveBranchPath(value);
@@ -2135,7 +2135,7 @@ async function loadConversation(convId, options = {}) {
         return siblings.length > 1;
     });
 
-    if (options.newThread) {
+    if (options.newThread || options.view === 'chat') {
         State._skipLoadOnChat = true;
         switchView('chat');
     } else if (hasForks) {
