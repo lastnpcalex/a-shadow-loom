@@ -24,18 +24,26 @@
                 const heading = document.createElement('h3'); heading.textContent = label;
                 const spend = document.createElement('p'); spend.textContent = `${money(key[`usage_${period}`])} used`;
                 const providerCap = key.limit_reset === period && typeof key.limit === 'number';
-                const cap = providerCap
-                    ? key.limit : data.limits?.[`${period}_limit_usd`];
+                const budget = data.limits?.[`${period}_limit_usd`];
+                const localBudget = Number.isFinite(budget) && budget > 0;
+                const useKeyCap = providerCap && !localBudget;
+                const cap = localBudget ? budget : useKeyCap ? key.limit : null;
                 const limit = document.createElement('small');
-                limit.textContent = typeof cap === 'number' && (providerCap || cap > 0)
-                    ? `${providerCap ? 'Key cap' : 'Budget'}: ${money(cap)}` : 'No period budget reported';
+                limit.textContent = Number.isFinite(cap) && (useKeyCap || cap > 0)
+                    ? `${useKeyCap ? 'Key cap' : 'EXO budget'}: ${money(cap)}` : 'No period budget reported';
                 const used = key[`usage_${period}`];
-                const remaining = providerCap ? key.limit_remaining : typeof cap === 'number' && cap > 0 && typeof used === 'number' ? cap - used : null;
+                const remaining = useKeyCap ? key.limit_remaining : typeof cap === 'number' && cap > 0 && typeof used === 'number' ? cap - used : null;
                 const left = document.createElement('small');
                 left.textContent = typeof remaining === 'number' ? `${money(remaining)} remaining` : 'Remaining unavailable';
                 card.append(heading, spend, limit, left); periods.appendChild(card);
+                if (localBudget && providerCap) {
+                    const provider = document.createElement('small');
+                    provider.textContent = `OpenRouter key cap: ${money(key.limit)}; ${money(key.limit_remaining)} remaining`;
+                    card.appendChild(provider);
+                }
                 if (Number.isFinite(cap) && cap > 0 && Number.isFinite(used) && used >= 0) {
-                    const percent = Math.min(100, Math.max(0, used / cap * 100));
+                    const consumed = useKeyCap && Number.isFinite(remaining) ? cap - remaining : used;
+                    const percent = Math.min(100, Math.max(0, consumed / cap * 100));
                     card.classList.toggle('nearing', percent >= 80 && percent < 90);
                     card.classList.toggle('critical', percent >= 90);
                     const bar = document.createElement('progress');

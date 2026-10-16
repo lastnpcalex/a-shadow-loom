@@ -20,7 +20,8 @@ function renderOpenRouter(snapshot) {
         const used = openRouterNumber(key[`usage_${period}`]);
         const localLimit = openRouterNumber(limits[`${period}_limit_usd`]);
         const keyLimit = openRouterNumber(key.limit);
-        const dailyKeyCap = key.limit_reset === period && keyLimit !== null;
+        const providerCap = key.limit_reset === period && keyLimit !== null;
+        const dailyKeyCap = providerCap && !(localLimit > 0);
         const limit = dailyKeyCap ? keyLimit : localLimit > 0 ? localLimit : null;
         // Provider remaining includes its own accounting (including BYOK when selected).
         const remaining = dailyKeyCap ? openRouterNumber(key.limit_remaining)
@@ -36,6 +37,7 @@ function renderOpenRouter(snapshot) {
         return `<div class="openrouter-period${percent >= 100 ? ' exhausted' : percent >= 80 ? ' nearing' : ''}" data-period="${period}">
             <h3>${label}</h3><div class="openrouter-spend">${openRouterMoney(used)}</div>
             <div class="openrouter-budget">${esc(budget)}</div>
+            ${providerCap && localLimit > 0 ? `<div class="empty-note">OpenRouter key cap: ${openRouterMoney(keyLimit)} · ${openRouterMoney(key.limit_remaining)} left</div>` : ''}
             ${percent !== null ? `<div class="openrouter-meter" role="progressbar" aria-label="${label} ${capLabel}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}"><span style="width:${percent}%"></span></div>` : ''}
             ${byok > 0 ? `<div class="empty-note">BYOK: ${openRouterMoney(byok)} (separate)</div>` : ''}
         </div>`;

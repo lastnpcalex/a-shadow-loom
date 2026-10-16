@@ -345,6 +345,7 @@ async def test_local_child_actual_cli_configuration_retains_tools_and_control(tm
     # This fixture has no native parent. Other tests can leave snapshots with
     # the same disposable conversation ID and gen:71 identifier.
     monkeypatch.setattr(server, '_generation_snapshots', {})
+    monkeypatch.setattr(server, '_recent_generations', {})
     calls = []
     hook_calls = []
     import local_context_guard

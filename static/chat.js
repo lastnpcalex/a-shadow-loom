@@ -947,7 +947,8 @@ function _reconcileMessageRows(previous) {
     const scroller = document.getElementById('messages-container');
     const top = scroller.scrollTop;
     const atBottom = scroller.scrollHeight - top - scroller.clientHeight < 60;
-    const old = new Map(previous.map(message => [String(message.id), JSON.stringify(message)]));
+    const _rowSig = message => JSON.stringify({ ...message, queue_status: undefined });
+    const old = new Map(previous.map(message => [String(message.id), _rowSig(message)]));
     const visible = State.messages.slice(Math.min(VIRTUAL_SCROLL.renderedStart || 0, State.messages.length));
     if (State.isStreaming && streamingDiv?.isConnected && _pendingLaunch
         && State._followingDraftMsgId == null && !streamingDiv.dataset.msgId) {
@@ -970,10 +971,12 @@ function _reconcileMessageRows(previous) {
     for (const message of visible) {
         const row = container.querySelector(`.message[data-msg-id="${message.id}"]`);
         if ((row && row === streamingDiv) || row?.querySelector('.edit-message-input')) continue;
-        if (!row || old.get(String(message.id)) !== JSON.stringify(message)) {
+        if (!row || old.get(String(message.id)) !== _rowSig(message)) {
             const replacement = createMessageElement(message);
             if (row) row.replaceWith(replacement);
             else container.insertBefore(replacement, streamingDiv?.isConnected ? streamingDiv : null);
+        } else if (row && message.queued) {
+            _syncQueuedMessagePresentation(row, message);
         }
     }
     if (State.messages.length) container.querySelector('.empty-loom-hint')?.remove();
@@ -986,12 +989,13 @@ async function loadMessages(convId, { preserveView = false, signal, refreshTreeA
         // loadConversation() when switching conversations, not on message reload
 
         const prevCount = State.messages.length;
-        const previous = State.messages.slice();
+        const previous = State.messages.map(m => ({ ...m }));
         const prevQueuedId = _queuedGeneration?.id;
         // Signature includes empty/non-empty content state so an empty draft
         // filling in (same id, "" → real text) forces a re-render instead of
-        // being skipped by the cheap-diff bail below.
-        const _msgSig = m => JSON.stringify(m);
+        // being skipped by the cheap-diff bail below. Queue status on the same
+        // queued item is reconciled in place by _refreshQueuedGeneration.
+        const _msgSig = m => JSON.stringify({ ...m, queue_status: undefined });
         const prevIdSig = State.messages.map(_msgSig).join(',');
         if (await _fetchCursorBranchMessages(convId, {signal, includeTree: refreshTreeAfter}) === false) return false;
         // Cheap change detection: if the message id list is identical to what
@@ -4472,6 +4476,9 @@ async function sendMessage() {
 
     // Capture every part of the submitted action before the first await. The
     // shared composer and branch may belong to a different window by then.
+    if (State.currentView === 'tree') {
+        State._branchSwitchSeq = (State._branchSwitchSeq || 0) + 1;
+    }
     const sendOwner = {
         convId: sendConvId,
         conversationSeq: _conversationLoadRequestSeq,
@@ -5400,6 +5407,7 @@ function _renderParallelActivityItem(activity) {
     return item;
 }
 
+let _notificationRenderSignature = null;
 function _renderNotifDropdown() {
     _applyNotificationDismissals();
     const dropdown = document.getElementById('notif-dropdown');
@@ -5407,6 +5415,10 @@ function _renderNotifDropdown() {
     const host = mobile ? document.body : document.getElementById('notif-bell-wrap');
     if (host && dropdown.parentElement !== host) host.appendChild(dropdown);
     const list = document.getElementById('notif-list');
+    // Polling unchanged activity must not replace buttons during a touch gesture.
+    const signature = JSON.stringify([_notifications, _parallelBranchActivity]);
+    if (signature === _notificationRenderSignature && list.childNodes.length) return;
+    _notificationRenderSignature = signature;
     list.innerHTML = '';
     const branchActivity = _notifications.filter(item => item.type === 'branch' && item.branchActivity);
     const otherNotifications = _notifications.filter(item => !(item.type === 'branch' && item.branchActivity));
@@ -6911,6 +6923,8 @@ async function switchToBranch(leafId, scrollToMsgId, options = {}) {
     const convId = State.currentConvId;
     const switchSeq = (State._branchSwitchSeq || 0) + 1;
     State._branchSwitchSeq = switchSeq;
+    const composerInput = document.getElementById('user-input');
+    const inputAtStart = composerInput ? composerInput.value : '';
     saveComposerDraft();
     try {
         if (typeof showLoading === 'function') showLoading();
@@ -6949,7 +6963,11 @@ async function switchToBranch(leafId, scrollToMsgId, options = {}) {
         State.treeData = treeData;
         markBranchActivitySeen(State.currentConvId, branch.map(message => message.id));
         if (loadedLeaf) rememberConversationLeaf(State.currentConvId, loadedLeaf.id);
-        restoreComposerDraft(State.currentConvId, State.loomCursor);
+        if (composerInput && composerInput.value !== inputAtStart) {
+            saveComposerDraft(State.currentConvId, State.loomCursor);
+        } else {
+            restoreComposerDraft(State.currentConvId, State.loomCursor);
+        }
         if (State.ws?.readyState === WebSocket.OPEN) {
             State.ws.send(JSON.stringify({ action: 'request_snapshot' }));
         }
